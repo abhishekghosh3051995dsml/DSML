@@ -1,0 +1,345 @@
+#!/usr/bin/env python3
+"""Build one presentation-ready Excel workbook from the metrics CSVs.
+
+Usage:
+    python build_excel_report.py ./metrics_aug
+    python build_excel_report.py ./metrics_aug --out NORA_Report.xlsx
+
+Needs openpyxl:   pip install openpyxl
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import sys
+from pathlib import Path
+from typing import Any, Dict, List, Sequence
+
+try:
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    from openpyxl.utils import get_column_letter
+except ImportError:
+    sys.exit("openpyxl is required.  Run:  pip install openpyxl")
+
+FONT = "Arial"
+HEADER_FILL = PatternFill("solid", fgColor="1F3864")
+TITLE_FILL = PatternFill("solid", fgColor="D9E2F3")
+GOOD_FILL = PatternFill("solid", fgColor="E2EFDA")
+WARN_FILL = PatternFill("solid", fgColor="FFF2CC")
+BAD_FILL = PatternFill("solid", fgColor="FCE4E4")
+THIN = Side(style="thin", color="BFBFBF")
+BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
+
+csv.field_size_limit(2**31 - 1)
+
+
+def read_csv(path: Path) -> List[Dict[str, str]]:
+    if not path.exists():
+        return []
+    with path.open("r", encoding="utf-8-sig", newline="") as fh:
+        return list(csv.DictReader(fh))
+
+
+def num(value: Any) -> Any:
+    """Convert numeric-looking strings to real numbers so Excel can sort them."""
+    if value is None or value == "":
+        return ""
+    text = str(value).strip()
+    try:
+        return int(text)
+    except ValueError:
+        pass
+    try:
+        return float(text)
+    except ValueError:
+        return text
+
+
+def shorten(value: Any, limit: int = 500) -> str:
+    text = str(value or "")
+    return text if len(text) <= limit else text[:limit] + " ..."
+
+
+def style_header(ws, ncols: int, row: int = 1) -> None:
+    for c in range(1, ncols + 1):
+        cell = ws.cell(row=row, column=c)
+        cell.font = Font(name=FONT, size=10, bold=True, color="FFFFFF")
+        cell.fill = HEADER_FILL
+        cell.alignment = Alignment(vertical="center", wrap_text=True)
+        cell.border = BORDER
+    ws.row_dimensions[row].height = 32
+
+
+def autosize(ws, widths: Sequence[int]) -> None:
+    for i, w in enumerate(widths, start=1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+
+
+def write_table(ws, headers: Sequence[str], rows: Sequence[Sequence[Any]],
+                widths: Sequence[int], start_row: int = 1) -> None:
+    ws.append([]) if start_row > 1 else None
+    for i, h in enumerate(headers, start=1):
+        ws.cell(row=start_row, column=i, value=h)
+    style_header(ws, len(headers), start_row)
+    for r, row in enumerate(rows, start=start_row + 1):
+        for c, value in enumerate(row, start=1):
+            cell = ws.cell(row=r, column=c, value=value)
+            cell.font = Font(name=FONT, size=10)
+            cell.border = BORDER
+            cell.alignment = Alignment(vertical="top", wrap_text=isinstance(value, str) and len(str(value)) > 60)
+    autosize(ws, widths)
+    ws.freeze_panes = ws.cell(row=start_row + 1, column=1)
+    if rows:
+        ws.auto_filter.ref = f"A{start_row}:{get_column_letter(len(headers))}{start_row + len(rows)}"
+
+
+# ------------------------------------------------------------------ sheets
+def sheet_overview(wb, summary: Dict[str, Any], src: Path) -> None:
+    ws = wb.create_sheet("Overview")
+    m1 = summary.get("M1_problems", {})
+    m2 = summary.get("M2_intents", {})
+    m3 = summary.get("M3_workflows", {})
+    m5 = summary.get("M5_tools_and_nora_api", {})
+    m6 = summary.get("M6_baseline", {})
+
+    ws["A1"] = "NORA Interaction Analysis — Summary"
+    ws["A1"].font = Font(name=FONT, size=16, bold=True, color="1F3864")
+    ws["A2"] = f"Generated from: {src}"
+    ws["A2"].font = Font(name=FONT, size=9, italic=True)
+    ws["A3"] = (f"Period covered: {str(m6.get('window_start', ''))[:10]} to "
+                f"{str(m6.get('window_end', ''))[:10]}")
+    ws["A3"].font = Font(name=FONT, size=10)
+
+    rows = [
+        ("What we looked at", "", ""),
+        ("Customer interactions analysed", m1.get("total_interactions", 0),
+         "Each one is a complete customer conversation handled by the agent."),
+        ("Total tool / API calls made", m5.get("total_tool_calls", 0),
+         "Every time the agent asked a backend system for information."),
+        ("Different tools in use", m5.get("unique_tools", 0),
+         "The catalogue of systems the agent can call."),
+        ("Average tool calls per interaction", m3.get("avg_tool_calls_per_interaction", 0),
+         "How much work the agent does to resolve one customer issue."),
+        ("", "", ""),
+        ("How well the tools are performing", "", ""),
+        ("Calls that returned useful data", m5.get("successful_tool_calls", 0),
+         "Worked as intended."),
+        ("Calls that returned NO data", m5.get("no_data_tool_calls", 0),
+         "The system answered, but had nothing to give — wasted effort."),
+        ("Calls that failed with an error", m5.get("error_tool_calls", 0),
+         "The call broke."),
+        ("Overall success rate", m5.get("tool_success_rate", 0),
+         "Share of calls that returned something useful."),
+        ("", "", ""),
+        ("How the agent plans its work", "", ""),
+        ("Distinct workflows observed", m3.get("distinct_workflows", 0),
+         "A workflow = the exact sequence of tools used in one interaction."),
+        ("Workflows used only once", m3.get("single_use_workflows", 0),
+         "KEY FINDING: the agent builds a new plan almost every single time, "
+         "rather than reusing a known procedure."),
+        ("Largest parallel tool group", m5.get("max_parallel_degree", 0),
+         "Most tools fired together in a single step."),
+        ("", "", ""),
+        ("What we cannot report yet", "", ""),
+        ("Intents captured", m2.get("total_intent_occurrences", 0),
+         "The export does not contain the intent field. Needs to be added at source."),
+        ("Positive customer ratings", m6.get("positive_samples", 0),
+         "The export does not contain customer feedback. Needs to be added at source."),
+        ("Negative customer ratings", m6.get("negative_samples", 0),
+         "As above."),
+    ]
+
+    start = 5
+    ws.cell(row=start, column=1, value="Measure")
+    ws.cell(row=start, column=2, value="Value")
+    ws.cell(row=start, column=3, value="What this means in plain English")
+    style_header(ws, 3, start)
+
+    for i, (label, value, meaning) in enumerate(rows, start=start + 1):
+        is_section = value == "" and meaning == "" and label
+        ws.cell(row=i, column=1, value=label)
+        ws.cell(row=i, column=2, value=num(value))
+        ws.cell(row=i, column=3, value=meaning)
+        for c in range(1, 4):
+            cell = ws.cell(row=i, column=c)
+            cell.font = Font(name=FONT, size=11, bold=is_section)
+            cell.alignment = Alignment(vertical="center", wrap_text=(c == 3))
+            if is_section:
+                cell.fill = TITLE_FILL
+            else:
+                cell.border = BORDER
+        if "NO data" in label or "failed" in label:
+            ws.cell(row=i, column=2).fill = BAD_FILL
+        if "useful data" in label:
+            ws.cell(row=i, column=2).fill = GOOD_FILL
+        if "only once" in label:
+            ws.cell(row=i, column=2).fill = WARN_FILL
+        ws.row_dimensions[i].height = 28
+
+    autosize(ws, [42, 16, 84])
+
+
+def sheet_tools(wb, rows: List[Dict[str, str]]) -> None:
+    ws = wb.create_sheet("Tools and APIs")
+    headers = ["Tool / API name", "System group", "Is NORA API?", "Times called",
+               "Interactions using it", "Worked", "Returned no data", "Errors",
+               "Success rate %", "No-data rate %"]
+    data = []
+    for r in rows:
+        data.append([
+            r.get("tool_name", ""), r.get("namespace", "") or "(none)",
+            "Yes" if r.get("is_nora_api") == "1" else "No",
+            num(r.get("total_calls")), num(r.get("interaction_count")),
+            num(r.get("success")), num(r.get("no_data")), num(r.get("error")),
+            round(float(r.get("success_rate") or 0) * 100, 1),
+            round(float(r.get("no_data_rate") or 0) * 100, 1),
+        ])
+    write_table(ws, headers, data, [42, 14, 13, 13, 18, 11, 17, 10, 14, 14])
+    for r in range(2, len(data) + 2):
+        rate = ws.cell(row=r, column=9).value
+        if isinstance(rate, (int, float)):
+            ws.cell(row=r, column=9).fill = GOOD_FILL if rate >= 70 else (
+                WARN_FILL if rate >= 40 else BAD_FILL)
+
+
+def sheet_workflows(wb, rows: List[Dict[str, str]], limit: int = 300) -> None:
+    ws = wb.create_sheet("Workflows")
+    headers = ["Workflow ID", "Times used", "Steps", "Tool calls", "Different tools",
+               "Success rate %", "The sequence of tools used (in order)"]
+    data = []
+    for r in rows[:limit]:
+        data.append([
+            r.get("workflow_id", "")[:12], num(r.get("interaction_count")),
+            num(r.get("step_count")), num(r.get("total_tool_calls")),
+            num(r.get("distinct_tools")),
+            round(float(r.get("success_rate") or 0) * 100, 1),
+            shorten(r.get("workflow", ""), 900),
+        ])
+    write_table(ws, headers, data, [16, 12, 9, 12, 15, 14, 120])
+    ws.cell(row=1, column=7).alignment = Alignment(vertical="center", wrap_text=True)
+
+
+def sheet_parallel(wb, rows: List[Dict[str, str]], limit: int = 300) -> None:
+    ws = wb.create_sheet("Tools Called Together")
+    headers = ["Tools fired in the same step", "How many tools",
+               "Times seen", "Interactions"]
+    data = [[shorten(r.get("parallel_tools", ""), 600), num(r.get("degree")),
+             num(r.get("occurrences")), num(r.get("interaction_count"))]
+            for r in rows[:limit]]
+    write_table(ws, headers, data, [110, 16, 13, 14])
+
+
+def sheet_pairs(wb, rows: List[Dict[str, str]], limit: int = 300) -> None:
+    ws = wb.create_sheet("Tool Pairings")
+    headers = ["Tool A", "Tool B", "Appear together in", "In parallel",
+               "How strongly linked %"]
+    data = [[r.get("tool_a", ""), r.get("tool_b", ""),
+             num(r.get("cooccurring_interactions")), num(r.get("parallel_cooccurrences")),
+             round(float(r.get("association_rate") or 0) * 100, 1)]
+            for r in rows[:limit]]
+    write_table(ws, headers, data, [40, 40, 18, 13, 20])
+
+
+def sheet_problems(wb, rows: List[Dict[str, str]], limit: int = 300) -> None:
+    ws = wb.create_sheet("Problem Themes")
+    headers = ["Theme", "Example wording", "How many interactions", "Variations seen"]
+    data = [[num(r.get("cluster_id")), shorten(r.get("representative", ""), 300),
+             num(r.get("n_interactions")), num(r.get("member_count"))]
+            for r in rows[:limit]]
+    write_table(ws, headers, data, [10, 90, 20, 16])
+
+
+def sheet_interactions(wb, rows: List[Dict[str, str]], limit: int = 2000) -> None:
+    ws = wb.create_sheet("Every Interaction")
+    headers = ["Interaction ID", "Started", "Customer rating", "Tool calls",
+               "Different tools", "Steps", "Worked", "No data", "Errors",
+               "Success rate %", "Largest parallel group", "Customer problem (start of it)"]
+    data = []
+    for r in rows[:limit]:
+        data.append([
+            r.get("interaction_id", ""), str(r.get("started_at", ""))[:19],
+            r.get("sentiment", "") or "not captured",
+            num(r.get("tool_call_count")), num(r.get("n_distinct_tools") or r.get("unique_tool_count")),
+            num(r.get("workflow_step_count")), num(r.get("success_calls")),
+            num(r.get("no_data_calls")), num(r.get("error_calls")),
+            round(float(r.get("tool_success_rate") or 0) * 100, 1),
+            num(r.get("max_parallel_degree")),
+            shorten(r.get("problems", ""), 300),
+        ])
+    write_table(ws, headers, data,
+                [38, 20, 16, 12, 15, 9, 10, 10, 9, 14, 20, 70])
+
+
+def sheet_intents(wb, intents: List[Dict[str, str]], clusters: List[Dict[str, str]]) -> None:
+    ws = wb.create_sheet("Intents")
+    if not intents and not clusters:
+        ws["A1"] = "Intents — not available in this data export"
+        ws["A1"].font = Font(name=FONT, size=14, bold=True, color="9C0006")
+        notes = [
+            "",
+            "The interactions file does not contain an intent or sub-intent field.",
+            "",
+            "This is NOT a result of zero intents being generated. The agent does interpret",
+            "intent, but that interpretation is not saved into this export, so we cannot",
+            "measure it or link it to the workflows.",
+            "",
+            "To complete this analysis we need the following exported per interaction:",
+            "   1. The intent the system determined",
+            "   2. The sub-intent, where one applies",
+            "   3. The customer's feedback / rating",
+            "",
+            "Once those are available, this sheet will show each intent, how often it occurs,",
+            "and how many different workflows were used to serve it.",
+        ]
+        for i, line in enumerate(notes, start=2):
+            ws.cell(row=i, column=1, value=line).font = Font(name=FONT, size=11)
+        ws.column_dimensions["A"].width = 100
+        return
+
+    headers = ["Intent", "Grouped under", "Interactions", "Different sub-intents"]
+    data = [[r.get("intent", ""), r.get("intent_cluster_label", ""),
+             num(r.get("interaction_count")), num(r.get("distinct_subintents"))]
+            for r in intents]
+    write_table(ws, headers, data, [45, 45, 15, 20])
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Build an Excel report from the metrics CSVs.")
+    ap.add_argument("metrics_dir", nargs="?", default="./metrics_aug")
+    ap.add_argument("--out", default=None)
+    args = ap.parse_args()
+
+    src = Path(args.metrics_dir).expanduser().resolve()
+    if not src.is_dir():
+        sys.exit(f"Not a folder: {src}")
+
+    out = Path(args.out) if args.out else src / "NORA_Analysis_Report.xlsx"
+
+    summary_path = src / "10_global_metrics.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8")) if summary_path.exists() else {}
+
+    wb = Workbook()
+    wb.remove(wb.active)
+
+    sheet_overview(wb, summary, src)
+    sheet_tools(wb, read_csv(src / "03_tool_summary.csv"))
+    sheet_workflows(wb, read_csv(src / "04_workflow_summary.csv"))
+    sheet_parallel(wb, read_csv(src / "14_parallel_tool_groups.csv"))
+    sheet_pairs(wb, read_csv(src / "06_tool_cooccurrence.csv"))
+    sheet_problems(wb, read_csv(src / "13_problem_clusters.csv"))
+    sheet_interactions(wb, read_csv(src / "01_interaction_metrics.csv"))
+    sheet_intents(wb, read_csv(src / "08_intent_summary.csv"),
+                  read_csv(src / "11_intent_clusters.csv"))
+
+    wb.save(out)
+    print(f"[DONE] Written: {out}")
+    print("\nSheets:")
+    for name in wb.sheetnames:
+        print(f"  - {name}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

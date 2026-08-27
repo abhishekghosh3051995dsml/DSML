@@ -1,0 +1,2580 @@
+#!/usr/bin/env python3
+"""
+NORA Interaction Metrics Analyzer  (v2)
+=======================================
+
+Analyzes interactions.csv (one or many daily dumps) and produces the metrics
+requested in the 27-Aug meeting notes.
+
+Metric map (matches the manager's numbered asks)
+------------------------------------------------
+M1  Total number of problems encountered            -> problem clusters
+M2  Total number of intents / sub-intents generated -> intent clusters (NLP)
+M3  Total workflows stated + tools called per workflow
+M4  Is the cluster similar, or is a NEW workflow generated every time for the
+    same intent?   -> workflow reuse / divergence, the "6 intents vs 100
+    workflows" test
+M5  NORA API calls: agent side vs tool side, parallel fan-out, co-occurrence
+M6  Baseline: volume in the July window, +ve vs -ve samples
+
+Design principles
+-----------------
+- Standard library ONLY (no pandas / sklearn needed)
+- No hardcoded interaction count, intent name, tool name, MSISDN or column order
+- Nested JSON inside CSV cells is decoded recursively
+- Streaming CSV read; large JSON cells supported (field size limit raised)
+- Every threshold / pattern is a CLI flag or a constant at the top
+
+Usage
+-----
+    python nora_metrics_analyzer.py interactions.csv
+    python nora_metrics_analyzer.py ./output_updated/output --output-dir ./metrics
+    python nora_metrics_analyzer.py interactions.csv \
+        --start-date 2025-07-13 --end-date 2025-07-26 --only-positive
+"""
+
+from __future__ import annotations
+
+import argparse
+import ast
+import csv
+import glob as globlib
+import hashlib
+import json
+import os
+import re
+import statistics
+import sys
+from collections import Counter, defaultdict
+from dataclasses import dataclass, asdict, field
+from datetime import datetime, timezone
+from difflib import SequenceMatcher
+from itertools import combinations
+from pathlib import Path
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+JSON_MAX_DEPTH = 8
+
+# ---- tool status classification ----------------------------------------
+
+NO_DATA_PATTERNS = (
+    "no data",
+    "no tickets found",
+    "no ticket found",
+    "none found",
+    "no relevant",
+    "not found",
+    "no outage",
+    "no transport alarms",
+    "no incident",
+    "no records",
+    "empty result",
+)
+
+SKIPPED_PATTERNS = (
+    "skipped",
+    "unavailable",
+    "missing",
+    "unknown tool",
+    "not applicable",
+)
+
+PARTIAL_PATTERNS = (
+    "partial response",
+    "partial result",
+    "truncated",
+)
+
+# NOTE: deliberately specific. A bare "error" substring matches payloads that
+# merely contain `"error": null`, which is what mis-classified calls in v1.
+ERROR_PATTERNS = (
+    "error executing tool",
+    "failed to",
+    "failure:",
+    "exception",
+    "traceback",
+    "bad request",
+    "httpstatuserror",
+    "internal server error",
+    "timed out",
+    "timeout",
+    "unauthorized",
+    "forbidden",
+    '"status": 5',
+    '"status": 4',
+    '"code": 5',
+    '"code": 4',
+)
+
+SUCCESS_PATTERNS = (
+    "successful",
+    '"code": 200',
+    "'code': 200",
+    '"status": 200',
+)
+
+NULLISH = {"", "none", "null", "nan", "{}", "[]", "n/a", "na", "-"}
+
+# ---- tool naming: "nsm-get_pgw_hlr" -> namespace=nsm, function=get_pgw_hlr ---
+
+TOOL_NAME_PATTERN = re.compile(r"^(?P<namespace>[A-Za-z0-9_]+)[-:.](?P<function>.+)$")
+
+DEFAULT_NORA_NAMESPACES = (
+    "nsm",
+    "misc",
+    "search",
+    "snowflake",
+    "nora",
+    "qtm",
+)
+
+# ---- caller side (agent side vs tool side) -----------------------------
+
+AGENT_SIDE_HINTS = ("agent", "assistant", "planner", "orchestrat", "llm", "model", "reason")
+TOOL_SIDE_HINTS = ("tool", "executor", "worker", "api", "backend", "function", "server")
+DEFAULT_SIDE = "tool"
+
+SIDE_KEYS = (
+    "caller",
+    "invoker",
+    "origin",
+    "source",
+    "executor",
+    "actor",
+    "role",
+    "side",
+    "called_by",
+    "calledby",
+    "agent_name",
+    "agentname",
+    "record_type",
+    "recordtype",
+    "type",
+)
+
+# ---- customer feedback / sentiment -------------------------------------
+
+FEEDBACK_KEYS = (
+    "feedback",
+    "user_feedback",
+    "userfeedback",
+    "customer_feedback",
+    "customerfeedback",
+    "human_feedback",
+    "rating",
+    "user_rating",
+    "sentiment",
+    "thumbs",
+    "thumbs_up",
+    "csat",
+    "vote",
+    "is_positive",
+    "ispositive",
+    "feedback_value",
+    "feedbackvalue",
+    "reaction",
+)
+
+POSITIVE_VALUE_PATTERNS = (
+    r"^\s*(true|yes|y|1)\s*$",
+    r"pos",
+    r"thumbs?[_\- ]?up",
+    r"^\s*up\s*$",
+    r"good",
+    r"helpful",
+    r"resolved",
+    r"satisf",
+    r"like",
+    r"^\s*\+1\s*$",
+    r"^\s*[45](\.0)?\s*$",
+)
+
+NEGATIVE_VALUE_PATTERNS = (
+    r"^\s*(false|no|n|0)\s*$",
+    r"neg",
+    r"thumbs?[_\- ]?down",
+    r"^\s*down\s*$",
+    r"bad",
+    r"unhelpful",
+    r"not[_\- ]helpful",
+    r"unresolved",
+    r"dissatisf",
+    r"dislike",
+    r"^\s*-1\s*$",
+    r"^\s*[12](\.0)?\s*$",
+)
+
+POSITIVE_RE = tuple(re.compile(p, re.IGNORECASE) for p in POSITIVE_VALUE_PATTERNS)
+NEGATIVE_RE = tuple(re.compile(p, re.IGNORECASE) for p in NEGATIVE_VALUE_PATTERNS)
+
+# ---- timestamps ---------------------------------------------------------
+
+TIMESTAMP_KEYS = (
+    "timestamp",
+    "time",
+    "ts",
+    "_ts",
+    "created_at",
+    "createdat",
+    "start_time",
+    "starttime",
+    "event_time",
+    "eventtime",
+    "updated_at",
+    "updatedat",
+    "date",
+)
+
+TIMESTAMP_FORMATS = (
+    "%Y-%m-%dT%H:%M:%S.%f%z",
+    "%Y-%m-%dT%H:%M:%S%z",
+    "%Y-%m-%dT%H:%M:%S.%f",
+    "%Y-%m-%dT%H:%M:%S",
+    "%Y-%m-%d %H:%M:%S.%f",
+    "%Y-%m-%d %H:%M:%S",
+    "%Y-%m-%d",
+    "%d/%m/%Y %H:%M:%S",
+    "%m/%d/%Y %H:%M:%S",
+    "%d-%m-%Y %H:%M:%S",
+)
+
+# ---- step / grouping keys (for parallel fan-out detection) --------------
+
+STEP_KEYS = (
+    "step_id",
+    "stepid",
+    "turn_id",
+    "turnid",
+    "parent_id",
+    "parentid",
+    "parent_call_id",
+    "group_id",
+    "groupid",
+    "batch_id",
+    "batchid",
+    "iteration",
+    "turn",
+    "step",
+)
+
+# ---- defaults -----------------------------------------------------------
+
+DEFAULT_INTENT_THRESHOLD = 0.72
+DEFAULT_WORKFLOW_THRESHOLD = 0.70
+DEFAULT_ORDER_WEIGHT = 0.35
+DEFAULT_PARALLEL_WINDOW_SECONDS = 1.0
+DEFAULT_MAX_CLUSTER_ITEMS = 4000
+DEFAULT_PREVIEW_CHARS = 500
+
+
+# ============================================================
+# GENERIC HELPERS
+# ============================================================
+
+def normalize_key(value: Any) -> str:
+    if value is None:
+        return ""
+    return re.sub(r"[^a-z0-9]+", "_", str(value).strip().lower()).strip("_")
+
+
+def normalize_text(value: Any) -> str:
+    if value is None:
+        return ""
+    text = str(value)
+    text = text.replace("\\n", " ").replace("\\r", " ").replace("\\t", " ")
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def normalize_label(value: Any) -> str:
+    """Aggressive normalisation used for clustering / dedup of labels."""
+    return re.sub(r"[^a-z0-9]+", " ", str(value).lower()).strip()
+
+
+def short_text(value: Any, limit: int = DEFAULT_PREVIEW_CHARS) -> str:
+    text = normalize_text(value)
+    return text if len(text) <= limit else text[:limit] + "..."
+
+
+def stable_hash(value: str, length: int = 20) -> str:
+    return hashlib.sha256(value.encode("utf-8", errors="ignore")).hexdigest()[:length]
+
+
+def json_dumps_safe(value: Any) -> str:
+    try:
+        return json.dumps(value, ensure_ascii=False, default=str)
+    except Exception:
+        return str(value)
+
+
+def unique_preserve_order(values: Iterable[Any]) -> List[Any]:
+    seen: Set[str] = set()
+    output: List[Any] = []
+    for value in values:
+        marker = json_dumps_safe(value)
+        if marker not in seen:
+            seen.add(marker)
+            output.append(value)
+    return output
+
+
+def is_nullish(value: Any) -> bool:
+    return normalize_text(value).strip().lower() in NULLISH
+
+
+def safe_div(numerator: float, denominator: float, digits: int = 6) -> float:
+    return round(numerator / denominator, digits) if denominator else 0.0
+
+
+def pct(part: float, whole: float) -> float:
+    return round(100.0 * part / whole, 2) if whole else 0.0
+
+
+def log(message: str, quiet: bool = False) -> None:
+    if not quiet:
+        print(message, flush=True)
+
+
+# ============================================================
+# SAFE JSON / PYTHON-LITERAL DECODING
+# ============================================================
+
+def try_decode(value: Any, depth: int = 0) -> Any:
+    """
+    Decode JSON strings, Python literals and JSON-inside-JSON, recursively.
+    Handles CSV-doubled quotes ("" -> ") and backslash-escaped quotes, which is
+    exactly how the tool_history payloads arrive in these dumps.
+    """
+    if depth >= JSON_MAX_DEPTH:
+        return value
+
+    if isinstance(value, dict):
+        return {k: try_decode(v, depth + 1) for k, v in value.items()}
+
+    if isinstance(value, list):
+        return [try_decode(v, depth + 1) for v in value]
+
+    if not isinstance(value, str):
+        return value
+
+    text = value.strip()
+    if len(text) < 2:
+        return value
+
+    if not ((text[0] == "{" and text[-1] == "}") or (text[0] == "[" and text[-1] == "]")):
+        return value
+
+    for candidate in _decode_candidates(text):
+        try:
+            return try_decode(json.loads(candidate), depth + 1)
+        except Exception:
+            continue
+
+    try:
+        decoded = ast.literal_eval(text)
+        if isinstance(decoded, (dict, list, tuple)):
+            return try_decode(list(decoded) if isinstance(decoded, tuple) else decoded, depth + 1)
+    except Exception:
+        pass
+
+    return value
+
+
+def _decode_candidates(text: str) -> Iterator[str]:
+    """Progressive un-escaping attempts, cheapest first."""
+    yield text
+    if '""' in text:
+        yield text.replace('""', '"')
+    if '\\"' in text:
+        yield text.replace('\\"', '"')
+    if '""' in text and '\\"' in text:
+        yield text.replace('""', '"').replace('\\"', '"')
+
+
+# ============================================================
+# RECURSIVE STRUCTURE WALKER
+# ============================================================
+
+def walk(obj: Any, path: Tuple[str, ...] = ()) -> Iterator[Tuple[Tuple[str, ...], str, Any]]:
+    """Yield (path, normalized_key, value) across nested dict/list structures."""
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            nkey = normalize_key(key)
+            yield path, nkey, value
+            yield from walk(value, path + (nkey,))
+    elif isinstance(obj, list):
+        for idx, value in enumerate(obj):
+            yield from walk(value, path + (str(idx),))
+
+
+def find_values_by_key_patterns(
+    obj: Any,
+    include_patterns: Sequence[str],
+    exclude_patterns: Sequence[str] = (),
+) -> List[Any]:
+    output: List[Any] = []
+    for _, key, value in walk(obj):
+        if not key:
+            continue
+        if not any(pattern in key for pattern in include_patterns):
+            continue
+        if any(pattern in key for pattern in exclude_patterns):
+            continue
+        if isinstance(value, (str, int, float, bool)):
+            output.append(value)
+        elif isinstance(value, list):
+            for item in value:
+                if isinstance(item, (str, int, float, bool)):
+                    output.append(item)
+    return output
+
+
+def find_values_by_exact_keys(obj: Any, keys: Sequence[str]) -> List[Any]:
+    wanted = {normalize_key(k) for k in keys}
+    output: List[Any] = []
+    for _, key, value in walk(obj):
+        if key in wanted and isinstance(value, (str, int, float, bool)):
+            output.append(value)
+    return output
+
+
+# ============================================================
+# TIMESTAMP PARSING
+# ============================================================
+
+def parse_timestamp(value: Any) -> Optional[datetime]:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if isinstance(value, (int, float)):
+        return _from_epoch(float(value))
+
+    text = normalize_text(value)
+    if not text or text.lower() in NULLISH:
+        return None
+
+    iso_text = text.replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(iso_text)
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    except Exception:
+        pass
+
+    for fmt in TIMESTAMP_FORMATS:
+        try:
+            parsed = datetime.strptime(text, fmt)
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+        except Exception:
+            continue
+
+    stripped = text.replace(".", "", 1)
+    if stripped.isdigit():
+        return _from_epoch(float(text))
+
+    return None
+
+
+def _from_epoch(value: float) -> Optional[datetime]:
+    if value <= 0:
+        return None
+    if value > 1e17:        # nanoseconds
+        value /= 1e9
+    elif value > 1e14:      # microseconds
+        value /= 1e6
+    elif value > 1e11:      # milliseconds
+        value /= 1e3
+    try:
+        return datetime.fromtimestamp(value, tz=timezone.utc)
+    except Exception:
+        return None
+
+
+def extract_timestamp(node: Dict[str, Any]) -> Optional[datetime]:
+    normalized = {normalize_key(k): v for k, v in node.items()}
+    for key in TIMESTAMP_KEYS:
+        if key in normalized:
+            parsed = parse_timestamp(normalized[key])
+            if parsed:
+                return parsed
+    return None
+
+
+def find_any_timestamp(obj: Any) -> Optional[datetime]:
+    for value in find_values_by_exact_keys(obj, TIMESTAMP_KEYS):
+        parsed = parse_timestamp(value)
+        if parsed:
+            return parsed
+    return None
+
+
+def iso_or_blank(value: Optional[datetime]) -> str:
+    return value.isoformat() if value else ""
+
+
+# ============================================================
+# INTERACTION-ID EXTRACTION
+# ============================================================
+
+ID_PRIORITY = (
+    "interaction_id",
+    "interactionid",
+    "cid",
+    "conversation_id",
+    "conversationid",
+    "run_id",
+    "runid",
+    "session_id",
+    "sessionid",
+)
+
+
+def find_interaction_id(obj: Any, row_number: int) -> str:
+    normalized_priority = [normalize_key(x) for x in ID_PRIORITY]
+    values_by_key: Dict[str, List[str]] = defaultdict(list)
+
+    for _, key, value in walk(obj):
+        if key in normalized_priority and isinstance(value, (str, int)):
+            text = str(value).strip()
+            if text and text.lower() not in NULLISH:
+                values_by_key[key].append(text)
+
+    for candidate in normalized_priority:
+        if values_by_key[candidate]:
+            return values_by_key[candidate][0]
+
+    for value in find_values_by_key_patterns(obj, include_patterns=("id",)):
+        text = str(value).strip()
+        if len(text) >= 8:
+            return text
+
+    return f"row_{row_number:09d}"
+
+
+# ============================================================
+# USER-PROBLEM EXTRACTION
+# ============================================================
+
+USER_ROLES = {"user", "customer", "human", "subscriber", "caller", "end_user"}
+
+PROBLEM_FALLBACK_PATTERNS = (
+    "problem",
+    "issue",
+    "customer_query",
+    "user_query",
+    "complaint",
+    "utterance",
+    "question",
+    "description",
+)
+
+PROBLEM_EXCLUDE_PATTERNS = (
+    "id",
+    "count",
+    "status_code",
+    "timestamp",
+)
+
+
+def extract_user_messages(obj: Any) -> List[str]:
+    messages: List[str] = []
+
+    def recurse(node: Any) -> None:
+        if isinstance(node, dict):
+            normalized = {normalize_key(k): v for k, v in node.items()}
+            role = normalize_text(
+                normalized.get("role", normalized.get("type", normalized.get("speaker", "")))
+            ).lower()
+
+            if role in USER_ROLES:
+                for field_name in ("content", "text", "message", "query", "utterance", "data"):
+                    if field_name not in normalized:
+                        continue
+                    value = normalized[field_name]
+                    if isinstance(value, str):
+                        text = normalize_text(value)
+                        if text:
+                            messages.append(text)
+                    elif isinstance(value, dict):
+                        for inner_name in ("content", "text", "message", "query", "utterance"):
+                            inner = value.get(inner_name)
+                            if isinstance(inner, str) and normalize_text(inner):
+                                messages.append(normalize_text(inner))
+                    elif isinstance(value, list):
+                        for item in value:
+                            if isinstance(item, str) and normalize_text(item):
+                                messages.append(normalize_text(item))
+
+            for value in node.values():
+                recurse(value)
+
+        elif isinstance(node, list):
+            for value in node:
+                recurse(value)
+
+    recurse(obj)
+
+    if not messages:
+        fallback = find_values_by_key_patterns(
+            obj,
+            include_patterns=PROBLEM_FALLBACK_PATTERNS,
+            exclude_patterns=PROBLEM_EXCLUDE_PATTERNS,
+        )
+        for value in fallback:
+            if isinstance(value, str):
+                text = normalize_text(value)
+                if len(text) >= 3:
+                    messages.append(text)
+
+    return unique_preserve_order(messages)
+
+
+def extract_problem_categories(obj: Any) -> List[str]:
+    values = find_values_by_key_patterns(
+        obj,
+        include_patterns=("category", "problem_type", "issue_type", "topic", "bucket"),
+        exclude_patterns=("id", "count"),
+    )
+    out = [normalize_text(v) for v in values if normalize_text(v)]
+    return unique_preserve_order(out)
+
+
+# ============================================================
+# INTENT / SUBINTENT EXTRACTION
+# ============================================================
+
+INTENT_EXCLUDE_TOKENS = ("confidence", "score", "probability", "threshold", "id", "count", "index")
+
+
+def extract_intents(obj: Any) -> Tuple[List[str], List[str]]:
+    intents: List[str] = []
+    subintents: List[str] = []
+
+    for _, key, value in walk(obj):
+        if not isinstance(value, (str, int, float)) or isinstance(value, bool):
+            continue
+
+        text = normalize_text(value)
+        if not text or text.lower() in NULLISH:
+            continue
+
+        if "subintent" in key or "sub_intent" in key:
+            subintents.append(text)
+            continue
+
+        if "intent" in key:
+            if any(token in key for token in INTENT_EXCLUDE_TOKENS):
+                continue
+            intents.append(text)
+
+    return unique_preserve_order(intents), unique_preserve_order(subintents)
+
+
+def extract_workflow_names(obj: Any) -> List[str]:
+    values = find_values_by_key_patterns(
+        obj,
+        include_patterns=("workflow", "playbook", "flow_name", "plan_name", "fixit_flow"),
+        exclude_patterns=("id", "count", "index"),
+    )
+    out = [normalize_text(v) for v in values if normalize_text(v) and normalize_text(v).lower() not in NULLISH]
+    return unique_preserve_order(out)
+
+
+# ============================================================
+# FEEDBACK / SENTIMENT EXTRACTION
+# ============================================================
+
+def classify_feedback_value(value: Any) -> str:
+    text = normalize_text(value)
+    if not text or text.lower() in NULLISH:
+        return "unknown"
+    # negative first: "not helpful" must not be caught by the "helpful" positive
+    if any(pattern.search(text) for pattern in NEGATIVE_RE):
+        return "negative"
+    if any(pattern.search(text) for pattern in POSITIVE_RE):
+        return "positive"
+    return "unknown"
+
+
+def extract_feedback(obj: Any) -> Tuple[str, List[str]]:
+    """Return (sentiment, raw_feedback_values)."""
+    raw_values = [
+        normalize_text(v)
+        for v in find_values_by_exact_keys(obj, FEEDBACK_KEYS)
+        if normalize_text(v) and normalize_text(v).lower() not in NULLISH
+    ]
+
+    sentiment = "unknown"
+    for value in raw_values:
+        classified = classify_feedback_value(value)
+        if classified == "negative":
+            return "negative", unique_preserve_order(raw_values)
+        if classified == "positive":
+            sentiment = "positive"
+
+    return sentiment, unique_preserve_order(raw_values)
+
+
+# ============================================================
+# TOOL-CALL EXTRACTION
+# ============================================================
+
+@dataclass
+class ToolCall:
+    interaction_id: str
+    row_number: int
+    call_index: int
+
+    tool_name: str
+    namespace: str
+    function_name: str
+    is_nora_api: int
+    side: str
+
+    arguments: str
+    argument_keys: str
+    result: str
+    error: str
+
+    status: str
+    is_success: int
+
+    timestamp: str
+    step_key: str
+    parallel_group: str
+    parallel_degree: int
+
+    source_path: str
+    result_length: int
+    argument_length: int
+
+
+TOOL_NAME_KEYS = {"function_name", "tool_name", "functionname", "toolname", "api_name", "apiname"}
+ARG_KEYS = {"arguments", "args", "parameters", "params", "input"}
+RESULT_KEYS = {"function_result", "tool_result", "result", "output", "response"}
+ERROR_KEYS = {"error", "exception", "error_message", "errormessage", "err"}
+
+
+def split_tool_name(tool_name: str) -> Tuple[str, str]:
+    match = TOOL_NAME_PATTERN.match(tool_name.strip())
+    if not match:
+        return "", tool_name.strip()
+    return match.group("namespace"), match.group("function")
+
+
+def classify_tool_status(result: Any, error: Any) -> str:
+    """
+    Structured error field wins; only then do we fall back to text patterns.
+    (v1 classified any payload containing the substring "error" as a failure,
+    including payloads carrying `"error": null`.)
+    """
+    error_text = normalize_text(error)
+    has_real_error = bool(error_text) and error_text.lower() not in NULLISH
+
+    if has_real_error:
+        lowered = error_text.lower()
+        if any(pattern in lowered for pattern in SKIPPED_PATTERNS):
+            return "skipped"
+        return "error"
+
+    result_text = normalize_text(result).lower()
+
+    if not result_text or result_text in NULLISH:
+        return "empty"
+
+    if any(pattern in result_text for pattern in PARTIAL_PATTERNS):
+        return "partial"
+
+    if any(pattern in result_text for pattern in ERROR_PATTERNS):
+        return "error"
+
+    if any(pattern in result_text for pattern in NO_DATA_PATTERNS):
+        return "no_data"
+
+    if any(pattern in result_text for pattern in SKIPPED_PATTERNS):
+        return "skipped"
+
+    return "success"
+
+
+def classify_side(node: Dict[str, Any], row_context: Dict[str, Any]) -> str:
+    """Agent side vs tool side, per the notes' 'on tool side & on agent side'."""
+    candidates: List[str] = []
+
+    normalized = {normalize_key(k): v for k, v in node.items()}
+    for key in SIDE_KEYS:
+        if key in normalized and isinstance(normalized[key], (str, int, float)):
+            candidates.append(normalize_text(normalized[key]).lower())
+
+    if not candidates:
+        for value in find_values_by_exact_keys(row_context, SIDE_KEYS):
+            candidates.append(normalize_text(value).lower())
+
+    for text in candidates:
+        if not text:
+            continue
+        if any(hint in text for hint in AGENT_SIDE_HINTS):
+            return "agent"
+        if any(hint in text for hint in TOOL_SIDE_HINTS):
+            return "tool"
+
+    return DEFAULT_SIDE
+
+
+def extract_step_key(node: Dict[str, Any], row_context: Dict[str, Any]) -> str:
+    normalized = {normalize_key(k): v for k, v in node.items()}
+    for key in STEP_KEYS:
+        if key in normalized and isinstance(normalized[key], (str, int, float)):
+            text = normalize_text(normalized[key])
+            if text and text.lower() not in NULLISH:
+                return text
+    for value in find_values_by_exact_keys(row_context, STEP_KEYS):
+        text = normalize_text(value)
+        if text and text.lower() not in NULLISH:
+            return text
+    return ""
+
+
+def extract_tool_calls(
+    obj: Any,
+    interaction_id: str,
+    row_number: int,
+    nora_namespaces: Sequence[str],
+    preview_chars: int,
+    row_timestamp: Optional[datetime],
+) -> List[ToolCall]:
+    calls: List[ToolCall] = []
+
+    def recurse(node: Any, path: Tuple[str, ...]) -> None:
+        if isinstance(node, dict):
+            normalized = {normalize_key(k): v for k, v in node.items()}
+
+            tool_name = ""
+            for key in TOOL_NAME_KEYS:
+                value = normalized.get(key)
+                if isinstance(value, str) and value.strip():
+                    tool_name = value.strip()
+                    break
+
+            if not tool_name:
+                name = normalized.get("name")
+                if isinstance(name, str) and name.strip():
+                    context_keys = set(normalized.keys())
+                    if context_keys.intersection(ARG_KEYS | RESULT_KEYS | ERROR_KEYS):
+                        tool_name = name.strip()
+
+            if tool_name:
+                arguments: Any = None
+                result: Any = None
+                error: Any = None
+
+                for key in ARG_KEYS:
+                    if key in normalized:
+                        arguments = normalized[key]
+                        break
+                for key in RESULT_KEYS:
+                    if key in normalized:
+                        result = normalized[key]
+                        break
+                for key in ERROR_KEYS:
+                    if key in normalized:
+                        error = normalized[key]
+                        break
+
+                namespace, function_name = split_tool_name(tool_name)
+                status = classify_tool_status(result=result, error=error)
+                arguments_text = json_dumps_safe(arguments)
+                result_text = json_dumps_safe(result)
+                node_ts = extract_timestamp(node) or row_timestamp
+
+                argument_keys = ""
+                if isinstance(arguments, dict):
+                    argument_keys = "|".join(sorted(normalize_key(k) for k in arguments))
+
+                calls.append(
+                    ToolCall(
+                        interaction_id=interaction_id,
+                        row_number=row_number,
+                        call_index=0,  # assigned after ordering
+                        tool_name=tool_name,
+                        namespace=namespace,
+                        function_name=function_name,
+                        is_nora_api=int(
+                            (namespace or tool_name).lower() in {n.lower() for n in nora_namespaces}
+                        ),
+                        side=classify_side(node, obj),
+                        arguments=short_text(arguments_text, preview_chars),
+                        argument_keys=argument_keys,
+                        result=short_text(result_text, preview_chars),
+                        error=short_text(normalize_text(error), preview_chars),
+                        status=status,
+                        is_success=int(status == "success"),
+                        timestamp=iso_or_blank(node_ts),
+                        step_key=extract_step_key(node, obj),
+                        parallel_group="",     # assigned in finalisation
+                        parallel_degree=1,
+                        source_path=".".join(path),
+                        result_length=len(result_text),
+                        argument_length=len(arguments_text),
+                    )
+                )
+                # Do not descend into a matched call's own payload: the result
+                # body often echoes a nested "name"/"response" pair.
+                return
+
+            for key, value in node.items():
+                recurse(value, path + (normalize_key(key),))
+
+        elif isinstance(node, list):
+            for idx, value in enumerate(node):
+                recurse(value, path + (str(idx),))
+
+    recurse(obj, ())
+
+    # Deduplicate ONLY within this row. The same call object is frequently
+    # serialised twice inside one row (raw + parsed). Genuine retries of the
+    # same tool live in *different* rows and must be preserved, otherwise the
+    # "repeated tool calls" metric silently under-reports.
+    unique_calls: List[ToolCall] = []
+    seen: Set[Tuple[str, str, str, str, str]] = set()
+    for call in calls:
+        fingerprint = (call.tool_name, call.arguments, call.result, call.error, call.timestamp)
+        if fingerprint in seen:
+            continue
+        seen.add(fingerprint)
+        unique_calls.append(call)
+
+    return unique_calls
+
+
+# ============================================================
+# CSV ROW DECODING
+# ============================================================
+
+def decode_csv_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    decoded: Dict[str, Any] = {}
+    for key, value in row.items():
+        if key is None:
+            continue
+        if isinstance(value, list):        # DictReader restkey (ragged rows)
+            value = " ".join(str(v) for v in value)
+        decoded[str(key).strip()] = try_decode(value)
+    return decoded
+
+
+def raise_csv_field_limit() -> int:
+    """
+    CRITICAL FIX: the default 131,072-char field cap makes csv abort with
+    "_csv.Error: field larger than field limit" on rows that carry a whole
+    tool_history JSON blob in one cell.
+    """
+    limit = min(sys.maxsize, 2**31 - 1)
+    while limit > 1024:
+        try:
+            csv.field_size_limit(limit)
+            return limit
+        except OverflowError:
+            limit //= 2
+    return csv.field_size_limit()
+
+
+# ============================================================
+# INTERACTION AGGREGATION
+# ============================================================
+
+@dataclass
+class InteractionAccumulator:
+    interaction_id: str
+    source_row_count: int = 0
+
+    problems: List[str] = field(default_factory=list)
+    problem_categories: List[str] = field(default_factory=list)
+    intents: List[str] = field(default_factory=list)
+    subintents: List[str] = field(default_factory=list)
+    workflow_names: List[str] = field(default_factory=list)
+    tool_calls: List[ToolCall] = field(default_factory=list)
+
+    feedback_values: List[str] = field(default_factory=list)
+    sentiment: str = "unknown"
+
+    started_at: Optional[datetime] = None
+    ended_at: Optional[datetime] = None
+
+    source_files: List[str] = field(default_factory=list)
+
+    # ---- derived views -------------------------------------------------
+    def tool_names(self) -> List[str]:
+        return [call.tool_name for call in self.tool_calls]
+
+    def tool_sequence(self, dedupe_consecutive: bool = True) -> List[str]:
+        names = self.tool_names()
+        if not dedupe_consecutive:
+            return names
+        out: List[str] = []
+        for name in names:
+            if not out or out[-1] != name:
+                out.append(name)
+        return out
+
+    def primary_intent(self) -> str:
+        return self.intents[0] if self.intents else ""
+
+    def primary_problem(self) -> str:
+        return self.problems[0] if self.problems else ""
+
+    def parallel_groups(self) -> List[Tuple[str, ...]]:
+        groups: Dict[str, Set[str]] = defaultdict(set)
+        for call in self.tool_calls:
+            if call.parallel_group:
+                groups[call.parallel_group].add(call.tool_name)
+        return [tuple(sorted(tools)) for tools in groups.values() if len(tools) > 1]
+
+    def max_parallel_degree(self) -> int:
+        return max((call.parallel_degree for call in self.tool_calls), default=0)
+
+
+def workflow_signature(tool_names: Sequence[str]) -> str:
+    normalized = [normalize_text(name) for name in tool_names if normalize_text(name)]
+    return " -> ".join(normalized)
+
+
+def workflow_set_signature(tool_names: Sequence[str]) -> str:
+    return " | ".join(sorted(set(tool_names)))
+
+
+def finalize_interaction(
+    item: InteractionAccumulator,
+    parallel_window_seconds: float,
+) -> None:
+    """Order tool calls by time, renumber, and assign parallel fan-out groups."""
+    item.problems = unique_preserve_order(item.problems)
+    item.problem_categories = unique_preserve_order(item.problem_categories)
+    item.intents = unique_preserve_order(item.intents)
+    item.subintents = unique_preserve_order(item.subintents)
+    item.workflow_names = unique_preserve_order(item.workflow_names)
+    item.feedback_values = unique_preserve_order(item.feedback_values)
+    item.source_files = unique_preserve_order(item.source_files)
+
+    # FIX: v1 relied purely on CSV row order. Order by timestamp when present,
+    # falling back to row order, so workflow signatures are stable.
+    def sort_key(entry: Tuple[int, ToolCall]) -> Tuple[int, float, int, int]:
+        index, call = entry
+        parsed = parse_timestamp(call.timestamp)
+        if parsed is None:
+            return (1, 0.0, call.row_number, index)
+        return (0, parsed.timestamp(), call.row_number, index)
+
+    ordered = [call for _, call in sorted(enumerate(item.tool_calls), key=sort_key)]
+    item.tool_calls = ordered
+
+    for idx, call in enumerate(item.tool_calls, start=1):
+        call.call_index = idx
+
+    # ---- parallel fan-out detection -----------------------------------
+    # Priority: explicit step id > timestamp window > same source row.
+    groups: Dict[str, List[ToolCall]] = defaultdict(list)
+    anchor_ts: Optional[datetime] = None
+    anchor_key = ""
+
+    for call in item.tool_calls:
+        if call.step_key:
+            key = f"step::{call.step_key}"
+        else:
+            parsed = parse_timestamp(call.timestamp)
+            if parsed is not None:
+                if anchor_ts is None or (parsed - anchor_ts).total_seconds() > parallel_window_seconds:
+                    anchor_ts = parsed
+                    anchor_key = f"win::{parsed.isoformat()}"
+                key = anchor_key
+            else:
+                key = f"row::{call.row_number}"
+        groups[key].append(call)
+
+    for key, group in groups.items():
+        group_id = stable_hash(f"{item.interaction_id}::{key}", 12)
+        distinct_tools = len({call.tool_name for call in group})
+        for call in group:
+            call.parallel_group = group_id
+            call.parallel_degree = distinct_tools
+
+
+# ============================================================
+# CLUSTERING  (stdlib only: token blocking + union-find)
+# ============================================================
+
+class UnionFind:
+    def __init__(self, size: int) -> None:
+        self.parent = list(range(size))
+
+    def find(self, x: int) -> int:
+        while self.parent[x] != x:
+            self.parent[x] = self.parent[self.parent[x]]
+            x = self.parent[x]
+        return x
+
+    def union(self, a: int, b: int) -> None:
+        ra, rb = self.find(a), self.find(b)
+        if ra != rb:
+            self.parent[max(ra, rb)] = min(ra, rb)
+
+
+@dataclass
+class ClusterResult:
+    assignments: Dict[str, int] = field(default_factory=dict)
+    representatives: Dict[int, str] = field(default_factory=dict)
+    members: Dict[int, List[str]] = field(default_factory=dict)
+    method: str = "none"
+
+    @property
+    def n_clusters(self) -> int:
+        return len(self.members)
+
+    def cluster_of(self, item: str) -> Optional[int]:
+        return self.assignments.get(item)
+
+    def label_of(self, item: str, default: str = "") -> str:
+        cid = self.assignments.get(item)
+        return self.representatives.get(cid, default) if cid is not None else default
+
+
+def _package_clusters(
+    items: Sequence[str],
+    labels: Sequence[int],
+    weights: Dict[str, int],
+    method: str,
+) -> ClusterResult:
+    grouped: Dict[int, List[str]] = defaultdict(list)
+    for item, label in zip(items, labels):
+        grouped[int(label)].append(item)
+
+    result = ClusterResult(method=method)
+    ordered = sorted(grouped.items(), key=lambda kv: (-len(kv[1]), str(kv[0])))
+    for new_id, (_, members) in enumerate(ordered):
+        result.members[new_id] = sorted(members)
+        result.representatives[new_id] = max(members, key=lambda m: (weights.get(m, 0), -len(m)))
+        for member in members:
+            result.assignments[member] = new_id
+    return result
+
+
+def _token_blocks(items: Sequence[str], tokens: Sequence[Set[str]]) -> Dict[str, List[int]]:
+    """Inverted index so we only compare candidates that share a token."""
+    blocks: Dict[str, List[int]] = defaultdict(list)
+    for idx, token_set in enumerate(tokens):
+        for token in token_set:
+            blocks[token].append(idx)
+    return blocks
+
+
+def text_similarity(a: str, b: str, ta: Set[str], tb: Set[str]) -> float:
+    if not a or not b:
+        return 0.0
+    jaccard = len(ta & tb) / len(ta | tb) if (ta or tb) else 0.0
+    ratio = SequenceMatcher(None, a, b).ratio()
+    return max(jaccard, 0.5 * jaccard + 0.5 * ratio)
+
+
+def cluster_texts(
+    values: Sequence[str],
+    weights: Optional[Dict[str, int]] = None,
+    threshold: float = DEFAULT_INTENT_THRESHOLD,
+    max_items: int = DEFAULT_MAX_CLUSTER_ITEMS,
+    enabled: bool = True,
+) -> ClusterResult:
+    """Cluster free-text labels (intents, sub-intents, problem statements)."""
+    weights = weights or {}
+    items = [v for v in unique_preserve_order(values) if str(v).strip()]
+
+    if not items:
+        return ClusterResult(method="empty")
+
+    if not enabled:
+        return _package_clusters(items, list(range(len(items))), weights, "disabled")
+
+    normalized = [normalize_label(item) for item in items]
+
+    if len(items) > max_items:
+        buckets: Dict[str, int] = {}
+        labels = [buckets.setdefault(text, len(buckets)) for text in normalized]
+        return _package_clusters(items, labels, weights, "normalized-exact (size guard)")
+
+    tokens = [set(text.split()) for text in normalized]
+    blocks = _token_blocks(items, tokens)
+    uf = UnionFind(len(items))
+
+    compared: Set[Tuple[int, int]] = set()
+    for candidates in blocks.values():
+        if len(candidates) > 400:      # skip pathological stop-word blocks
+            continue
+        for i, j in combinations(candidates, 2):
+            pair = (i, j) if i < j else (j, i)
+            if pair in compared:
+                continue
+            compared.add(pair)
+            if text_similarity(normalized[i], normalized[j], tokens[i], tokens[j]) >= threshold:
+                uf.union(i, j)
+
+    labels = [uf.find(i) for i in range(len(items))]
+    return _package_clusters(items, labels, weights, "token-blocking + difflib union-find")
+
+
+def sequence_similarity(
+    seq_a: Sequence[str],
+    seq_b: Sequence[str],
+    set_a: Set[str],
+    set_b: Set[str],
+    order_weight: float,
+) -> float:
+    if not set_a or not set_b:
+        return 0.0
+    jaccard = len(set_a & set_b) / len(set_a | set_b)
+    order = SequenceMatcher(None, list(seq_a), list(seq_b)).ratio()
+    return (1 - order_weight) * jaccard + order_weight * order
+
+
+def cluster_tool_sequences(
+    sequences: Dict[str, Sequence[str]],
+    weights: Optional[Dict[str, int]] = None,
+    threshold: float = DEFAULT_WORKFLOW_THRESHOLD,
+    order_weight: float = DEFAULT_ORDER_WEIGHT,
+    max_items: int = DEFAULT_MAX_CLUSTER_ITEMS,
+    enabled: bool = True,
+) -> ClusterResult:
+    """
+    Task-decomposition clustering: do two workflows do essentially the same
+    thing (same tools, similar order), or is a genuinely new decomposition
+    generated each run?
+    """
+    weights = weights or {}
+    keys = [key for key, seq in sequences.items() if seq]
+
+    if not keys:
+        return ClusterResult(method="empty")
+
+    if not enabled:
+        return _package_clusters(keys, list(range(len(keys))), weights, "disabled")
+
+    sets = {key: set(sequences[key]) for key in keys}
+
+    if len(keys) > max_items:
+        buckets: Dict[Tuple[str, ...], int] = {}
+        labels = [buckets.setdefault(tuple(sorted(sets[key])), len(buckets)) for key in keys]
+        return _package_clusters(keys, labels, weights, "toolset-exact (size guard)")
+
+    blocks: Dict[str, List[int]] = defaultdict(list)
+    for idx, key in enumerate(keys):
+        for tool in sets[key]:
+            blocks[tool].append(idx)
+
+    uf = UnionFind(len(keys))
+    compared: Set[Tuple[int, int]] = set()
+    for candidates in blocks.values():
+        if len(candidates) > 400:
+            continue
+        for i, j in combinations(candidates, 2):
+            pair = (i, j) if i < j else (j, i)
+            if pair in compared:
+                continue
+            compared.add(pair)
+            a, b = keys[i], keys[j]
+            score = sequence_similarity(sequences[a], sequences[b], sets[a], sets[b], order_weight)
+            if score >= threshold:
+                uf.union(i, j)
+
+    labels = [uf.find(i) for i in range(len(keys))]
+    return _package_clusters(keys, labels, weights, "jaccard + sequence union-find")
+
+
+# ============================================================
+# FILTERS  (July window / positive-only baseline)
+# ============================================================
+
+def parse_boundary_date(value: Optional[str], end_of_day: bool = False) -> Optional[datetime]:
+    if not value:
+        return None
+    parsed = parse_timestamp(value)
+    if parsed is None:
+        raise SystemExit(f"[ERROR] Invalid date '{value}'. Use ISO format, e.g. 2025-07-13")
+    if end_of_day and (parsed.hour, parsed.minute, parsed.second) == (0, 0, 0):
+        parsed = parsed.replace(hour=23, minute=59, second=59)
+    return parsed
+
+
+def filter_interactions(
+    interactions: Dict[str, InteractionAccumulator],
+    start_date: Optional[str],
+    end_date: Optional[str],
+    only_positive: bool,
+) -> Tuple[Dict[str, InteractionAccumulator], Dict[str, Any]]:
+    start = parse_boundary_date(start_date)
+    end = parse_boundary_date(end_date, end_of_day=True)
+
+    kept: Dict[str, InteractionAccumulator] = {}
+    dropped: Counter = Counter()
+
+    for key, item in interactions.items():
+        reference = item.started_at or item.ended_at
+
+        if (start or end) and reference is None:
+            dropped["missing_timestamp"] += 1
+            continue
+        if start and reference and reference < start:
+            dropped["before_start_date"] += 1
+            continue
+        if end and reference and reference > end:
+            dropped["after_end_date"] += 1
+            continue
+        if only_positive and item.sentiment != "positive":
+            dropped["not_positive"] += 1
+            continue
+
+        kept[key] = item
+
+    report = {
+        "start_date": start_date or "",
+        "end_date": end_date or "",
+        "only_positive": bool(only_positive),
+        "input_interactions": len(interactions),
+        "kept_interactions": len(kept),
+        "dropped": dict(dropped),
+    }
+    return kept, report
+
+
+# ============================================================
+# MAIN ANALYSIS
+# ============================================================
+
+def expand_inputs(paths: Sequence[str]) -> List[Path]:
+    """Accept files, directories and globs (so daily dumps just work)."""
+    resolved: List[Path] = []
+    for raw in paths:
+        expanded = globlib.glob(os.path.expanduser(raw))
+        candidates = [Path(p) for p in expanded] if expanded else [Path(os.path.expanduser(raw))]
+        for candidate in candidates:
+            if candidate.is_dir():
+                resolved.extend(sorted(candidate.glob("*.csv")))
+            else:
+                resolved.append(candidate)
+
+    unique: List[Path] = []
+    seen: Set[str] = set()
+    for path in resolved:
+        key = str(path.resolve())
+        if key not in seen:
+            seen.add(key)
+            unique.append(path.resolve())
+    return unique
+
+
+def analyze_csv_files(
+    input_files: Sequence[Path],
+    nora_namespaces: Sequence[str],
+    preview_chars: int,
+    parallel_window_seconds: float,
+    max_rows: Optional[int],
+    quiet: bool,
+) -> Tuple[Dict[str, InteractionAccumulator], Counter, Dict[str, Any]]:
+    interactions: Dict[str, InteractionAccumulator] = {}
+    schema_counter: Counter = Counter()
+
+    limit = raise_csv_field_limit()
+    log(f"[INFO] CSV field size limit set to {limit:,} characters", quiet)
+
+    ingest_report: Dict[str, Any] = {
+        "files": [],
+        "total_rows": 0,
+        "failed_rows": 0,
+        "rows_without_native_id": 0,
+    }
+
+    for input_csv in input_files:
+        log(f"[INFO] Reading: {input_csv}", quiet)
+        file_rows = 0
+        file_failures = 0
+
+        with input_csv.open("r", encoding="utf-8-sig", errors="replace", newline="") as handle:
+            reader = csv.DictReader(handle)
+
+            if not reader.fieldnames:
+                raise RuntimeError(f"CSV has no header row: {input_csv}")
+
+            log("[INFO] CSV columns: " + ", ".join(str(c) for c in reader.fieldnames), quiet)
+
+            for row_number, raw_row in enumerate(reader, start=1):
+                if max_rows is not None and row_number > max_rows:
+                    log(f"[INFO] Stopping early at --max-rows={max_rows}", quiet)
+                    break
+
+                if row_number % 10000 == 0:
+                    log(f"[INFO] Processed {row_number:,} CSV rows...", quiet)
+
+                try:
+                    decoded_row = decode_csv_row(raw_row)
+
+                    for key in decoded_row:
+                        schema_counter[normalize_key(key)] += 1
+
+                    interaction_id = find_interaction_id(decoded_row, row_number=row_number)
+                    if interaction_id.startswith("row_"):
+                        ingest_report["rows_without_native_id"] += 1
+
+                    item = interactions.get(interaction_id)
+                    if item is None:
+                        item = InteractionAccumulator(interaction_id=interaction_id)
+                        interactions[interaction_id] = item
+
+                    item.source_row_count += 1
+                    item.source_files.append(input_csv.name)
+
+                    row_timestamp = find_any_timestamp(decoded_row)
+                    if row_timestamp:
+                        item.started_at = min(item.started_at or row_timestamp, row_timestamp)
+                        item.ended_at = max(item.ended_at or row_timestamp, row_timestamp)
+
+                    intents, subintents = extract_intents(decoded_row)
+                    sentiment, feedback_values = extract_feedback(decoded_row)
+
+                    item.problems.extend(extract_user_messages(decoded_row))
+                    item.problem_categories.extend(extract_problem_categories(decoded_row))
+                    item.intents.extend(intents)
+                    item.subintents.extend(subintents)
+                    item.workflow_names.extend(extract_workflow_names(decoded_row))
+                    item.feedback_values.extend(feedback_values)
+
+                    if sentiment == "negative":
+                        item.sentiment = "negative"
+                    elif sentiment == "positive" and item.sentiment != "negative":
+                        item.sentiment = "positive"
+
+                    item.tool_calls.extend(
+                        extract_tool_calls(
+                            decoded_row,
+                            interaction_id=interaction_id,
+                            row_number=row_number,
+                            nora_namespaces=nora_namespaces,
+                            preview_chars=preview_chars,
+                            row_timestamp=row_timestamp,
+                        )
+                    )
+
+                except Exception as exc:  # row-level isolation: never lose the file
+                    file_failures += 1
+                    ingest_report["failed_rows"] += 1
+                    if file_failures <= 5:
+                        log(f"[WARN] Row {row_number} in {input_csv.name} failed: {exc}", quiet)
+                    continue
+
+                file_rows += 1
+
+        ingest_report["files"].append(
+            {
+                "file": str(input_csv),
+                "rows": file_rows,
+                "failed_rows": file_failures,
+                "size_mb": round(input_csv.stat().st_size / 1e6, 2),
+            }
+        )
+        ingest_report["total_rows"] += file_rows
+
+    log("[INFO] Ordering tool calls and detecting parallel fan-out...", quiet)
+    for item in interactions.values():
+        finalize_interaction(item, parallel_window_seconds=parallel_window_seconds)
+
+    log(f"[INFO] Discovered {len(interactions):,} interactions.", quiet)
+    return interactions, schema_counter, ingest_report
+
+
+# ============================================================
+# OUTPUT WRITERS
+# ============================================================
+
+def ensure_output_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def write_csv(path: Path, rows: Iterable[Dict[str, Any]], fieldnames: Sequence[str]) -> None:
+    with path.open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(fieldnames), extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+
+def write_json(path: Path, payload: Any) -> None:
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2, default=str)
+
+
+# ============================================================
+# PER-INTERACTION METRICS  (the 1:1 view)
+# ============================================================
+
+def build_interaction_rows(
+    interactions: Dict[str, InteractionAccumulator],
+    intent_clusters: ClusterResult,
+    problem_clusters: ClusterResult,
+    workflow_clusters: ClusterResult,
+) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+
+    for interaction_id, item in interactions.items():
+        tool_names = item.tool_names()
+        tool_counter = Counter(tool_names)
+        status_counter = Counter(call.status for call in item.tool_calls)
+
+        repeated_tools = {tool: count for tool, count in tool_counter.items() if count > 1}
+        total_calls = len(item.tool_calls)
+
+        sequence = item.tool_sequence()
+        workflow = workflow_signature(sequence)
+        workflow_id = stable_hash(workflow) if workflow else ""
+
+        primary_intent = item.primary_intent()
+        primary_problem = item.primary_problem()
+
+        rows.append(
+            {
+                "interaction_id": interaction_id,
+                "source_files": " | ".join(item.source_files),
+                "source_row_count": item.source_row_count,
+                "started_at": iso_or_blank(item.started_at),
+                "ended_at": iso_or_blank(item.ended_at),
+
+                "sentiment": item.sentiment,
+                "feedback_values": " || ".join(item.feedback_values)[:500],
+
+                "problem_count": len(item.problems),
+                "problems": short_text(" || ".join(item.problems), 2000),
+                "problem_categories": " || ".join(item.problem_categories),
+                "problem_cluster_id": problem_clusters.cluster_of(primary_problem),
+                "problem_cluster_label": short_text(problem_clusters.label_of(primary_problem), 200),
+
+                "intent_count": len(item.intents),
+                "intents": " || ".join(item.intents),
+                "primary_intent": primary_intent,
+                "intent_cluster_id": intent_clusters.cluster_of(primary_intent),
+                "intent_cluster_label": intent_clusters.label_of(primary_intent),
+
+                "subintent_count": len(item.subintents),
+                "subintents": " || ".join(item.subintents),
+                "subintent_cluster_labels": " || ".join(
+                    unique_preserve_order(
+                        [intent_clusters.label_of(s) for s in item.subintents if intent_clusters.label_of(s)]
+                    )
+                ),
+
+                "declared_workflow_names": " || ".join(item.workflow_names)[:500],
+
+                "tool_call_count": total_calls,
+                "unique_tool_count": len(set(tool_names)),
+                "tool_names": " || ".join(unique_preserve_order(tool_names)),
+
+                "workflow": short_text(workflow, 4000),
+                "workflow_id": workflow_id,
+                "workflow_step_count": len(sequence),
+                "workflow_tool_set": workflow_set_signature(tool_names),
+                "task_decomposition_cluster_id": workflow_clusters.cluster_of(workflow_id),
+
+                "nora_api_calls": sum(call.is_nora_api for call in item.tool_calls),
+                "nora_calls_agent_side": sum(
+                    1 for call in item.tool_calls if call.is_nora_api and call.side == "agent"
+                ),
+                "nora_calls_tool_side": sum(
+                    1 for call in item.tool_calls if call.is_nora_api and call.side == "tool"
+                ),
+                "calls_agent_side": sum(1 for call in item.tool_calls if call.side == "agent"),
+                "calls_tool_side": sum(1 for call in item.tool_calls if call.side == "tool"),
+
+                "max_parallel_degree": item.max_parallel_degree(),
+                "parallel_tool_groups": "; ".join(
+                    ", ".join(group) for group in item.parallel_groups()
+                )[:1000],
+
+                "success_calls": status_counter["success"],
+                "partial_calls": status_counter["partial"],
+                "no_data_calls": status_counter["no_data"],
+                "skipped_calls": status_counter["skipped"],
+                "error_calls": status_counter["error"],
+                "empty_calls": status_counter["empty"],
+                "tool_success_rate": safe_div(status_counter["success"], total_calls),
+
+                "repeated_tool_types": len(repeated_tools),
+                "repeated_tool_calls": sum(count - 1 for count in repeated_tools.values()),
+                "repeated_tools": json_dumps_safe(repeated_tools),
+
+                "has_problem": int(bool(item.problems)),
+                "has_intent": int(bool(item.intents)),
+                "has_tool_calls": int(bool(item.tool_calls)),
+            }
+        )
+
+    rows.sort(key=lambda row: row["tool_call_count"], reverse=True)
+    return rows
+
+
+INTERACTION_FIELDS = [
+    "interaction_id", "source_files", "source_row_count", "started_at", "ended_at",
+    "sentiment", "feedback_values",
+    "problem_count", "problems", "problem_categories", "problem_cluster_id", "problem_cluster_label",
+    "intent_count", "intents", "primary_intent", "intent_cluster_id", "intent_cluster_label",
+    "subintent_count", "subintents", "subintent_cluster_labels",
+    "declared_workflow_names",
+    "tool_call_count", "unique_tool_count", "tool_names",
+    "workflow", "workflow_id", "workflow_step_count", "workflow_tool_set",
+    "task_decomposition_cluster_id",
+    "nora_api_calls", "nora_calls_agent_side", "nora_calls_tool_side",
+    "calls_agent_side", "calls_tool_side",
+    "max_parallel_degree", "parallel_tool_groups",
+    "success_calls", "partial_calls", "no_data_calls", "skipped_calls", "error_calls",
+    "empty_calls", "tool_success_rate",
+    "repeated_tool_types", "repeated_tool_calls", "repeated_tools",
+    "has_problem", "has_intent", "has_tool_calls",
+]
+
+
+# ============================================================
+# TOOL-LEVEL OUTPUT
+# ============================================================
+
+def build_tool_call_rows(interactions: Dict[str, InteractionAccumulator]) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for item in interactions.values():
+        for call in item.tool_calls:
+            rows.append(asdict(call))
+    return rows
+
+
+TOOL_CALL_FIELDS = [
+    "interaction_id", "row_number", "call_index",
+    "tool_name", "namespace", "function_name", "is_nora_api", "side",
+    "arguments", "argument_keys", "result", "error",
+    "status", "is_success",
+    "timestamp", "step_key", "parallel_group", "parallel_degree",
+    "source_path", "result_length", "argument_length",
+]
+
+
+# ============================================================
+# TOOL FREQUENCY
+# ============================================================
+
+def build_tool_summary(interactions: Dict[str, InteractionAccumulator]) -> List[Dict[str, Any]]:
+    tool_data: Dict[str, Dict[str, Any]] = defaultdict(
+        lambda: {
+            "calls": 0,
+            "interactions": set(),
+            "statuses": Counter(),
+            "sides": Counter(),
+            "result_lengths": [],
+            "namespace": "",
+            "is_nora_api": 0,
+            "argument_keys": Counter(),
+        }
+    )
+
+    for interaction_id, item in interactions.items():
+        for call in item.tool_calls:
+            bucket = tool_data[call.tool_name]
+            bucket["calls"] += 1
+            bucket["interactions"].add(interaction_id)
+            bucket["statuses"][call.status] += 1
+            bucket["sides"][call.side] += 1
+            bucket["result_lengths"].append(call.result_length)
+            bucket["namespace"] = call.namespace
+            bucket["is_nora_api"] = call.is_nora_api
+            if call.argument_keys:
+                bucket["argument_keys"][call.argument_keys] += 1
+
+    rows: List[Dict[str, Any]] = []
+    for tool_name, data in tool_data.items():
+        total = data["calls"]
+        interaction_count = len(data["interactions"])
+        rows.append(
+            {
+                "tool_name": tool_name,
+                "namespace": data["namespace"],
+                "is_nora_api": data["is_nora_api"],
+                "total_calls": total,
+                "interaction_count": interaction_count,
+                "avg_calls_per_interaction": safe_div(total, max(interaction_count, 1), 4),
+                "agent_side_calls": data["sides"]["agent"],
+                "tool_side_calls": data["sides"]["tool"],
+                "success": data["statuses"]["success"],
+                "partial": data["statuses"]["partial"],
+                "no_data": data["statuses"]["no_data"],
+                "skipped": data["statuses"]["skipped"],
+                "error": data["statuses"]["error"],
+                "empty": data["statuses"]["empty"],
+                "success_rate": safe_div(data["statuses"]["success"], total),
+                "error_rate": safe_div(data["statuses"]["error"], total),
+                "no_data_rate": safe_div(data["statuses"]["no_data"], total),
+                "avg_result_length": round(statistics.mean(data["result_lengths"]), 2)
+                if data["result_lengths"] else 0,
+                "common_argument_keys": json_dumps_safe(data["argument_keys"].most_common(3)),
+            }
+        )
+
+    rows.sort(key=lambda row: row["total_calls"], reverse=True)
+    return rows
+
+
+TOOL_SUMMARY_FIELDS = [
+    "tool_name", "namespace", "is_nora_api", "total_calls", "interaction_count",
+    "avg_calls_per_interaction", "agent_side_calls", "tool_side_calls",
+    "success", "partial", "no_data", "skipped", "error", "empty",
+    "success_rate", "error_rate", "no_data_rate", "avg_result_length",
+    "common_argument_keys",
+]
+
+
+# ============================================================
+# WORKFLOW METRICS
+# ============================================================
+
+def build_workflow_summary(
+    interactions: Dict[str, InteractionAccumulator],
+    intent_clusters: ClusterResult,
+    workflow_clusters: ClusterResult,
+) -> List[Dict[str, Any]]:
+    workflow_data: Dict[str, Dict[str, Any]] = defaultdict(
+        lambda: {
+            "count": 0,
+            "interactions": [],
+            "intents": Counter(),
+            "intent_clusters": Counter(),
+            "tool_counts": Counter(),
+            "step_count": 0,
+            "workflow": "",
+            "positive": 0,
+            "negative": 0,
+            "success_calls": 0,
+            "total_calls": 0,
+        }
+    )
+
+    for interaction_id, item in interactions.items():
+        sequence = item.tool_sequence()
+        workflow = workflow_signature(sequence)
+        if not workflow:
+            continue
+
+        workflow_id = stable_hash(workflow)
+        bucket = workflow_data[workflow_id]
+
+        bucket["count"] += 1
+        bucket["interactions"].append(interaction_id)
+        bucket["step_count"] = len(sequence)
+        bucket["workflow"] = workflow
+
+        for intent in item.intents:
+            bucket["intents"][intent] += 1
+            label = intent_clusters.label_of(intent)
+            if label:
+                bucket["intent_clusters"][label] += 1
+
+        for call in item.tool_calls:
+            bucket["tool_counts"][call.tool_name] += 1
+            bucket["total_calls"] += 1
+            bucket["success_calls"] += call.is_success
+
+        if item.sentiment == "positive":
+            bucket["positive"] += 1
+        elif item.sentiment == "negative":
+            bucket["negative"] += 1
+
+    rows: List[Dict[str, Any]] = []
+    for workflow_id, data in workflow_data.items():
+        rows.append(
+            {
+                "workflow_id": workflow_id,
+                "task_decomposition_cluster_id": workflow_clusters.cluster_of(workflow_id),
+                "interaction_count": data["count"],
+                "step_count": data["step_count"],
+                "total_tool_calls": data["total_calls"],
+                "distinct_tools": len(data["tool_counts"]),
+                "tool_call_counts": json_dumps_safe(data["tool_counts"].most_common(50)),
+                "unique_intent_count": len(data["intents"]),
+                "intents": json_dumps_safe(dict(data["intents"].most_common(20))),
+                "intent_clusters": json_dumps_safe(dict(data["intent_clusters"].most_common(20))),
+                "success_rate": safe_div(data["success_calls"], data["total_calls"]),
+                "positive_interactions": data["positive"],
+                "negative_interactions": data["negative"],
+                "is_single_use": int(data["count"] == 1),
+                "workflow": short_text(data["workflow"], 4000),
+                "example_interactions": " | ".join(data["interactions"][:5]),
+            }
+        )
+
+    rows.sort(key=lambda row: row["interaction_count"], reverse=True)
+    return rows
+
+
+WORKFLOW_FIELDS = [
+    "workflow_id", "task_decomposition_cluster_id", "interaction_count", "step_count",
+    "total_tool_calls", "distinct_tools", "tool_call_counts",
+    "unique_intent_count", "intents", "intent_clusters",
+    "success_rate", "positive_interactions", "negative_interactions",
+    "is_single_use", "workflow", "example_interactions",
+]
+
+
+# ============================================================
+# INTENT -> WORKFLOW METRICS  (M4: reuse vs new workflow each time)
+# ============================================================
+
+def divergence_verdict(interaction_count: int, workflow_count: int, cluster_count: int) -> str:
+    if not interaction_count:
+        return "no data"
+    ratio = workflow_count / interaction_count
+    if ratio >= 0.8:
+        base = "HIGH DIVERGENCE - a near-unique workflow almost every run"
+    elif ratio >= 0.4:
+        base = "MIXED - partial reuse with substantial per-run variation"
+    else:
+        base = "STABLE - workflows are largely reused"
+    if cluster_count and workflow_count and cluster_count <= 0.5 * workflow_count:
+        base += f" (collapses into {cluster_count} structural cluster(s) - variation is mostly cosmetic)"
+    elif cluster_count and workflow_count and cluster_count < workflow_count:
+        base += f" ({cluster_count} structural cluster(s) - decompositions are genuinely different)"
+    return base
+
+
+def build_intent_workflow_summary(
+    interactions: Dict[str, InteractionAccumulator],
+    intent_clusters: ClusterResult,
+    workflow_clusters: ClusterResult,
+    use_clusters: bool = True,
+) -> List[Dict[str, Any]]:
+    relationship: Dict[str, Dict[str, Any]] = defaultdict(
+        lambda: {
+            "interactions": set(),
+            "workflow_counter": Counter(),
+            "workflow_clusters": set(),
+            "tool_counter": Counter(),
+            "member_labels": set(),
+            "positive": 0,
+            "negative": 0,
+            "tool_calls": 0,
+        }
+    )
+
+    for interaction_id, item in interactions.items():
+        sequence = item.tool_sequence()
+        workflow = workflow_signature(sequence)
+        workflow_id = stable_hash(workflow) if workflow else ""
+
+        raw_intents = item.intents or ["__INTENT_NOT_AVAILABLE__"]
+        if use_clusters:
+            keys = unique_preserve_order(
+                [intent_clusters.label_of(intent, intent) for intent in raw_intents]
+            )
+        else:
+            keys = raw_intents
+
+        for key, original in zip(keys, raw_intents):
+            bucket = relationship[key]
+            bucket["interactions"].add(interaction_id)
+            bucket["member_labels"].add(original)
+            bucket["tool_calls"] += len(item.tool_calls)
+
+            if workflow_id:
+                bucket["workflow_counter"][workflow_id] += 1
+                cluster_id = workflow_clusters.cluster_of(workflow_id)
+                if cluster_id is not None:
+                    bucket["workflow_clusters"].add(cluster_id)
+
+            for call in item.tool_calls:
+                bucket["tool_counter"][call.tool_name] += 1
+
+            if item.sentiment == "positive":
+                bucket["positive"] += 1
+            elif item.sentiment == "negative":
+                bucket["negative"] += 1
+
+    rows: List[Dict[str, Any]] = []
+    for intent, data in relationship.items():
+        interaction_count = len(data["interactions"])
+        workflow_count = len(data["workflow_counter"])
+        cluster_count = len(data["workflow_clusters"])
+
+        dominant_workflow, dominant_count = ("", 0)
+        if data["workflow_counter"]:
+            dominant_workflow, dominant_count = data["workflow_counter"].most_common(1)[0]
+
+        rows.append(
+            {
+                "intent_cluster": intent,
+                "member_intent_labels": " || ".join(sorted(data["member_labels"]))[:800],
+                "interaction_count": interaction_count,
+                "distinct_workflow_count": workflow_count,
+                "task_decomposition_cluster_count": cluster_count,
+                "workflow_consistency_rate": safe_div(dominant_count, interaction_count),
+                "workflow_reuse_ratio": round(1 - workflow_count / interaction_count, 6)
+                if interaction_count else 0.0,
+                "dominant_workflow_id": dominant_workflow,
+                "dominant_workflow_count": dominant_count,
+                "verdict": divergence_verdict(interaction_count, workflow_count, cluster_count),
+                "avg_tool_calls": safe_div(data["tool_calls"], interaction_count, 4),
+                "positive_interactions": data["positive"],
+                "negative_interactions": data["negative"],
+                "distinct_tool_count": len(data["tool_counter"]),
+                "top_tools": json_dumps_safe(data["tool_counter"].most_common(20)),
+                "workflow_distribution": json_dumps_safe(data["workflow_counter"].most_common(50)),
+            }
+        )
+
+    rows.sort(key=lambda row: row["interaction_count"], reverse=True)
+    return rows
+
+
+INTENT_WORKFLOW_FIELDS = [
+    "intent_cluster", "member_intent_labels", "interaction_count",
+    "distinct_workflow_count", "task_decomposition_cluster_count",
+    "workflow_consistency_rate", "workflow_reuse_ratio",
+    "dominant_workflow_id", "dominant_workflow_count", "verdict",
+    "avg_tool_calls", "positive_interactions", "negative_interactions",
+    "distinct_tool_count", "top_tools", "workflow_distribution",
+]
+
+
+def build_intent_workflow_matrix(
+    interactions: Dict[str, InteractionAccumulator],
+    intent_clusters: ClusterResult,
+    workflow_clusters: ClusterResult,
+) -> List[Dict[str, Any]]:
+    """Long-format intent x workflow counts - directly answers '6 intents -> N workflows?'."""
+    matrix: Counter = Counter()
+    totals: Counter = Counter()
+    sequences: Dict[str, str] = {}
+
+    for item in interactions.values():
+        sequence = item.tool_sequence()
+        workflow = workflow_signature(sequence)
+        workflow_id = stable_hash(workflow) if workflow else "EMPTY"
+        sequences[workflow_id] = workflow
+
+        for intent in (item.intents or ["__INTENT_NOT_AVAILABLE__"]):
+            label = intent_clusters.label_of(intent, intent)
+            matrix[(label, workflow_id)] += 1
+            totals[label] += 1
+
+    rows: List[Dict[str, Any]] = []
+    for (label, workflow_id), count in matrix.most_common():
+        rows.append(
+            {
+                "intent_cluster": label,
+                "workflow_id": workflow_id,
+                "task_decomposition_cluster_id": workflow_clusters.cluster_of(workflow_id),
+                "interaction_count": count,
+                "share_of_intent_pct": pct(count, totals[label]),
+                "workflow": short_text(sequences.get(workflow_id, ""), 2000),
+            }
+        )
+    return rows
+
+
+INTENT_WORKFLOW_MATRIX_FIELDS = [
+    "intent_cluster", "workflow_id", "task_decomposition_cluster_id",
+    "interaction_count", "share_of_intent_pct", "workflow",
+]
+
+
+# ============================================================
+# CLUSTER OUTPUT
+# ============================================================
+
+def build_cluster_rows(
+    clusters: ClusterResult,
+    weights: Dict[str, int],
+    label_name: str,
+) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for cluster_id, members in clusters.members.items():
+        rows.append(
+            {
+                "cluster_id": cluster_id,
+                "representative": short_text(clusters.representatives.get(cluster_id, ""), 300),
+                "member_count": len(members),
+                "total_occurrences": sum(weights.get(member, 0) for member in members),
+                "members": short_text(" || ".join(members), 3000),
+                "label_type": label_name,
+                "method": clusters.method,
+            }
+        )
+    rows.sort(key=lambda row: row["total_occurrences"], reverse=True)
+    return rows
+
+
+CLUSTER_FIELDS = [
+    "cluster_id", "representative", "member_count", "total_occurrences",
+    "members", "label_type", "method",
+]
+
+
+# ============================================================
+# TOOL CO-OCCURRENCE / PARALLEL FAN-OUT
+# ============================================================
+
+def build_tool_cooccurrence(interactions: Dict[str, InteractionAccumulator]) -> List[Dict[str, Any]]:
+    pair_counter: Counter = Counter()
+    tool_interaction_counter: Counter = Counter()
+    parallel_pair_counter: Counter = Counter()
+
+    for item in interactions.values():
+        unique_tools = sorted({call.tool_name for call in item.tool_calls})
+        for tool in unique_tools:
+            tool_interaction_counter[tool] += 1
+        for tool_a, tool_b in combinations(unique_tools, 2):
+            pair_counter[(tool_a, tool_b)] += 1
+
+        for group in item.parallel_groups():
+            for tool_a, tool_b in combinations(sorted(group), 2):
+                parallel_pair_counter[(tool_a, tool_b)] += 1
+
+    rows: List[Dict[str, Any]] = []
+    for (tool_a, tool_b), count in pair_counter.items():
+        denominator = min(tool_interaction_counter[tool_a], tool_interaction_counter[tool_b])
+        rows.append(
+            {
+                "tool_a": tool_a,
+                "tool_b": tool_b,
+                "cooccurring_interactions": count,
+                "parallel_cooccurrences": parallel_pair_counter[(tool_a, tool_b)],
+                "tool_a_interactions": tool_interaction_counter[tool_a],
+                "tool_b_interactions": tool_interaction_counter[tool_b],
+                "association_rate": safe_div(count, denominator),
+            }
+        )
+
+    rows.sort(key=lambda row: row["cooccurring_interactions"], reverse=True)
+    return rows
+
+
+COOCCURRENCE_FIELDS = [
+    "tool_a", "tool_b", "cooccurring_interactions", "parallel_cooccurrences",
+    "tool_a_interactions", "tool_b_interactions", "association_rate",
+]
+
+
+def build_parallel_group_rows(interactions: Dict[str, InteractionAccumulator]) -> List[Dict[str, Any]]:
+    """'For one tool, what are the parallel tools being called' - the notes' ask."""
+    group_counter: Counter = Counter()
+    group_interactions: Dict[Tuple[str, ...], Set[str]] = defaultdict(set)
+    group_intents: Dict[Tuple[str, ...], Counter] = defaultdict(Counter)
+
+    for interaction_id, item in interactions.items():
+        for group in item.parallel_groups():
+            group_counter[group] += 1
+            group_interactions[group].add(interaction_id)
+            for intent in item.intents:
+                group_intents[group][intent] += 1
+
+    rows: List[Dict[str, Any]] = []
+    for group, count in group_counter.most_common():
+        rows.append(
+            {
+                "parallel_tools": ", ".join(group),
+                "degree": len(group),
+                "occurrences": count,
+                "interaction_count": len(group_interactions[group]),
+                "top_intents": json_dumps_safe(group_intents[group].most_common(5)),
+            }
+        )
+    return rows
+
+
+PARALLEL_FIELDS = ["parallel_tools", "degree", "occurrences", "interaction_count", "top_intents"]
+
+
+# ============================================================
+# SEQUENTIAL TOOL TRANSITIONS
+# ============================================================
+
+def build_tool_transitions(interactions: Dict[str, InteractionAccumulator]) -> List[Dict[str, Any]]:
+    transitions: Counter = Counter()
+    source_counter: Counter = Counter()
+
+    for item in interactions.values():
+        tools = item.tool_sequence()
+        for source in tools:
+            source_counter[source] += 1
+        for current_tool, next_tool in zip(tools, tools[1:]):
+            transitions[(current_tool, next_tool)] += 1
+
+    rows: List[Dict[str, Any]] = []
+    for (current_tool, next_tool), count in transitions.items():
+        rows.append(
+            {
+                "current_tool": current_tool,
+                "next_tool": next_tool,
+                "transition_count": count,
+                "transition_rate": safe_div(count, source_counter[current_tool]),
+            }
+        )
+
+    rows.sort(key=lambda row: row["transition_count"], reverse=True)
+    return rows
+
+
+TRANSITION_FIELDS = ["current_tool", "next_tool", "transition_count", "transition_rate"]
+
+
+# ============================================================
+# INTENT FREQUENCY
+# ============================================================
+
+def build_intent_summary(
+    interactions: Dict[str, InteractionAccumulator],
+    intent_clusters: ClusterResult,
+) -> List[Dict[str, Any]]:
+    intent_interactions: Dict[str, Set[str]] = defaultdict(set)
+    subintent_counter: Counter = Counter()
+    intent_subintents: Dict[str, Set[str]] = defaultdict(set)
+
+    for interaction_id, item in interactions.items():
+        for intent in item.intents:
+            intent_interactions[intent].add(interaction_id)
+            for subintent in item.subintents:
+                intent_subintents[intent].add(subintent)
+        for subintent in item.subintents:
+            subintent_counter[subintent] += 1
+
+    rows: List[Dict[str, Any]] = []
+    for intent, ids in intent_interactions.items():
+        rows.append(
+            {
+                "intent": intent,
+                "intent_cluster_id": intent_clusters.cluster_of(intent),
+                "intent_cluster_label": intent_clusters.label_of(intent),
+                "interaction_count": len(ids),
+                "distinct_subintents": len(intent_subintents[intent]),
+                "subintents": short_text(" || ".join(sorted(intent_subintents[intent])), 1000),
+            }
+        )
+
+    rows.sort(key=lambda row: row["interaction_count"], reverse=True)
+    return rows
+
+
+INTENT_FIELDS = [
+    "intent", "intent_cluster_id", "intent_cluster_label",
+    "interaction_count", "distinct_subintents", "subintents",
+]
+
+
+# ============================================================
+# GLOBAL SUMMARY  (M1 - M6)
+# ============================================================
+
+def build_global_summary(
+    interactions: Dict[str, InteractionAccumulator],
+    intent_clusters: ClusterResult,
+    problem_clusters: ClusterResult,
+    workflow_clusters: ClusterResult,
+    filter_report: Dict[str, Any],
+    ingest_report: Dict[str, Any],
+) -> Dict[str, Any]:
+    total_interactions = len(interactions)
+
+    all_tool_calls: List[ToolCall] = []
+    all_problems: List[str] = []
+    all_intents: List[str] = []
+    all_subintents: List[str] = []
+
+    interactions_with_problem = 0
+    interactions_with_intent = 0
+    interactions_with_tools = 0
+    interactions_with_parallel = 0
+
+    workflow_counter: Counter = Counter()
+    sentiment_counter: Counter = Counter()
+    timestamps: List[datetime] = []
+
+    for item in interactions.values():
+        if item.problems:
+            interactions_with_problem += 1
+        if item.intents:
+            interactions_with_intent += 1
+        if item.tool_calls:
+            interactions_with_tools += 1
+        if item.max_parallel_degree() > 1:
+            interactions_with_parallel += 1
+
+        all_problems.extend(item.problems)
+        all_intents.extend(item.intents)
+        all_subintents.extend(item.subintents)
+        all_tool_calls.extend(item.tool_calls)
+
+        sentiment_counter[item.sentiment] += 1
+        if item.started_at:
+            timestamps.append(item.started_at)
+
+        workflow = workflow_signature(item.tool_sequence())
+        if workflow:
+            workflow_counter[workflow] += 1
+
+    status_counter = Counter(call.status for call in all_tool_calls)
+    total_tool_calls = len(all_tool_calls)
+    unique_tools = {call.tool_name for call in all_tool_calls}
+    calls_per_interaction = [len(item.tool_calls) for item in interactions.values()]
+
+    distinct_workflows = len(workflow_counter)
+    single_use_workflows = sum(1 for count in workflow_counter.values() if count == 1)
+    intent_cluster_count = max(intent_clusters.n_clusters, 0)
+
+    return {
+        "M1_problems": {
+            "total_interactions": total_interactions,
+            "interactions_with_problem": interactions_with_problem,
+            "problem_coverage_pct": pct(interactions_with_problem, total_interactions),
+            "total_problem_records": len(all_problems),
+            "unique_problem_texts": len(set(all_problems)),
+            "problem_clusters": problem_clusters.n_clusters,
+            "problem_clustering_method": problem_clusters.method,
+        },
+        "M2_intents": {
+            "interactions_with_intent": interactions_with_intent,
+            "total_intent_occurrences": len(all_intents),
+            "unique_intents": len(set(all_intents)),
+            "intent_clusters": intent_cluster_count,
+            "total_subintent_occurrences": len(all_subintents),
+            "unique_subintents": len(set(all_subintents)),
+            "intent_clustering_method": intent_clusters.method,
+        },
+        "M3_workflows": {
+            "interactions_with_tool_calls": interactions_with_tools,
+            "distinct_workflows": distinct_workflows,
+            "task_decomposition_clusters": workflow_clusters.n_clusters,
+            "reused_workflows": sum(1 for count in workflow_counter.values() if count > 1),
+            "single_use_workflows": single_use_workflows,
+            "single_use_workflow_pct": pct(single_use_workflows, distinct_workflows),
+            "avg_tool_calls_per_interaction": round(statistics.mean(calls_per_interaction), 4)
+            if calls_per_interaction else 0,
+            "median_tool_calls_per_interaction": round(statistics.median(calls_per_interaction), 4)
+            if calls_per_interaction else 0,
+            "max_tool_calls_in_interaction": max(calls_per_interaction, default=0),
+            "workflow_clustering_method": workflow_clusters.method,
+        },
+        "M4_workflow_reuse": {
+            "intent_clusters": intent_cluster_count,
+            "distinct_workflows": distinct_workflows,
+            "workflows_per_intent_cluster": safe_div(distinct_workflows, max(intent_cluster_count, 1), 2),
+            "workflows_per_interaction": safe_div(distinct_workflows, max(total_interactions, 1), 4),
+            "verdict": divergence_verdict(
+                total_interactions, distinct_workflows, workflow_clusters.n_clusters
+            ),
+        },
+        "M5_tools_and_nora_api": {
+            "total_tool_calls": total_tool_calls,
+            "unique_tools": len(unique_tools),
+            "unique_namespaces": len({call.namespace for call in all_tool_calls if call.namespace}),
+            "nora_api_calls": sum(call.is_nora_api for call in all_tool_calls),
+            "nora_calls_agent_side": sum(
+                1 for call in all_tool_calls if call.is_nora_api and call.side == "agent"
+            ),
+            "nora_calls_tool_side": sum(
+                1 for call in all_tool_calls if call.is_nora_api and call.side == "tool"
+            ),
+            "calls_agent_side": sum(1 for call in all_tool_calls if call.side == "agent"),
+            "calls_tool_side": sum(1 for call in all_tool_calls if call.side == "tool"),
+            "successful_tool_calls": status_counter["success"],
+            "partial_tool_calls": status_counter["partial"],
+            "no_data_tool_calls": status_counter["no_data"],
+            "skipped_tool_calls": status_counter["skipped"],
+            "error_tool_calls": status_counter["error"],
+            "empty_tool_calls": status_counter["empty"],
+            "tool_success_rate": safe_div(status_counter["success"], total_tool_calls),
+            "tool_error_rate": safe_div(status_counter["error"], total_tool_calls),
+            "tool_no_data_rate": safe_div(status_counter["no_data"], total_tool_calls),
+            "interactions_with_parallel_calls": interactions_with_parallel,
+            "max_parallel_degree": max(
+                (item.max_parallel_degree() for item in interactions.values()), default=0
+            ),
+        },
+        "M6_baseline": {
+            "positive_samples": sentiment_counter["positive"],
+            "negative_samples": sentiment_counter["negative"],
+            "unlabelled_samples": sentiment_counter["unknown"],
+            "positive_pct": pct(sentiment_counter["positive"], total_interactions),
+            "negative_pct": pct(sentiment_counter["negative"], total_interactions),
+            "window_start": iso_or_blank(min(timestamps)) if timestamps else "",
+            "window_end": iso_or_blank(max(timestamps)) if timestamps else "",
+            "interactions_with_timestamp": len(timestamps),
+        },
+        "data_quality": {
+            "ingest": ingest_report,
+            "filters": filter_report,
+            "interactions_without_tool_calls": total_interactions - interactions_with_tools,
+            "interactions_without_intent": total_interactions - interactions_with_intent,
+            "interactions_without_problem": total_interactions - interactions_with_problem,
+        },
+    }
+
+
+# ============================================================
+# CONSOLE SUMMARY
+# ============================================================
+
+def print_console_summary(summary: Dict[str, Any]) -> None:
+    m1, m2, m3 = summary["M1_problems"], summary["M2_intents"], summary["M3_workflows"]
+    m4, m5, m6 = summary["M4_workflow_reuse"], summary["M5_tools_and_nora_api"], summary["M6_baseline"]
+
+    line = "=" * 78
+    print()
+    print(line)
+    print("NORA DATA-SCIENCE BASELINE METRICS")
+    print(line)
+    print(f"Window                        : {m6['window_start'] or 'n/a'} -> {m6['window_end'] or 'n/a'}")
+    print(
+        f"Interactions analysed         : {m1['total_interactions']:,}"
+        f"   (+ve {m6['positive_samples']:,} / -ve {m6['negative_samples']:,}"
+        f" / unlabelled {m6['unlabelled_samples']:,})"
+    )
+    print()
+    print("M1  PROBLEMS")
+    print(f"  With problem statement      : {m1['interactions_with_problem']:,} ({m1['problem_coverage_pct']}%)")
+    print(f"  Unique problem texts        : {m1['unique_problem_texts']:,}")
+    print(f"  Problem clusters            : {m1['problem_clusters']:,}")
+    print()
+    print("M2  INTENTS")
+    print(f"  Intent occurrences          : {m2['total_intent_occurrences']:,}")
+    print(f"  Unique intent labels        : {m2['unique_intents']:,}")
+    print(f"  Intent clusters (NLP)       : {m2['intent_clusters']:,}   [{m2['intent_clustering_method']}]")
+    print(f"  Unique sub-intents          : {m2['unique_subintents']:,}")
+    print()
+    print("M3  WORKFLOWS")
+    print(f"  Distinct workflows          : {m3['distinct_workflows']:,}")
+    print(f"  Task-decomposition clusters : {m3['task_decomposition_clusters']:,}")
+    print(f"  Single-use workflows        : {m3['single_use_workflows']:,} ({m3['single_use_workflow_pct']}%)")
+    print(f"  Tool calls per interaction  : avg {m3['avg_tool_calls_per_interaction']} / max {m3['max_tool_calls_in_interaction']}")
+    print()
+    print("M4  REUSE vs NEW WORKFLOW EACH RUN")
+    print(f"  Workflows per intent cluster: {m4['workflows_per_intent_cluster']}")
+    print(f"  Verdict                     : {m4['verdict']}")
+    print()
+    print("M5  TOOLS / NORA API")
+    print(f"  Tool calls                  : {m5['total_tool_calls']:,} across {m5['unique_tools']:,} tools")
+    print(
+        f"  NORA API calls              : {m5['nora_api_calls']:,}"
+        f"   (agent side {m5['nora_calls_agent_side']:,} / tool side {m5['nora_calls_tool_side']:,})"
+    )
+    print(f"  Success / error / no-data   : {m5['successful_tool_calls']:,} / {m5['error_tool_calls']:,} / {m5['no_data_tool_calls']:,}")
+    print(f"  Tool success rate           : {round(m5['tool_success_rate'] * 100, 2)}%")
+    print(
+        f"  Parallel fan-out            : max degree {m5['max_parallel_degree']},"
+        f" {m5['interactions_with_parallel_calls']:,} interactions with parallel calls"
+    )
+    print(line)
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Generate production-grade NORA metrics from interactions.csv",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+
+    parser.add_argument(
+        "input_csv",
+        nargs="*",
+        default=[os.getenv("NORA_INTERACTIONS_CSV", "interactions.csv")],
+        help="One or more CSV files, directories or globs.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default=os.getenv("NORA_METRICS_OUTPUT", "nora_metrics_output"),
+        help="Directory where metrics files are written.",
+    )
+    parser.add_argument("--start-date", default=None, help="Inclusive ISO start date, e.g. 2025-07-13")
+    parser.add_argument("--end-date", default=None, help="Inclusive ISO end date, e.g. 2025-07-26")
+    parser.add_argument(
+        "--only-positive",
+        action="store_true",
+        help="Keep only interactions where the customer feedback is positive.",
+    )
+    parser.add_argument("--max-rows", type=int, default=None, help="Read at most N rows per file (smoke test).")
+    parser.add_argument("--no-clustering", action="store_true", help="Disable intent/workflow clustering.")
+    parser.add_argument(
+        "--intent-threshold", type=float, default=DEFAULT_INTENT_THRESHOLD,
+        help="Similarity threshold for intent clustering (0-1).",
+    )
+    parser.add_argument(
+        "--workflow-threshold", type=float, default=DEFAULT_WORKFLOW_THRESHOLD,
+        help="Similarity threshold for task-decomposition clustering (0-1).",
+    )
+    parser.add_argument(
+        "--order-weight", type=float, default=DEFAULT_ORDER_WEIGHT,
+        help="How much tool ORDER matters vs tool SET when clustering workflows (0-1).",
+    )
+    parser.add_argument(
+        "--parallel-window", type=float, default=DEFAULT_PARALLEL_WINDOW_SECONDS,
+        help="Seconds within which tool calls count as parallel fan-out.",
+    )
+    parser.add_argument(
+        "--max-cluster-items", type=int, default=DEFAULT_MAX_CLUSTER_ITEMS,
+        help="Above this many distinct labels, fall back to exact grouping.",
+    )
+    parser.add_argument(
+        "--nora-namespaces", default=",".join(DEFAULT_NORA_NAMESPACES),
+        help="Comma-separated tool namespaces counted as NORA API calls.",
+    )
+    parser.add_argument(
+        "--preview-chars", type=int, default=DEFAULT_PREVIEW_CHARS,
+        help="Max characters kept per argument/result in the tool-call export.",
+    )
+    parser.add_argument("--quiet", action="store_true", help="Suppress progress logging.")
+
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+
+    input_files = expand_inputs(args.input_csv)
+    missing = [str(path) for path in input_files if not path.exists()]
+    if missing or not input_files:
+        for path in missing:
+            print(f"[ERROR] Input CSV not found: {path}", file=sys.stderr)
+        if not input_files:
+            print("[ERROR] No input files resolved.", file=sys.stderr)
+        return 2
+
+    output_dir = Path(args.output_dir).expanduser().resolve()
+    ensure_output_dir(output_dir)
+
+    nora_namespaces = [ns.strip() for ns in args.nora_namespaces.split(",") if ns.strip()]
+    clustering_enabled = not args.no_clustering
+
+    interactions, schema_counter, ingest_report = analyze_csv_files(
+        input_files=input_files,
+        nora_namespaces=nora_namespaces,
+        preview_chars=args.preview_chars,
+        parallel_window_seconds=args.parallel_window,
+        max_rows=args.max_rows,
+        quiet=args.quiet,
+    )
+
+    interactions, filter_report = filter_interactions(
+        interactions,
+        start_date=args.start_date,
+        end_date=args.end_date,
+        only_positive=args.only_positive,
+    )
+    log(
+        f"[INFO] {filter_report['kept_interactions']:,} interactions kept after filters"
+        f" (dropped: {filter_report['dropped'] or 'none'})",
+        args.quiet,
+    )
+
+    if not interactions:
+        print("[WARN] No interactions left after filtering. Check --start-date/--end-date/--only-positive.")
+        write_json(output_dir / "10_global_metrics.json", {"warning": "no interactions", "filters": filter_report})
+        return 0
+
+    # ---- clustering -----------------------------------------------------
+    log("[INFO] Clustering intents and task decompositions...", args.quiet)
+
+    intent_weights: Counter = Counter()
+    for item in interactions.values():
+        for label in unique_preserve_order(item.intents + item.subintents):
+            intent_weights[label] += 1
+
+    problem_weights: Counter = Counter()
+    for item in interactions.values():
+        for label in unique_preserve_order(item.problems):
+            problem_weights[label] += 1
+
+    sequences: Dict[str, Sequence[str]] = {}
+    workflow_weights: Counter = Counter()
+    for item in interactions.values():
+        sequence = item.tool_sequence()
+        if not sequence:
+            continue
+        workflow_id = stable_hash(workflow_signature(sequence))
+        sequences.setdefault(workflow_id, sequence)
+        workflow_weights[workflow_id] += 1
+
+    intent_clusters = cluster_texts(
+        list(intent_weights), dict(intent_weights),
+        threshold=args.intent_threshold, max_items=args.max_cluster_items, enabled=clustering_enabled,
+    )
+    problem_clusters = cluster_texts(
+        list(problem_weights), dict(problem_weights),
+        threshold=args.intent_threshold, max_items=args.max_cluster_items, enabled=clustering_enabled,
+    )
+    workflow_clusters = cluster_tool_sequences(
+        sequences, dict(workflow_weights),
+        threshold=args.workflow_threshold, order_weight=args.order_weight,
+        max_items=args.max_cluster_items, enabled=clustering_enabled,
+    )
+
+    # ---- build metrics --------------------------------------------------
+    log("[INFO] Building metrics...", args.quiet)
+
+    interaction_rows = build_interaction_rows(interactions, intent_clusters, problem_clusters, workflow_clusters)
+    tool_call_rows = build_tool_call_rows(interactions)
+    tool_summary_rows = build_tool_summary(interactions)
+    workflow_rows = build_workflow_summary(interactions, intent_clusters, workflow_clusters)
+    intent_workflow_rows = build_intent_workflow_summary(
+        interactions, intent_clusters, workflow_clusters, use_clusters=clustering_enabled
+    )
+    intent_workflow_matrix_rows = build_intent_workflow_matrix(interactions, intent_clusters, workflow_clusters)
+    cooccurrence_rows = build_tool_cooccurrence(interactions)
+    parallel_rows = build_parallel_group_rows(interactions)
+    transition_rows = build_tool_transitions(interactions)
+    intent_rows = build_intent_summary(interactions, intent_clusters)
+    intent_cluster_rows = build_cluster_rows(intent_clusters, dict(intent_weights), "intent")
+    problem_cluster_rows = build_cluster_rows(problem_clusters, dict(problem_weights), "problem")
+    workflow_cluster_rows = build_cluster_rows(workflow_clusters, dict(workflow_weights), "task_decomposition")
+
+    global_summary = build_global_summary(
+        interactions, intent_clusters, problem_clusters, workflow_clusters, filter_report, ingest_report
+    )
+
+    # ---- write outputs --------------------------------------------------
+    write_csv(output_dir / "01_interaction_metrics.csv", interaction_rows, INTERACTION_FIELDS)
+    write_csv(output_dir / "02_tool_calls.csv", tool_call_rows, TOOL_CALL_FIELDS)
+    write_csv(output_dir / "03_tool_summary.csv", tool_summary_rows, TOOL_SUMMARY_FIELDS)
+    write_csv(output_dir / "04_workflow_summary.csv", workflow_rows, WORKFLOW_FIELDS)
+    write_csv(output_dir / "05_intent_workflow_summary.csv", intent_workflow_rows, INTENT_WORKFLOW_FIELDS)
+    write_csv(output_dir / "06_tool_cooccurrence.csv", cooccurrence_rows, COOCCURRENCE_FIELDS)
+    write_csv(output_dir / "07_tool_transitions.csv", transition_rows, TRANSITION_FIELDS)
+    write_csv(output_dir / "08_intent_summary.csv", intent_rows, INTENT_FIELDS)
+    write_csv(
+        output_dir / "09_schema_profile.csv",
+        ({"field": name, "row_occurrence_count": count} for name, count in schema_counter.most_common()),
+        ["field", "row_occurrence_count"],
+    )
+    write_json(output_dir / "10_global_metrics.json", global_summary)
+    write_csv(output_dir / "11_intent_clusters.csv", intent_cluster_rows, CLUSTER_FIELDS)
+    write_csv(output_dir / "12_task_decomposition_clusters.csv", workflow_cluster_rows, CLUSTER_FIELDS)
+    write_csv(output_dir / "13_problem_clusters.csv", problem_cluster_rows, CLUSTER_FIELDS)
+    write_csv(output_dir / "14_parallel_tool_groups.csv", parallel_rows, PARALLEL_FIELDS)
+    write_csv(
+        output_dir / "15_intent_workflow_matrix.csv",
+        intent_workflow_matrix_rows,
+        INTENT_WORKFLOW_MATRIX_FIELDS,
+    )
+
+    print_console_summary(global_summary)
+
+    print()
+    print(f"[DONE] Metrics written to:\n{output_dir}")
+    print()
+    print("Generated files:")
+    for path in sorted(output_dir.glob("*")):
+        print(f"  - {path.name}")
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

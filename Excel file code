@@ -101,10 +101,10 @@ def sheet_overview(wb, summary: Dict[str, Any], src: Path) -> None:
     m1 = summary.get("M1_problems", {})
     m2 = summary.get("M2_intents", {})
     m3 = summary.get("M3_workflows", {})
-    m5 = summary.get("M5_tools_and_nora_api", {})
+    m5 = summary.get("M5_tools_and_A_api", {})
     m6 = summary.get("M6_baseline", {})
 
-    ws["A1"] = "NORA Interaction Analysis — Summary"
+    ws["A1"] = "A Interaction Analysis — Summary"
     ws["A1"].font = Font(name=FONT, size=16, bold=True, color="1F3864")
     ws["A2"] = f"Generated from: {src}"
     ws["A2"].font = Font(name=FONT, size=9, italic=True)
@@ -183,14 +183,14 @@ def sheet_overview(wb, summary: Dict[str, Any], src: Path) -> None:
 
 def sheet_tools(wb, rows: List[Dict[str, str]]) -> None:
     ws = wb.create_sheet("Tools and APIs")
-    headers = ["Tool / API name", "System group", "Is NORA API?", "Times called",
+    headers = ["Tool / API name", "System group", "Is A API?", "Times called",
                "Interactions using it", "Worked", "Returned no data", "Errors",
                "Success rate %", "No-data rate %"]
     data = []
     for r in rows:
         data.append([
             r.get("tool_name", ""), r.get("namespace", "") or "(none)",
-            "Yes" if r.get("is_nora_api") == "1" else "No",
+            "Yes" if r.get("is_A_api") == "1" else "No",
             num(r.get("total_calls")), num(r.get("interaction_count")),
             num(r.get("success")), num(r.get("no_data")), num(r.get("error")),
             round(float(r.get("success_rate") or 0) * 100, 1),
@@ -315,7 +315,7 @@ def main() -> int:
     if not src.is_dir():
         sys.exit(f"Not a folder: {src}")
 
-    out = Path(args.out) if args.out else src / "NORA_Analysis_Report.xlsx"
+    out = Path(args.out) if args.out else src / "A_Analysis_Report.xlsx"
 
     summary_path = src / "10_global_metrics.json"
     summary = json.loads(summary_path.read_text(encoding="utf-8")) if summary_path.exists() else {}

@@ -3,7 +3,7 @@
 
 Usage:
     python build_excel_report.py ./metrics_aug
-    python build_excel_report.py ./metrics_aug --out NORA_Report.xlsx
+    python build_excel_report.py ./metrics_aug --out A_Report.xlsx
 
 Needs openpyxl:   pip install openpyxl
 """

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-NORA Interaction Metrics Analyzer  (v2)
+Metrics Analyzer  (v2)
 =======================================
 
 Analyzes interactions.csv (one or many daily dumps) and produces the metrics
@@ -14,7 +14,7 @@ M3  Total workflows stated + tools called per workflow
 M4  Is the cluster similar, or is a NEW workflow generated every time for the
     same intent?   -> workflow reuse / divergence, the "6 intents vs 100
     workflows" test
-M5  NORA API calls: agent side vs tool side, parallel fan-out, co-occurrence
+M5  API calls: agent side vs tool side, parallel fan-out, co-occurrence
 M6  Baseline: volume in the July window, +ve vs -ve samples
 
 Design principles
@@ -27,9 +27,9 @@ Design principles
 
 Usage
 -----
-    python nora_metrics_analyzer.py interactions.csv
-    python nora_metrics_analyzer.py ./output_updated/output --output-dir ./metrics
-    python nora_metrics_analyzer.py interactions.csv \
+    python _metrics_analyzer.py interactions.csv
+    python _metrics_analyzer.py ./output_updated/output --output-dir ./metrics
+    python _metrics_analyzer.py interactions.csv \
         --start-date 2025-07-13 --end-date 2025-07-26 --only-positive
 """
 
@@ -124,12 +124,12 @@ NULLISH = {"", "none", "null", "nan", "{}", "[]", "n/a", "na", "-"}
 
 TOOL_NAME_PATTERN = re.compile(r"^(?P<namespace>[A-Za-z0-9_]+)[-:.](?P<function>.+)$")
 
-DEFAULT_NORA_NAMESPACES = (
+DEFAULT___NAMESPACES = (
     "nsm",
     "misc",
     "search",
     "snowflake",
-    "nora",
+    "A",
     "qtm",
 )
 
@@ -732,7 +732,7 @@ class ToolCall:
     tool_name: str
     namespace: str
     function_name: str
-    is_nora_api: int
+    is___api: int
     side: str
 
     arguments: str
@@ -843,7 +843,7 @@ def extract_tool_calls(
     obj: Any,
     interaction_id: str,
     row_number: int,
-    nora_namespaces: Sequence[str],
+    A_namespaces: Sequence[str],
     preview_chars: int,
     row_timestamp: Optional[datetime],
 ) -> List[ToolCall]:
@@ -903,8 +903,8 @@ def extract_tool_calls(
                         tool_name=tool_name,
                         namespace=namespace,
                         function_name=function_name,
-                        is_nora_api=int(
-                            (namespace or tool_name).lower() in {n.lower() for n in nora_namespaces}
+                        is___api=int(
+                            (namespace or tool_name).lower() in {n.lower() for n in __namespaces}
                         ),
                         side=classify_side(node, obj),
                         arguments=short_text(arguments_text, preview_chars),
@@ -1373,7 +1373,7 @@ def expand_inputs(paths: Sequence[str]) -> List[Path]:
 
 def analyze_csv_files(
     input_files: Sequence[Path],
-    nora_namespaces: Sequence[str],
+    A_namespaces: Sequence[str],
     preview_chars: int,
     parallel_window_seconds: float,
     max_rows: Optional[int],
@@ -1456,7 +1456,7 @@ def analyze_csv_files(
                             decoded_row,
                             interaction_id=interaction_id,
                             row_number=row_number,
-                            nora_namespaces=nora_namespaces,
+                            A_namespaces=A_namespaces,
                             preview_chars=preview_chars,
                             row_timestamp=row_timestamp,
                         )
@@ -1580,12 +1580,12 @@ def build_interaction_rows(
                 "workflow_tool_set": workflow_set_signature(tool_names),
                 "task_decomposition_cluster_id": workflow_clusters.cluster_of(workflow_id),
 
-                "nora_api_calls": sum(call.is_nora_api for call in item.tool_calls),
-                "nora_calls_agent_side": sum(
-                    1 for call in item.tool_calls if call.is_nora_api and call.side == "agent"
+                "A_api_calls": sum(call.is_A_api for call in item.tool_calls),
+                "A_calls_agent_side": sum(
+                    1 for call in item.tool_calls if call.is_A_api and call.side == "agent"
                 ),
-                "nora_calls_tool_side": sum(
-                    1 for call in item.tool_calls if call.is_nora_api and call.side == "tool"
+                "A_calls_tool_side": sum(
+                    1 for call in item.tool_calls if call.is_A_api and call.side == "tool"
                 ),
                 "calls_agent_side": sum(1 for call in item.tool_calls if call.side == "agent"),
                 "calls_tool_side": sum(1 for call in item.tool_calls if call.side == "tool"),
@@ -1627,7 +1627,7 @@ INTERACTION_FIELDS = [
     "tool_call_count", "unique_tool_count", "tool_names",
     "workflow", "workflow_id", "workflow_step_count", "workflow_tool_set",
     "task_decomposition_cluster_id",
-    "nora_api_calls", "nora_calls_agent_side", "nora_calls_tool_side",
+    "A_api_calls", "A_calls_agent_side", "A_calls_tool_side",
     "calls_agent_side", "calls_tool_side",
     "max_parallel_degree", "parallel_tool_groups",
     "success_calls", "partial_calls", "no_data_calls", "skipped_calls", "error_calls",
@@ -1651,7 +1651,7 @@ def build_tool_call_rows(interactions: Dict[str, InteractionAccumulator]) -> Lis
 
 TOOL_CALL_FIELDS = [
     "interaction_id", "row_number", "call_index",
-    "tool_name", "namespace", "function_name", "is_nora_api", "side",
+    "tool_name", "namespace", "function_name", "is_A_api", "side",
     "arguments", "argument_keys", "result", "error",
     "status", "is_success",
     "timestamp", "step_key", "parallel_group", "parallel_degree",
@@ -1672,7 +1672,7 @@ def build_tool_summary(interactions: Dict[str, InteractionAccumulator]) -> List[
             "sides": Counter(),
             "result_lengths": [],
             "namespace": "",
-            "is_nora_api": 0,
+            "is_A_api": 0,
             "argument_keys": Counter(),
         }
     )
@@ -1686,7 +1686,7 @@ def build_tool_summary(interactions: Dict[str, InteractionAccumulator]) -> List[
             bucket["sides"][call.side] += 1
             bucket["result_lengths"].append(call.result_length)
             bucket["namespace"] = call.namespace
-            bucket["is_nora_api"] = call.is_nora_api
+            bucket["is_A_api"] = call.is_A_api
             if call.argument_keys:
                 bucket["argument_keys"][call.argument_keys] += 1
 
@@ -1698,7 +1698,7 @@ def build_tool_summary(interactions: Dict[str, InteractionAccumulator]) -> List[
             {
                 "tool_name": tool_name,
                 "namespace": data["namespace"],
-                "is_nora_api": data["is_nora_api"],
+                "is_A_api": data["is_A_api"],
                 "total_calls": total,
                 "interaction_count": interaction_count,
                 "avg_calls_per_interaction": safe_div(total, max(interaction_count, 1), 4),
@@ -1724,7 +1724,7 @@ def build_tool_summary(interactions: Dict[str, InteractionAccumulator]) -> List[
 
 
 TOOL_SUMMARY_FIELDS = [
-    "tool_name", "namespace", "is_nora_api", "total_calls", "interaction_count",
+    "tool_name", "namespace", "is_A_api", "total_calls", "interaction_count",
     "avg_calls_per_interaction", "agent_side_calls", "tool_side_calls",
     "success", "partial", "no_data", "skipped", "error", "empty",
     "success_rate", "error_rate", "no_data_rate", "avg_result_length",
@@ -2269,16 +2269,16 @@ def build_global_summary(
                 total_interactions, distinct_workflows, workflow_clusters.n_clusters
             ),
         },
-        "M5_tools_and_nora_api": {
+        "M5_tools_and_A_api": {
             "total_tool_calls": total_tool_calls,
             "unique_tools": len(unique_tools),
             "unique_namespaces": len({call.namespace for call in all_tool_calls if call.namespace}),
-            "nora_api_calls": sum(call.is_nora_api for call in all_tool_calls),
-            "nora_calls_agent_side": sum(
-                1 for call in all_tool_calls if call.is_nora_api and call.side == "agent"
+            "A_api_calls": sum(call.is_A_api for call in all_tool_calls),
+            "A_calls_agent_side": sum(
+                1 for call in all_tool_calls if call.is_A_api and call.side == "agent"
             ),
-            "nora_calls_tool_side": sum(
-                1 for call in all_tool_calls if call.is_nora_api and call.side == "tool"
+            "A_calls_tool_side": sum(
+                1 for call in all_tool_calls if call.is_A_api and call.side == "tool"
             ),
             "calls_agent_side": sum(1 for call in all_tool_calls if call.side == "agent"),
             "calls_tool_side": sum(1 for call in all_tool_calls if call.side == "tool"),
@@ -2322,12 +2322,12 @@ def build_global_summary(
 
 def print_console_summary(summary: Dict[str, Any]) -> None:
     m1, m2, m3 = summary["M1_problems"], summary["M2_intents"], summary["M3_workflows"]
-    m4, m5, m6 = summary["M4_workflow_reuse"], summary["M5_tools_and_nora_api"], summary["M6_baseline"]
+    m4, m5, m6 = summary["M4_workflow_reuse"], summary["M5_tools_and_A_api"], summary["M6_baseline"]
 
     line = "=" * 78
     print()
     print(line)
-    print("NORA DATA-SCIENCE BASELINE METRICS")
+    print("A DATA-SCIENCE BASELINE METRICS")
     print(line)
     print(f"Window                        : {m6['window_start'] or 'n/a'} -> {m6['window_end'] or 'n/a'}")
     print(
@@ -2357,11 +2357,11 @@ def print_console_summary(summary: Dict[str, Any]) -> None:
     print(f"  Workflows per intent cluster: {m4['workflows_per_intent_cluster']}")
     print(f"  Verdict                     : {m4['verdict']}")
     print()
-    print("M5  TOOLS / NORA API")
+    print("M5  TOOLS / A API")
     print(f"  Tool calls                  : {m5['total_tool_calls']:,} across {m5['unique_tools']:,} tools")
     print(
-        f"  NORA API calls              : {m5['nora_api_calls']:,}"
-        f"   (agent side {m5['nora_calls_agent_side']:,} / tool side {m5['nora_calls_tool_side']:,})"
+        f"  A API calls              : {m5['A_api_calls']:,}"
+        f"   (agent side {m5['A_calls_agent_side']:,} / tool side {m5['A_calls_tool_side']:,})"
     )
     print(f"  Success / error / no-data   : {m5['successful_tool_calls']:,} / {m5['error_tool_calls']:,} / {m5['no_data_tool_calls']:,}")
     print(f"  Tool success rate           : {round(m5['tool_success_rate'] * 100, 2)}%")
@@ -2378,19 +2378,19 @@ def print_console_summary(summary: Dict[str, Any]) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Generate production-grade NORA metrics from interactions.csv",
+        description="Generate production-grade A metrics from interactions.csv",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
     parser.add_argument(
         "input_csv",
         nargs="*",
-        default=[os.getenv("NORA_INTERACTIONS_CSV", "interactions.csv")],
+        default=[os.getenv("A_INTERACTIONS_CSV", "interactions.csv")],
         help="One or more CSV files, directories or globs.",
     )
     parser.add_argument(
         "--output-dir",
-        default=os.getenv("NORA_METRICS_OUTPUT", "nora_metrics_output"),
+        default=os.getenv("A_METRICS_OUTPUT", "A_metrics_output"),
         help="Directory where metrics files are written.",
     )
     parser.add_argument("--start-date", default=None, help="Inclusive ISO start date, e.g. 2025-07-13")
@@ -2423,8 +2423,8 @@ def parse_args() -> argparse.Namespace:
         help="Above this many distinct labels, fall back to exact grouping.",
     )
     parser.add_argument(
-        "--nora-namespaces", default=",".join(DEFAULT_NORA_NAMESPACES),
-        help="Comma-separated tool namespaces counted as NORA API calls.",
+        "--A-namespaces", default=",".join(DEFAULT_A_NAMESPACES),
+        help="Comma-separated tool namespaces counted as A API calls.",
     )
     parser.add_argument(
         "--preview-chars", type=int, default=DEFAULT_PREVIEW_CHARS,
@@ -2450,12 +2450,12 @@ def main() -> int:
     output_dir = Path(args.output_dir).expanduser().resolve()
     ensure_output_dir(output_dir)
 
-    nora_namespaces = [ns.strip() for ns in args.nora_namespaces.split(",") if ns.strip()]
+    A_namespaces = [ns.strip() for ns in args.A_namespaces.split(",") if ns.strip()]
     clustering_enabled = not args.no_clustering
 
     interactions, schema_counter, ingest_report = analyze_csv_files(
         input_files=input_files,
-        nora_namespaces=nora_namespaces,
+        A_namespaces=A_namespaces,
         preview_chars=args.preview_chars,
         parallel_window_seconds=args.parallel_window,
         max_rows=args.max_rows,

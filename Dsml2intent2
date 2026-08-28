@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-NORA Interaction Metrics Analyzer (v3)
+A Interaction Metrics Analyzer (v3)
 ======================================
 
 M1 problems | M2 intents/sub-intents | M3 workflows + tools per workflow
-M4 workflow reuse vs new-every-run | M5 NORA API agent/tool side + parallel
+M4 workflow reuse vs new-every-run | M5 A API agent/tool side + parallel
 M6 baseline volume, +ve vs -ve
 
 Standard library only. Nothing about the schema is hardcoded: field names,
@@ -28,9 +28,9 @@ P6  Cluster exports now carry interaction counts (v2 left them blank).
 
 Usage
 -----
-    python nora_metrics_analyzer.py interactions.csv
-    python nora_metrics_analyzer.py "C:/path/output_1998_complete_interactions"
-    python nora_metrics_analyzer.py interactions.csv --start-date 2026-06-01 \
+    python A_metrics_analyzer.py interactions.csv
+    python A_metrics_analyzer.py "C:/path/output_1998_complete_interactions"
+    python A_metrics_analyzer.py interactions.csv --start-date 2026-06-01 \
         --end-date 2026-08-31 --output-dir ./metrics_aug
 """
 from __future__ import annotations
@@ -58,7 +58,7 @@ ERROR_PATTERNS = ("error executing tool", "failed to", "failure:", "exception", 
                   '"code": 5', '"code": 4')
 
 TOOL_NAME_PATTERN = re.compile(r"^(?P<namespace>[A-Za-z0-9_]+)[-:.](?P<function>.+)$")
-DEFAULT_NORA_NAMESPACES = ("nsm", "misc", "search", "snowflake", "nora", "qtm")
+DEFAULT_A_NAMESPACES = ("nsm", "misc", "search", "snowflake", "A", "qtm")
 
 AGENT_SIDE_HINTS = ("agent", "assistant", "planner", "orchestrat", "llm", "model", "reason")
 TOOL_SIDE_HINTS = ("tool", "executor", "worker", "api", "backend", "function", "server")
@@ -441,7 +441,7 @@ class ToolCall:
     canonical_tool: str
     namespace: str
     function_name: str
-    is_nora_api: int
+    is_A_api: int
     side: str
     arguments: str
     argument_keys: str
@@ -514,10 +514,10 @@ def extract_step_key(node: Dict[str, Any], row: Dict[str, Any]) -> str:
 
 
 def extract_tool_calls(obj: Any, interaction_id: str, row_number: int,
-                       nora_namespaces: Sequence[str], preview_chars: int,
+                       A_namespaces: Sequence[str], preview_chars: int,
                        row_timestamp: Optional[datetime], tsr: TimestampReader) -> List[ToolCall]:
     calls: List[ToolCall] = []
-    nora_set = {n.lower() for n in nora_namespaces}
+    A_set = {n.lower() for n in A_namespaces}
 
     def recurse(node: Any, path: Tuple[str, ...]) -> None:
         if isinstance(node, dict):
@@ -544,7 +544,7 @@ def extract_tool_calls(obj: Any, interaction_id: str, row_number: int,
                 calls.append(ToolCall(
                     interaction_id=interaction_id, row_number=row_number, call_index=0,
                     tool_name=tool_name, canonical_tool=tool_name, namespace=ns, function_name=fn,
-                    is_nora_api=int((ns or tool_name).lower() in nora_set),
+                    is_A_api=int((ns or tool_name).lower() in A_set),
                     side=classify_side(node, obj),
                     arguments=short_text(args_text, preview_chars),
                     argument_keys="|".join(sorted(normalize_key(k) for k in args))
@@ -975,7 +975,7 @@ def expand_inputs(paths: Sequence[str]) -> List[Path]:
     return out
 
 
-def analyze_csv_files(input_files: Sequence[Path], nora_namespaces: Sequence[str],
+def analyze_csv_files(input_files: Sequence[Path], A_namespaces: Sequence[str],
                       preview_chars: int, parallel_window: float, max_rows: Optional[int],
                       canonicalise: bool, tsr: TimestampReader, min_problem_chars: int,
                       quiet: bool) -> Tuple[Dict[str, Interaction], Counter, Dict[str, Any], Dict[str, str]]:
@@ -1037,7 +1037,7 @@ def analyze_csv_files(input_files: Sequence[Path], nora_namespaces: Sequence[str
                         item.sentiment = "positive"
 
                     item.tool_calls.extend(extract_tool_calls(
-                        row, iid, row_number, nora_namespaces, preview_chars, ts, tsr))
+                        row, iid, row_number, A_namespaces, preview_chars, ts, tsr))
                 except Exception as exc:
                     file_failures += 1
                     report["failed_rows"] += 1
@@ -1112,11 +1112,11 @@ def build_interaction_rows(interactions: Dict[str, Interaction], ic: ClusterResu
             "workflow_step_count": len(seq),
             "workflow_tool_set": workflow_set_signature(names),
             "task_decomposition_cluster_id": wc.cluster_of(wf_id),
-            "nora_api_calls": sum(c.is_nora_api for c in item.tool_calls),
-            "nora_calls_agent_side": sum(1 for c in item.tool_calls
-                                         if c.is_nora_api and c.side == "agent"),
-            "nora_calls_tool_side": sum(1 for c in item.tool_calls
-                                        if c.is_nora_api and c.side == "tool"),
+            "A_api_calls": sum(c.is_A_api for c in item.tool_calls),
+            "A_calls_agent_side": sum(1 for c in item.tool_calls
+                                         if c.is_A_api and c.side == "agent"),
+            "A_calls_tool_side": sum(1 for c in item.tool_calls
+                                        if c.is_A_api and c.side == "tool"),
             "calls_agent_side": sum(1 for c in item.tool_calls if c.side == "agent"),
             "calls_tool_side": sum(1 for c in item.tool_calls if c.side == "tool"),
             "max_parallel_degree": item.max_parallel_degree(),
@@ -1141,14 +1141,14 @@ INTERACTION_FIELDS = [
     "intent_cluster_label", "subintent_count", "subintents", "declared_workflow_names",
     "tool_call_count", "unique_tool_count", "tool_names", "workflow", "workflow_id",
     "workflow_step_count", "workflow_tool_set", "task_decomposition_cluster_id",
-    "nora_api_calls", "nora_calls_agent_side", "nora_calls_tool_side", "calls_agent_side",
+    "A_api_calls", "A_calls_agent_side", "A_calls_tool_side", "calls_agent_side",
     "calls_tool_side", "max_parallel_degree", "parallel_tool_groups", "success_calls",
     "partial_calls", "no_data_calls", "skipped_calls", "error_calls", "empty_calls",
     "tool_success_rate", "repeated_tool_types", "repeated_tool_calls", "repeated_tools",
     "has_problem", "has_intent", "has_tool_calls"]
 
 TOOL_CALL_FIELDS = ["interaction_id", "row_number", "call_index", "tool_name", "canonical_tool",
-                    "namespace", "function_name", "is_nora_api", "side", "arguments",
+                    "namespace", "function_name", "is_A_api", "side", "arguments",
                     "argument_keys", "result", "error", "status", "is_success", "timestamp",
                     "step_key", "parallel_group", "parallel_degree", "source_path",
                     "result_length", "argument_length"]
@@ -1159,7 +1159,7 @@ def build_tool_summary(interactions: Dict[str, Interaction]) -> List[Dict[str, A
     total_interactions = len(interactions)
     data: Dict[str, Dict[str, Any]] = defaultdict(
         lambda: {"calls": 0, "interactions": set(), "statuses": Counter(), "sides": Counter(),
-                 "lengths": [], "namespace": "", "is_nora_api": 0, "argkeys": Counter(),
+                 "lengths": [], "namespace": "", "is_A_api": 0, "argkeys": Counter(),
                  "raw_names": set()})
     for iid, item in interactions.items():
         for c in item.tool_calls:
@@ -1172,7 +1172,7 @@ def build_tool_summary(interactions: Dict[str, Interaction]) -> List[Dict[str, A
             b["raw_names"].add(c.tool_name)
             if c.namespace:
                 b["namespace"] = c.namespace
-            b["is_nora_api"] = max(b["is_nora_api"], c.is_nora_api)
+            b["is_A_api"] = max(b["is_A_api"], c.is_A_api)
             if c.argument_keys:
                 b["argkeys"][c.argument_keys] += 1
     rows = []
@@ -1182,7 +1182,7 @@ def build_tool_summary(interactions: Dict[str, Interaction]) -> List[Dict[str, A
         rows.append({
             "tool_name": tool, "namespace": b["namespace"] or "(none)",
             "raw_name_variants": " | ".join(sorted(b["raw_names"])),
-            "is_nora_api": b["is_nora_api"], "total_calls": total, "interaction_count": n_int,
+            "is_A_api": b["is_A_api"], "total_calls": total, "interaction_count": n_int,
             "coverage_pct": coverage,
             "usage_pattern": "always-on" if coverage >= 95 else (
                 "frequent" if coverage >= 50 else "conditional"),
@@ -1200,7 +1200,7 @@ def build_tool_summary(interactions: Dict[str, Interaction]) -> List[Dict[str, A
     return rows
 
 
-TOOL_SUMMARY_FIELDS = ["tool_name", "namespace", "raw_name_variants", "is_nora_api",
+TOOL_SUMMARY_FIELDS = ["tool_name", "namespace", "raw_name_variants", "is_A_api",
                        "total_calls", "interaction_count", "coverage_pct", "usage_pattern",
                        "avg_calls_per_interaction", "agent_side_calls", "tool_side_calls",
                        "success", "partial", "no_data", "skipped", "error", "empty",
@@ -1535,7 +1535,7 @@ def build_global_summary(interactions: Dict[str, Interaction], ic: ClusterResult
             "workflows_per_intent_cluster": safe_div(n_workflows, max(ic.n_clusters, 1), 2),
             "workflows_per_interaction": safe_div(n_workflows, max(total, 1), 4),
             "verdict": divergence_verdict(total, n_workflows, wc.n_clusters)},
-        "M5_tools_and_nora_api": {
+        "M5_tools_and_A_api": {
             "total_tool_calls": n_calls,
             "unique_tools_canonical": len({c.canonical_tool for c in all_calls}),
             "unique_tools_raw_names": len({c.tool_name for c in all_calls}),
@@ -1544,11 +1544,11 @@ def build_global_summary(interactions: Dict[str, Interaction], ic: ClusterResult
             "always_on_tool_names": sorted(always_on)[:50],
             "always_on_pct_of_catalogue": pct(len(always_on), max(len(tool_interactions), 1)),
             "unique_namespaces": len({c.namespace for c in all_calls if c.namespace}),
-            "nora_api_calls": sum(c.is_nora_api for c in all_calls),
-            "nora_calls_agent_side": sum(1 for c in all_calls
-                                         if c.is_nora_api and c.side == "agent"),
-            "nora_calls_tool_side": sum(1 for c in all_calls
-                                        if c.is_nora_api and c.side == "tool"),
+            "A_api_calls": sum(c.is_A_api for c in all_calls),
+            "A_calls_agent_side": sum(1 for c in all_calls
+                                         if c.is_A_api and c.side == "agent"),
+            "A_calls_tool_side": sum(1 for c in all_calls
+                                        if c.is_A_api and c.side == "tool"),
             "calls_agent_side": sum(1 for c in all_calls if c.side == "agent"),
             "calls_tool_side": sum(1 for c in all_calls if c.side == "tool"),
             "successful_tool_calls": status["success"], "partial_tool_calls": status["partial"],
@@ -1579,11 +1579,11 @@ def build_global_summary(interactions: Dict[str, Interaction], ic: ClusterResult
 
 def print_console_summary(s: Dict[str, Any]) -> None:
     m1, m2, m3 = s["M1_problems"], s["M2_intents"], s["M3_workflows"]
-    m4, m5, m6 = s["M4_workflow_reuse"], s["M5_tools_and_nora_api"], s["M6_baseline"]
+    m4, m5, m6 = s["M4_workflow_reuse"], s["M5_tools_and_A_api"], s["M6_baseline"]
     line = "=" * 78
     print()
     print(line)
-    print("NORA DATA-SCIENCE BASELINE METRICS")
+    print("A DATA-SCIENCE BASELINE METRICS")
     print(line)
     print(f"Window                        : {m6['window_start'] or 'n/a'} -> "
           f"{m6['window_end'] or 'n/a'}")
@@ -1622,16 +1622,16 @@ def print_console_summary(s: Dict[str, Any]) -> None:
     print(f"  Workflows per intent cluster: {m4['workflows_per_intent_cluster']}")
     print(f"  Verdict                     : {m4['verdict']}")
     print()
-    print("M5  TOOLS / NORA API")
+    print("M5  TOOLS / A API")
     print(f"  Tool calls                  : {m5['total_tool_calls']:,} across "
           f"{m5['unique_tools_canonical']:,} tools "
           f"({m5['unique_tools_raw_names']:,} raw names, "
           f"{m5['tool_name_aliases_merged']:,} merged)")
     print(f"  ALWAYS-ON tools (>=95% int.): {m5['always_on_tools']:,} "
           f"({m5['always_on_pct_of_catalogue']}% of the catalogue)")
-    print(f"  NORA API calls              : {m5['nora_api_calls']:,}   "
-          f"(agent side {m5['nora_calls_agent_side']:,} / "
-          f"tool side {m5['nora_calls_tool_side']:,})")
+    print(f"  A API calls              : {m5['A_api_calls']:,}   "
+          f"(agent side {m5['A_calls_agent_side']:,} / "
+          f"tool side {m5['A_calls_tool_side']:,})")
     print(f"  Success / error / no-data   : {m5['successful_tool_calls']:,} / "
           f"{m5['error_tool_calls']:,} / {m5['no_data_tool_calls']:,}")
     print(f"  Tool success rate           : {round(m5['tool_success_rate'] * 100, 2)}%")
@@ -1643,12 +1643,12 @@ def print_console_summary(s: Dict[str, Any]) -> None:
 # ------------------------------------------------------------------- main
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Generate production-grade NORA metrics from interactions.csv",
+        description="Generate production-grade A metrics from interactions.csv",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     p.add_argument("input_csv", nargs="*",
-                   default=[os.getenv("NORA_INTERACTIONS_CSV", "interactions.csv")],
+                   default=[os.getenv("A_INTERACTIONS_CSV", "interactions.csv")],
                    help="One or more CSV files, directories or globs.")
-    p.add_argument("--output-dir", default=os.getenv("NORA_METRICS_OUTPUT", "nora_metrics_output"))
+    p.add_argument("--output-dir", default=os.getenv("A_METRICS_OUTPUT", "A_metrics_output"))
     p.add_argument("--start-date", default=None, help="Inclusive ISO start, e.g. 2026-06-01")
     p.add_argument("--end-date", default=None, help="Inclusive ISO end, e.g. 2026-08-31")
     p.add_argument("--only-positive", action="store_true")
@@ -1661,7 +1661,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--order-weight", type=float, default=D_ORDER_WEIGHT)
     p.add_argument("--parallel-window", type=float, default=D_PARALLEL_WINDOW)
     p.add_argument("--max-cluster-items", type=int, default=D_MAX_CLUSTER_ITEMS)
-    p.add_argument("--nora-namespaces", default=",".join(DEFAULT_NORA_NAMESPACES))
+    p.add_argument("--A-namespaces", default=",".join(DEFAULT_A_NAMESPACES))
     p.add_argument("--preview-chars", type=int, default=D_PREVIEW_CHARS)
     p.add_argument("--min-problem-chars", type=int, default=D_MIN_PROBLEM_CHARS,
                    help="Shorter strings are not treated as customer problem text.")
@@ -1689,12 +1689,12 @@ def main() -> int:
 
     out_dir = Path(args.output_dir).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
-    nora_ns = [n.strip() for n in args.nora_namespaces.split(",") if n.strip()]
+    A_ns = [n.strip() for n in args.A_namespaces.split(",") if n.strip()]
     clustering = not args.no_clustering
     tsr = TimestampReader(args.min_year, args.max_year_ahead)
 
     interactions, schema_counter, ingest_report, alias = analyze_csv_files(
-        input_files, nora_ns, args.preview_chars, args.parallel_window, args.max_rows,
+        input_files, A_ns, args.preview_chars, args.parallel_window, args.max_rows,
         not args.no_canonical_tools, tsr, args.min_problem_chars, args.quiet)
 
     interactions, filter_report = filter_interactions(

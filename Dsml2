@@ -1,0 +1,630 @@
+#!/usr/bin/env python3
+"""
+nora_visual_profile.py
+======================
+Look at the data before deciding what to do with it.
+
+Produces ONE self-contained HTML file (charts embedded as base64 PNG, no
+external assets, no CDN, no internet) that can be opened on any machine and
+forwarded to a manager. Nothing in it is configured by us: every chart is
+drawn from whatever columns the file actually contains.
+
+Sections
+--------
+  V1   Dataset overview and column inventory
+  V2   Missingness map and blank-rate ranking
+  V3   Co-missingness heatmap (which fields go blank together)
+  V4   Cardinality vs fill - identifies keys, constants, free text
+  V5   Label distribution (linear and log) and confidence behaviour
+  V6   Text length distributions, overall and by label
+  V7   Temporal volume from the real event clock
+  V8   Rows per conversation - the grain question, answered visually
+  V9   Repetition profile: how much of the corpus is duplicated text
+  V10  Intent x telecom subcategory heatmap
+  V11  Cramer's V heatmap across categorical columns
+  V12  Numeric correlation heatmap
+  V13  PCA scree and 2D projection coloured by the independent label
+
+Privacy: every text sample rendered into the HTML is passed through the same
+masker used by the feature pipeline. A profiling report is exactly the kind of
+artefact that gets emailed around, so it must not carry customer identifiers.
+
+Usage
+-----
+  python nora_visual_profile.py --input intent_labels_all.csv \\
+      --out nora_data_profile.html
+
+  --sample 20000        rows to sample for the heavy charts (default all)
+  --salt-file nora_salt.txt
+  --max-categories 30   cap on categories drawn per axis
+
+NOTE ON PASTED COMMANDS: copied "--" often becomes an en dash. Retype it.
+
+Dependencies: pandas, numpy, matplotlib, scikit-learn, scipy
+"""
+
+import argparse
+import base64
+import html as htmlmod
+import io
+import os
+import sys
+from collections import Counter
+
+import numpy as np
+import pandas as pd
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+from nora_label_diagnostics import discover_roles
+from nora_nlp_feature_pipeline import (
+    Masker, load_or_create_salt, is_blank, cramers_v, log,
+)
+
+PALETTE = ["#2b6cb0", "#c05621", "#2f855a", "#6b46c1", "#b83280",
+           "#975a16", "#285e61", "#9b2c2c"]
+plt.rcParams.update({
+    "figure.dpi": 110, "savefig.dpi": 110, "font.size": 9,
+    "axes.spines.top": False, "axes.spines.right": False,
+    "axes.grid": True, "grid.alpha": 0.25, "grid.linestyle": "-",
+    "axes.axisbelow": True, "figure.facecolor": "white",
+})
+
+
+# --------------------------------------------------------------------------
+# report scaffolding
+# --------------------------------------------------------------------------
+
+class Report:
+    def __init__(self, title):
+        self.title = title
+        self.blocks = []
+
+    def h(self, text, level=2):
+        self.blocks.append(f"<h{level}>{htmlmod.escape(text)}</h{level}>")
+
+    def p(self, text):
+        self.blocks.append(f"<p>{htmlmod.escape(text)}</p>")
+
+    def note(self, text):
+        self.blocks.append(f'<div class="note">{htmlmod.escape(text)}</div>')
+
+    def warn(self, text):
+        self.blocks.append(f'<div class="warn">{htmlmod.escape(text)}</div>')
+
+    def fig(self, figure, caption=""):
+        buf = io.BytesIO()
+        figure.savefig(buf, format="png", bbox_inches="tight")
+        plt.close(figure)
+        b64 = base64.b64encode(buf.getvalue()).decode()
+        cap = f'<div class="cap">{htmlmod.escape(caption)}</div>' if caption else ""
+        self.blocks.append(
+            f'<div class="figbox"><img src="data:image/png;base64,{b64}"/>{cap}</div>')
+
+    def table(self, df, max_rows=30):
+        d = df.head(max_rows).copy()
+        for c in d.columns:
+            d[c] = d[c].astype(str).str.slice(0, 200)
+        self.blocks.append('<div class="tbl">' +
+                           d.to_html(index=False, escape=True, border=0) + "</div>")
+
+    def write(self, path):
+        css = """
+        body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,
+        Helvetica,Arial,sans-serif;max-width:1080px;margin:0 auto;padding:32px;
+        color:#1a202c;line-height:1.55;background:#fff}
+        h1{font-size:26px;border-bottom:3px solid #2b6cb0;padding-bottom:10px;
+        margin-bottom:4px}
+        h2{font-size:19px;margin-top:38px;color:#2b6cb0;
+        border-bottom:1px solid #e2e8f0;padding-bottom:5px}
+        h3{font-size:15px;margin-top:22px;color:#4a5568}
+        p{color:#2d3748}
+        .note{background:#ebf8ff;border-left:4px solid #2b6cb0;padding:11px 14px;
+        margin:14px 0;font-size:13.5px;border-radius:0 3px 3px 0}
+        .warn{background:#fffaf0;border-left:4px solid #c05621;padding:11px 14px;
+        margin:14px 0;font-size:13.5px;border-radius:0 3px 3px 0}
+        .figbox{margin:20px 0;text-align:center}
+        .figbox img{max-width:100%;border:1px solid #e2e8f0;border-radius:4px}
+        .cap{font-size:12px;color:#718096;margin-top:6px;font-style:italic}
+        .tbl{overflow-x:auto;margin:14px 0}
+        table{border-collapse:collapse;font-size:12px;width:100%}
+        th{background:#edf2f7;text-align:left;padding:7px 9px;
+        border-bottom:2px solid #cbd5e0;font-weight:600;white-space:nowrap}
+        td{padding:6px 9px;border-bottom:1px solid #edf2f7;vertical-align:top}
+        tr:nth-child(even) td{background:#fafbfc}
+        .foot{margin-top:44px;padding-top:14px;border-top:1px solid #e2e8f0;
+        font-size:12px;color:#718096}
+        """
+        doc = (f"<!DOCTYPE html><html><head><meta charset='utf-8'>"
+               f"<title>{htmlmod.escape(self.title)}</title>"
+               f"<style>{css}</style></head><body>"
+               f"<h1>{htmlmod.escape(self.title)}</h1>"
+               + "".join(self.blocks)
+               + '<div class="foot">Generated by nora_visual_profile.py. '
+                 'Every chart is derived from the input file; no thresholds, '
+                 'categories, or label names are supplied by the script. '
+                 'All text samples are PII-masked.</div>'
+                 "</body></html>")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(doc)
+
+
+def barh(labels, values, xlabel, title, color=PALETTE[0], figsize=None):
+    n = len(labels)
+    fig, ax = plt.subplots(figsize=figsize or (9, max(2.2, 0.28 * n + 1)))
+    y = np.arange(n)
+    ax.barh(y, values, color=color, height=0.68)
+    ax.set_yticks(y)
+    ax.set_yticklabels([str(l)[:52] for l in labels])
+    ax.invert_yaxis()
+    ax.set_xlabel(xlabel)
+    ax.set_title(title, loc="left", fontweight="600")
+    for i, v in enumerate(values):
+        ax.text(v, i, f" {v:,.4g}" if v < 1 else f" {v:,.0f}",
+                va="center", fontsize=8, color="#4a5568")
+    return fig
+
+
+def heat(mat, xlabels, ylabels, title, cbar_label, cmap="Blues", fmt="{:.2f}"):
+    fig, ax = plt.subplots(figsize=(min(1.05 * len(xlabels) + 3, 14),
+                                    min(0.5 * len(ylabels) + 2.2, 13)))
+    im = ax.imshow(mat, cmap=cmap, aspect="auto")
+    ax.set_xticks(range(len(xlabels)))
+    ax.set_xticklabels([str(x)[:22] for x in xlabels], rotation=42,
+                       ha="right", fontsize=8)
+    ax.set_yticks(range(len(ylabels)))
+    ax.set_yticklabels([str(y)[:34] for y in ylabels], fontsize=8)
+    ax.set_title(title, loc="left", fontweight="600")
+    ax.grid(False)
+    fig.colorbar(im, ax=ax, label=cbar_label, fraction=0.03, pad=0.02)
+    if mat.size <= 400:
+        vmax = np.nanmax(mat) if mat.size else 1
+        for i in range(mat.shape[0]):
+            for j in range(mat.shape[1]):
+                v = mat[i, j]
+                if np.isnan(v):
+                    continue
+                ax.text(j, i, fmt.format(v), ha="center", va="center", fontsize=7,
+                        color="white" if v > 0.6 * vmax else "#2d3748")
+    return fig
+
+
+def cap_categories(series, k):
+    s = series.fillna("__BLANK__").astype(str).str.strip()
+    s = s.replace({"": "__BLANK__"})
+    top = s.value_counts().head(k).index
+    return s.where(s.isin(top), "__OTHER__")
+
+
+# --------------------------------------------------------------------------
+# main
+# --------------------------------------------------------------------------
+
+def main():
+    ap = argparse.ArgumentParser(description="Visual data profile for NORA")
+    ap.add_argument("--input", required=True)
+    ap.add_argument("--out", default="nora_data_profile.html")
+    ap.add_argument("--salt-file", default="nora_salt.txt")
+    ap.add_argument("--sample", type=int, default=0)
+    ap.add_argument("--max-categories", type=int, default=30)
+    ap.add_argument("--seed", type=int, default=42)
+    args = ap.parse_args()
+
+    log(f"reading {args.input} ...")
+    df = pd.read_csv(args.input, low_memory=False, dtype=str, keep_default_na=False,
+                     na_values=["", "NA", "NaN", "null", "None"])
+    n_full = len(df)
+    if args.sample and args.sample < len(df):
+        df = df.sample(args.sample, random_state=args.seed).reset_index(drop=True)
+    log(f"  {n_full:,} rows x {len(df.columns)} columns"
+        f"{f' (sampled to {len(df):,})' if len(df) < n_full else ''}")
+
+    roles = discover_roles(df.columns)
+    salt = load_or_create_salt(args.salt_file)
+
+    # name gazetteer, so masked samples do not leak names from free text
+    gaz = []
+    ncol = roles.get("customer_name")
+    if ncol and ncol in df.columns:
+        for full in df[ncol].dropna().astype(str).unique()[:20000]:
+            gaz += [p.lower() for p in str(full).split() if len(p) >= 3 and p.isalpha()]
+        gaz = list(dict.fromkeys(gaz))
+    masker = Masker(salt, gaz)
+
+    R = Report("NORA Intent Export — Visual Data Profile")
+    R.p(f"Source: {os.path.basename(args.input)} — {n_full:,} rows × "
+        f"{len(df.columns)} columns."
+        + (f" Charts drawn from a random sample of {len(df):,} rows."
+           if len(df) < n_full else ""))
+    R.note("Read this before choosing any modelling approach. Nothing here is "
+           "configured: the label names, category lists, bin edges and axis "
+           "ranges are all read from the file itself.")
+
+    # ---------------- V1 inventory
+    R.h("V1 · Column inventory")
+    inv = []
+    inv_rev = {v: k for k, v in roles.items()}
+    for c in df.columns:
+        s = df[c].dropna().astype(str)
+        s = s[s.str.strip() != ""]
+        inv.append({
+            "column": c, "discovered_role": inv_rev.get(c, ""),
+            "fill_%": round(100.0 * len(s) / len(df), 1),
+            "distinct": int(s.nunique()),
+            "uniqueness": round(s.nunique() / max(len(s), 1), 3),
+            "median_len": int(s.str.len().median()) if len(s) else 0,
+            "max_len": int(s.str.len().max()) if len(s) else 0,
+        })
+    inv = pd.DataFrame(inv)
+    R.table(inv.sort_values("fill_%"), max_rows=60)
+    R.note(f"{len(inv[inv['discovered_role'] != ''])} of {len(inv)} columns "
+           f"resolved to a known role. Check this table first: if a column "
+           f"mapped to the wrong role, every chart below inherits the error.")
+
+    # ---------------- V2 missingness
+    R.h("V2 · Missingness")
+    B = pd.DataFrame({c: is_blank(df[c]) for c in df.columns})
+    rate = (B.mean() * 100).sort_values(ascending=False)
+    live = rate[(rate > 0) & (rate < 100)]
+    R.fig(barh(rate.index.tolist(), rate.values, "% blank",
+               "Blank rate by column"),
+          "Derived from the data: a value counts as blank if it is empty, or "
+          "one of the null-like strings actually present in this file.")
+    dead = rate[rate >= 100]
+    if len(dead):
+        R.warn(f"{len(dead)} column(s) are 100% blank and carry no information: "
+               f"{', '.join(list(dead.index)[:10])}")
+    if len(live):
+        R.p(f"{len(live)} columns are partially populated. Partial fill is the "
+            f"interesting case: it may be a broken pipeline, or it may be a "
+            f"genuine signal about which situations produce which fields.")
+
+    # ---------------- V3 co-missingness
+    if len(live) >= 2:
+        R.h("V3 · Co-missingness")
+        cols = list(live.index)[:24]
+        M = np.zeros((len(cols), len(cols)))
+        for i, a in enumerate(cols):
+            for j, b in enumerate(cols):
+                inter = (B[a] & B[b]).sum()
+                union = (B[a] | B[b]).sum()
+                M[i, j] = inter / union if union else np.nan
+        R.fig(heat(M, cols, cols, "Jaccard similarity of blankness",
+                   "Jaccard", cmap="Purples"),
+              "Blocks of high similarity are fields that go blank together, "
+              "i.e. one upstream condition switches them all off at once.")
+
+    # ---------------- V4 cardinality
+    R.h("V4 · Cardinality vs fill")
+    fig, ax = plt.subplots(figsize=(8.5, 5.2))
+    ax.scatter(inv["fill_%"], inv["distinct"].clip(lower=1), s=42,
+               c=PALETTE[0], alpha=0.75, edgecolors="white", linewidths=0.6)
+    ax.set_yscale("log")
+    ax.set_xlabel("fill %")
+    ax.set_ylabel("distinct values (log)")
+    ax.set_title("Column shape", loc="left", fontweight="600")
+    for _, r in inv.nlargest(6, "distinct").iterrows():
+        ax.annotate(str(r["column"])[:26], (r["fill_%"], max(r["distinct"], 1)),
+                    fontsize=7, alpha=0.85, xytext=(4, 3),
+                    textcoords="offset points")
+    R.fig(fig, "Top right = identifiers or free text. Bottom right = "
+               "categoricals. Bottom left = mostly-empty fields.")
+
+    # ---------------- V5 labels
+    intent = roles.get("intent")
+    if intent:
+        R.h("V5 · Label distribution")
+        vc = df[intent].fillna("__NULL__").value_counts()
+        fig, axes = plt.subplots(1, 2, figsize=(12, 3.6))
+        axes[0].bar(range(len(vc)), vc.values, color=PALETTE[0])
+        axes[0].set_xticks(range(len(vc)))
+        axes[0].set_xticklabels([str(x)[:16] for x in vc.index],
+                                rotation=25, ha="right")
+        axes[0].set_ylabel("rows")
+        axes[0].set_title("linear scale", loc="left", fontsize=10)
+        axes[1].bar(range(len(vc)), vc.values, color=PALETTE[1])
+        axes[1].set_yscale("log")
+        axes[1].set_xticks(range(len(vc)))
+        axes[1].set_xticklabels([str(x)[:16] for x in vc.index],
+                                rotation=25, ha="right")
+        axes[1].set_title("log scale — reveals the rare classes", loc="left",
+                          fontsize=10)
+        fig.suptitle("Class distribution", x=0.09, ha="left", fontweight="600")
+        R.fig(fig)
+        share = (100.0 * vc / vc.sum()).round(2)
+        R.table(pd.DataFrame({"label": vc.index, "rows": vc.values,
+                              "share_%": share.values}))
+        if share.iloc[0] > 60:
+            R.warn(f"'{vc.index[0]}' accounts for {share.iloc[0]:.1f}% of rows. "
+                   f"A model predicting only this label would score that as "
+                   f"accuracy while learning nothing. Macro-F1, not accuracy.")
+        if vc.min() < 500:
+            R.warn(f"Smallest class '{vc.index[-1]}' has {vc.min():,} rows. "
+                   f"Check whether it can support a train/val/test split at all.")
+        dupct = vc.value_counts()
+        tied = dupct[dupct > 1]
+        if len(tied):
+            for cnt in tied.index:
+                names = list(vc[vc == cnt].index)
+                R.warn(f"Classes {names} have identical counts ({cnt:,}). "
+                       f"Exact ties across independent semantic classes are "
+                       f"very unlikely by chance — inspect the rule that "
+                       f"produced them.")
+
+        conf = roles.get("confidence")
+        if conf:
+            R.h("Confidence behaviour", 3)
+            c = pd.to_numeric(df[conf], errors="coerce")
+            g = pd.DataFrame({"lab": df[intent], "c": c}).dropna()
+            grp = g.groupby("lab")["c"]
+            nuniq = grp.nunique()
+            fig, ax = plt.subplots(figsize=(8.5, 3.6))
+            labs = list(grp.groups.keys())
+            ax.scatter([str(l)[:16] for l in labs], grp.mean().reindex(labs).values,
+                       s=90, c=PALETTE[2], zorder=3, label="mean")
+            ax.errorbar([str(l)[:16] for l in labs],
+                        grp.mean().reindex(labs).values,
+                        yerr=grp.std().reindex(labs).fillna(0).values,
+                        fmt="none", ecolor="#a0aec0", capsize=4, zorder=2)
+            ax.set_ylabel("confidence")
+            ax.set_title("Confidence per class (error bar = std dev)",
+                         loc="left", fontweight="600")
+            plt.setp(ax.get_xticklabels(), rotation=25, ha="right")
+            R.fig(fig)
+            if (nuniq <= 1).all():
+                R.warn("Every class has exactly one confidence value. This is a "
+                       "lookup table, not a probability. It carries no row-level "
+                       "information and cannot be used for thresholding, active "
+                       "learning, or calibration.")
+
+    # ---------------- V6 text length
+    ut = roles.get("user_text")
+    if ut:
+        R.h("V6 · Text length")
+        t = df[ut].fillna("").astype(str)
+        L = t.str.len()
+        fig, axes = plt.subplots(1, 2, figsize=(12, 3.6))
+        pos = L[L > 0]
+        axes[0].hist(pos, bins=60, color=PALETTE[0])
+        axes[0].set_xlabel("characters")
+        axes[0].set_ylabel("rows")
+        axes[0].set_title("length distribution", loc="left", fontsize=10)
+        if len(pos):
+            axes[1].hist(np.log10(pos + 1), bins=60, color=PALETTE[3])
+            axes[1].set_xlabel("log10(characters)")
+            axes[1].set_title("log scale — reveals multiple populations",
+                              loc="left", fontsize=10)
+        R.fig(fig, "Multiple humps mean multiple kinds of row are mixed "
+                   "together — for example short customer utterances alongside "
+                   "long machine-generated diagnostic dumps.")
+        R.table(pd.DataFrame([{
+            "empty_rows": int((L == 0).sum()),
+            "empty_%": round(100.0 * (L == 0).mean(), 2),
+            "p05": int(L.quantile(.05)), "median": int(L.median()),
+            "p95": int(L.quantile(.95)), "max": int(L.max())}]))
+        if intent:
+            byl = pd.DataFrame({"lab": df[intent].astype(str), "len": L})
+            order = byl.groupby("lab")["len"].median().sort_values().index
+            fig, ax = plt.subplots(figsize=(9, 3.8))
+            ax.boxplot([byl.loc[byl["lab"] == l, "len"].values for l in order],
+                       tick_labels=[str(l)[:16] for l in order], showfliers=False,
+                       patch_artist=True,
+                       boxprops=dict(facecolor="#bee3f8", edgecolor="#2b6cb0"),
+                       medianprops=dict(color="#c05621", linewidth=2))
+            ax.set_ylabel("characters")
+            ax.set_title("Text length by label", loc="left", fontweight="600")
+            plt.setp(ax.get_xticklabels(), rotation=25, ha="right")
+            R.fig(fig, "If length alone separates the classes, the labeller may "
+                       "be keying on document type rather than on meaning.")
+
+    # ---------------- V7 temporal
+    ts = roles.get("cosmos_ts")
+    if ts:
+        R.h("V7 · Volume over time")
+        v = pd.to_numeric(df[ts], errors="coerce")
+        best, unit, score = None, None, -1
+        for nm, div in [("s", 1), ("ms", 1e3), ("us", 1e6)]:
+            dt = pd.to_datetime(v / div, unit="s", errors="coerce", utc=True)
+            sc = float(dt.dt.year.between(2020, 2030).mean(skipna=True) or 0)
+            if sc > score:
+                best, unit, score = dt, nm, sc
+        if score >= 0.5:
+            R.p(f"Epoch unit auto-detected as {unit} "
+                f"({100 * score:.1f}% of values land in a plausible window). "
+                f"Range: {best.min()} to {best.max()}.")
+            daily = best.dt.date.value_counts().sort_index()
+            fig, ax = plt.subplots(figsize=(11, 3.4))
+            ax.plot(daily.index, daily.values, color=PALETTE[0], linewidth=1.3)
+            ax.fill_between(daily.index, daily.values, alpha=0.18,
+                            color=PALETTE[0])
+            ax.set_ylabel("rows per day")
+            ax.set_title("Ingest volume on the real event clock", loc="left",
+                         fontweight="600")
+            fig.autofmt_xdate()
+            R.fig(fig, "Gaps and step changes here indicate pipeline outages or "
+                       "instrumentation changes, and both break a temporal split.")
+        else:
+            R.warn(f"Could not resolve {ts} to a plausible timestamp under any "
+                   f"epoch unit. A temporal train/test split is not currently "
+                   f"possible; fix this before relying on holdout results.")
+        va = roles.get("validated_at")
+        if va and df[va].dropna().nunique() <= 2:
+            R.warn(f"'{va}' has {df[va].dropna().nunique()} distinct value(s) "
+                   f"across the whole file. That is batch-run time, not event "
+                   f"time. Never split on it.")
+
+    # ---------------- V8 grain
+    conv = roles.get("conversation_id")
+    if conv:
+        R.h("V8 · Grain — what is one row?")
+        vc = df[conv].fillna("__BLANK__").value_counts()
+        dist = vc.value_counts().sort_index()
+        fig, ax = plt.subplots(figsize=(8.5, 3.4))
+        ax.bar(dist.index.astype(str), dist.values, color=PALETTE[2])
+        ax.set_xlabel("rows sharing one conversation id")
+        ax.set_ylabel("conversations")
+        ax.set_yscale("log")
+        ax.set_title("Rows per conversation", loc="left", fontweight="600")
+        R.fig(fig)
+        multi = int((vc > 1).sum())
+        R.p(f"{len(vc):,} distinct conversation ids across {len(df):,} rows. "
+            f"{multi:,} conversations contain more than one row "
+            f"(mean {vc.mean():.2f}, max {vc.max():,}).")
+        if multi:
+            R.warn("Because conversations span multiple rows, a random "
+                   "row-level train/test split would place related rows on both "
+                   "sides and inflate every score. Splits must be grouped.")
+
+    # ---------------- V9 repetition
+    if ut:
+        R.h("V9 · Repetition")
+        t = df[ut].fillna("").astype(str).str.strip()
+        vc = t.value_counts()
+        cum = (vc.cumsum() / vc.sum() * 100)
+        fig, ax = plt.subplots(figsize=(8.5, 3.6))
+        ax.plot(range(1, min(len(cum), 3000) + 1), cum.values[:3000],
+                color=PALETTE[1], linewidth=1.6)
+        ax.set_xlabel("distinct texts, ranked by frequency")
+        ax.set_ylabel("cumulative % of corpus")
+        ax.set_xscale("log")
+        ax.set_title("How concentrated is the corpus?", loc="left",
+                     fontweight="600")
+        R.fig(fig, "A curve that rises steeply means a handful of templated "
+                   "strings make up most of the data.")
+        dup = t.duplicated(keep=False)
+        R.p(f"{int(dup.sum()):,} rows ({100 * dup.mean():.1f}%) share their text "
+            f"with at least one other row. {t.nunique():,} distinct texts.")
+        top = vc.head(10).reset_index()
+        top.columns = ["text", "rows"]
+        top["% of corpus"] = (100.0 * top["rows"] / len(t)).round(2)
+        top["text"] = top["text"].map(lambda x: masker.mask_text(str(x))[:180])
+        R.h("Most repeated texts (PII-masked)", 3)
+        R.table(top)
+
+    # ---------------- V10 intent x subcategory
+    sc = roles.get("subcategory")
+    if intent and sc:
+        R.h("V10 · Intent vs telecom subcategory")
+        a = cap_categories(df[sc], args.max_categories)
+        b = df[intent].fillna("__NULL__").astype(str)
+        ct = pd.crosstab(a, b)
+        ct = ct.loc[ct.sum(axis=1).sort_values(ascending=False).index]
+        rownorm = ct.div(ct.sum(axis=1).replace(0, np.nan), axis=0).fillna(0)
+        R.fig(heat(rownorm.values, list(ct.columns), list(ct.index),
+                   "Row-normalised: share of each subcategory by intent",
+                   "share of row", cmap="YlGnBu"))
+        R.note("This is the most valuable panel in the report. The subcategory "
+               "column is an independent label axis that did not come from the "
+               "rules engine. If intent and subcategory were unrelated, every "
+               "row here would look identical. Where they differ, there is real "
+               "structure to learn.")
+        R.table(ct.reset_index())
+
+    # ---------------- V11 categorical association
+    cat_roles = ["subdomain", "domain", "record_producer", "rca_complete",
+                 "ticket_stage", "category", "subcategory", "rule_id",
+                 "validator", "intent"]
+    cats = [roles[r] for r in cat_roles if roles.get(r) and roles[r] in df.columns]
+    cats = [c for c in cats if 1 < df[c].fillna("__B__").nunique() <= 500]
+    if len(cats) >= 2:
+        R.h("V11 · Association between categorical columns")
+        S = {c: cap_categories(df[c], 60) for c in cats}
+        M = np.full((len(cats), len(cats)), np.nan)
+        for i, a in enumerate(cats):
+            for j, b in enumerate(cats):
+                M[i, j] = 1.0 if i == j else cramers_v(S[a], S[b])
+        R.fig(heat(M, cats, cats, "Cramér's V (bias-corrected)", "V",
+                   cmap="Oranges"))
+        R.note("Cramér's V runs 0 to 1. A value near 1 between the label and "
+               "any other column means that column effectively IS the label — "
+               "which is leakage, not a useful feature.")
+
+    # ---------------- V12/V13 numeric structure
+    R.h("V12 · Derived numeric structure")
+    num = pd.DataFrame(index=df.index)
+    if ut:
+        t = df[ut].fillna("").astype(str)
+        num["text_chars"] = t.str.len()
+        num["text_words"] = t.str.split().str.len().fillna(0)
+        num["digit_ratio"] = (t.str.count(r"\d") /
+                              t.str.len().replace(0, np.nan)).fillna(0)
+        num["punct_ratio"] = (t.str.count(r"[^\w\s]") /
+                              t.str.len().replace(0, np.nan)).fillna(0)
+        num["upper_ratio"] = (t.str.count(r"[A-Z]") /
+                              t.str.len().replace(0, np.nan)).fillna(0)
+        num["question_marks"] = t.str.count(r"\?")
+    for r in ["latitude", "longitude"]:
+        c = roles.get(r)
+        if c:
+            v = pd.to_numeric(df[c], errors="coerce")
+            if v.notna().sum() > 10:
+                num[r] = v.fillna(v.median())
+    for c in df.columns:
+        if c in num.columns:
+            continue
+        v = pd.to_numeric(df[c], errors="coerce")
+        if v.notna().mean() > 0.7 and v.nunique() > 10 and c != roles.get("cosmos_ts"):
+            num[f"num_{c[:28]}"] = v.fillna(v.median())
+    num = num.replace([np.inf, -np.inf], np.nan).fillna(0)
+    num = num.loc[:, num.std() > 0]
+
+    if num.shape[1] >= 2:
+        C = num.corr()
+        R.fig(heat(C.values, list(C.columns), list(C.index),
+                   "Pearson correlation between derived numeric features",
+                   "r", cmap="RdBu_r", fmt="{:.2f}"))
+        R.note("These features are computed here on the fly from the text; they "
+               "are not assumed to exist in the file. Pairs near |r| = 1 are "
+               "redundant and only one should survive into a linear model.")
+
+    if num.shape[1] >= 3 and len(num) >= 20:
+        from sklearn.preprocessing import StandardScaler
+        from sklearn.decomposition import PCA
+        R.h("V13 · PCA")
+        Z = StandardScaler().fit_transform(num.values)
+        k = int(min(10, Z.shape[1]))
+        pca = PCA(n_components=k, random_state=args.seed)
+        P = pca.fit_transform(Z)
+        ev = pca.explained_variance_ratio_
+        fig, axes = plt.subplots(1, 2, figsize=(12, 3.8))
+        axes[0].bar(range(1, k + 1), ev, color=PALETTE[0])
+        axes[0].plot(range(1, k + 1), np.cumsum(ev), color=PALETTE[1],
+                     marker="o", markersize=4)
+        axes[0].axhline(0.9, color="#a0aec0", linestyle="--", linewidth=1)
+        axes[0].set_xlabel("component")
+        axes[0].set_ylabel("explained variance")
+        axes[0].set_title("scree (dashed = 90%)", loc="left", fontsize=10)
+        colour_col = sc if sc else intent
+        if colour_col:
+            lab = cap_categories(df[colour_col], 8)
+            for i, u in enumerate(lab.value_counts().head(8).index):
+                m = (lab == u).values
+                axes[1].scatter(P[m, 0], P[m, 1], s=9, alpha=0.5,
+                                color=PALETTE[i % len(PALETTE)],
+                                label=str(u)[:20])
+            axes[1].legend(fontsize=6.5, markerscale=1.6, loc="best",
+                           frameon=False)
+        else:
+            axes[1].scatter(P[:, 0], P[:, 1], s=9, alpha=0.5, color=PALETTE[0])
+        axes[1].set_xlabel("PC1")
+        axes[1].set_ylabel("PC2")
+        axes[1].set_title(f"projection coloured by {colour_col}", loc="left",
+                          fontsize=10)
+        R.fig(fig, "If the colours overlap completely, these surface features "
+                   "carry no class information and the signal must come from "
+                   "the text content itself.")
+        n90 = int((np.cumsum(ev) < 0.9).sum()) + 1
+        R.p(f"{int((pca.explained_variance_ > 1).sum())} components have "
+            f"eigenvalue > 1 (Kaiser); {n90} are needed to reach 90% of "
+            f"variance across {num.shape[1]} derived features.")
+
+    R.write(args.out)
+    log(f"\nwrote {os.path.abspath(args.out)}")
+    log("Open it in a browser. It is one self-contained file, safe to forward.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

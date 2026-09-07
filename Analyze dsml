@@ -1,0 +1,1355 @@
+#!/usr/bin/env python3
+"""
+===============================================================================
+ INTENT ANALYSIS  -  single self-contained script
+===============================================================================
+Input : the flattened turn-level export, saved as CSV, with columns like
+        source_row | message_index | classification.intent | message.data.cid |
+        message.data.content | message.data.intent_predicted |
+        message.data.label | message.data.type | message.type
+
+Output: one HTML report + a folder of CSV tables.
+
+This file has NO local imports. Copy this one file into VS Code, put the CSV
+next to it, and run. Nothing else from earlier work is needed.
+
+-------------------------------------------------------------------------------
+ WHAT IS X AND WHAT IS Y
+-------------------------------------------------------------------------------
+  X        the text of a USER turn (plus features derived from it)
+  y_turn   the intent of that single user turn        <- message.data.label
+  y_global the intent of the whole conversation       <- classification.intent
+
+  Assistant turns are NOT X. They are the system's answer and already contain
+  the conclusion; using them as input would be target leakage.
+
+-------------------------------------------------------------------------------
+ THE SIX PHASES
+-------------------------------------------------------------------------------
+  PHASE 1  DATA ANALYSIS      structure, labels, text, missingness, association
+  PHASE 2  CLEANING           mask PII, split roles, strip boilerplate, dedup
+  PHASE 3  EDA + PCA          vectorise, compress, is the label learnable at all
+  PHASE 4  CLUSTERING         K-means with k chosen by silhouette, heat maps,
+                              cluster naming, purity, sub-intent discovery
+  PHASE 5  TURN -> GLOBAL     transition matrix, and is the case label just a rule
+  PHASE 6  TWO LABEL SETS     Excel label vs a keyword rule block, out of fold,
+                              Cohen's kappa, confidence calibration
+
+No column name, class name, keyword or threshold is hardcoded. Everything is
+discovered from the file.
+
+-------------------------------------------------------------------------------
+ SETUP
+-------------------------------------------------------------------------------
+  pip install pandas numpy scikit-learn scipy matplotlib
+
+  python nora_intent_analysis.py --input intent_labels_all_flattened.csv \\
+      --outdir nora_out
+
+  Options
+    --salt-file PATH     PII salt (auto-created). Keep it OUTSIDE OneDrive.
+    --max-k 30           upper bound for the silhouette search
+    --sample 0           0 = use every row
+    --min-cluster-size   0 = derived from the data
+
+  If you paste the command from a chat window the double hyphen may be
+  auto-converted to an en dash and argparse will reject it. Retype the dashes.
+===============================================================================
+"""
+
+import argparse
+import base64
+import hashlib
+import hmac
+import html as htmlmod
+import io
+import json
+import os
+import re
+import secrets
+import sys
+from collections import Counter, defaultdict
+
+import numpy as np
+import pandas as pd
+from scipy.stats import chi2_contingency
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.decomposition import TruncatedSVD, PCA
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score
+from sklearn.feature_selection import mutual_info_classif
+from sklearn.model_selection import StratifiedKFold
+
+
+# =============================================================================
+# 0. UTILITIES
+# =============================================================================
+
+PALETTE = ["#2b6cb0", "#c05621", "#2f855a", "#6b46c1", "#b83280",
+           "#975a16", "#285e61", "#9b2c2c"]
+
+plt.rcParams.update({
+    "figure.dpi": 110, "savefig.dpi": 110, "font.size": 9,
+    "axes.spines.top": False, "axes.spines.right": False,
+    "axes.grid": True, "grid.alpha": 0.25, "axes.axisbelow": True,
+    "figure.facecolor": "white",
+})
+
+
+def log(m):
+    print(m, flush=True)
+
+
+class Out:
+    """Writes CSV tables and accumulates the HTML report."""
+
+    def __init__(self, outdir, title):
+        self.dir = outdir
+        os.makedirs(outdir, exist_ok=True)
+        self.title = title
+        self.blocks = []
+
+    # ---- tables
+    def csv(self, df, name):
+        p = os.path.join(self.dir, name)
+        df.to_csv(p, index=False)
+        log(f"      -> {name}  ({len(df):,} rows)")
+        return p
+
+    # ---- report
+    def h(self, text, level=2):
+        self.blocks.append(f"<h{level}>{htmlmod.escape(str(text))}</h{level}>")
+
+    def p(self, text):
+        self.blocks.append(f"<p>{htmlmod.escape(str(text))}</p>")
+
+    def note(self, text):
+        self.blocks.append(f'<div class="note">{htmlmod.escape(str(text))}</div>')
+
+    def warn(self, text):
+        self.blocks.append(f'<div class="warn">{htmlmod.escape(str(text))}</div>')
+
+    def fig(self, figure, caption=""):
+        buf = io.BytesIO()
+        figure.savefig(buf, format="png", bbox_inches="tight")
+        plt.close(figure)
+        b64 = base64.b64encode(buf.getvalue()).decode()
+        cap = f'<div class="cap">{htmlmod.escape(caption)}</div>' if caption else ""
+        self.blocks.append(
+            f'<div class="figbox"><img src="data:image/png;base64,{b64}"/>{cap}</div>')
+
+    def table(self, df, max_rows=30):
+        d = df.head(max_rows).copy()
+        for c in d.columns:
+            d[c] = d[c].astype(str).str.slice(0, 220)
+        self.blocks.append('<div class="tbl">' +
+                           d.to_html(index=False, escape=True, border=0) + "</div>")
+
+    def save(self, path):
+        css = """
+        body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,
+        Helvetica,Arial,sans-serif;max-width:1100px;margin:0 auto;padding:32px;
+        color:#1a202c;line-height:1.55;background:#fff}
+        h1{font-size:27px;border-bottom:3px solid #2b6cb0;padding-bottom:10px}
+        h2{font-size:20px;margin-top:42px;color:#2b6cb0;
+        border-bottom:1px solid #e2e8f0;padding-bottom:6px}
+        h3{font-size:15px;margin-top:24px;color:#4a5568}
+        .note{background:#ebf8ff;border-left:4px solid #2b6cb0;padding:11px 14px;
+        margin:14px 0;font-size:13.5px}
+        .warn{background:#fffaf0;border-left:4px solid #c05621;padding:11px 14px;
+        margin:14px 0;font-size:13.5px}
+        .figbox{margin:20px 0;text-align:center}
+        .figbox img{max-width:100%;border:1px solid #e2e8f0;border-radius:4px}
+        .cap{font-size:12px;color:#718096;margin-top:6px;font-style:italic}
+        .tbl{overflow-x:auto;margin:14px 0}
+        table{border-collapse:collapse;font-size:12px;width:100%}
+        th{background:#edf2f7;text-align:left;padding:7px 9px;
+        border-bottom:2px solid #cbd5e0;white-space:nowrap}
+        td{padding:6px 9px;border-bottom:1px solid #edf2f7;vertical-align:top}
+        tr:nth-child(even) td{background:#fafbfc}
+        .foot{margin-top:46px;padding-top:14px;border-top:1px solid #e2e8f0;
+        font-size:12px;color:#718096}
+        """
+        doc = (f"<!DOCTYPE html><html><head><meta charset='utf-8'>"
+               f"<title>{htmlmod.escape(self.title)}</title><style>{css}</style>"
+               f"</head><body><h1>{htmlmod.escape(self.title)}</h1>"
+               + "".join(self.blocks)
+               + '<div class="foot">Every chart, class list, keyword, cluster '
+                 'count and threshold in this report is derived from the input '
+                 'file. All text shown is PII-masked.</div></body></html>')
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(doc)
+
+
+def barh(labels, values, xlabel, title, color=PALETTE[0]):
+    n = len(labels)
+    fig, ax = plt.subplots(figsize=(9, max(2.2, 0.30 * n + 1)))
+    y = np.arange(n)
+    ax.barh(y, values, color=color, height=0.68)
+    ax.set_yticks(y)
+    ax.set_yticklabels([str(l)[:55] for l in labels])
+    ax.invert_yaxis()
+    ax.set_xlabel(xlabel)
+    ax.set_title(title, loc="left", fontweight="600")
+    for i, v in enumerate(values):
+        ax.text(v, i, f" {v:,.3g}", va="center", fontsize=8, color="#4a5568")
+    return fig
+
+
+def heat(mat, xlabels, ylabels, title, cbar, cmap="Blues", fmt="{:.2f}"):
+    fig, ax = plt.subplots(figsize=(min(1.1 * len(xlabels) + 3.5, 14),
+                                    min(0.46 * len(ylabels) + 2.4, 13)))
+    im = ax.imshow(mat, cmap=cmap, aspect="auto")
+    ax.set_xticks(range(len(xlabels)))
+    ax.set_xticklabels([str(x)[:22] for x in xlabels], rotation=42, ha="right",
+                       fontsize=8)
+    ax.set_yticks(range(len(ylabels)))
+    ax.set_yticklabels([str(y)[:34] for y in ylabels], fontsize=8)
+    ax.set_title(title, loc="left", fontweight="600")
+    ax.grid(False)
+    fig.colorbar(im, ax=ax, label=cbar, fraction=0.03, pad=0.02)
+    if mat.size <= 400:
+        vmax = np.nanmax(mat) if mat.size else 1
+        for i in range(mat.shape[0]):
+            for j in range(mat.shape[1]):
+                v = mat[i, j]
+                if np.isnan(v):
+                    continue
+                ax.text(j, i, fmt.format(v), ha="center", va="center", fontsize=7,
+                        color="white" if v > 0.6 * vmax else "#2d3748")
+    return fig
+
+
+# =============================================================================
+# 1. COLUMN DISCOVERY  (by pattern, never by exact name)
+# =============================================================================
+
+def find(cols, patterns, exclude=()):
+    for pat in patterns:
+        for c in cols:
+            n = re.sub(r"[^a-z0-9]+", "_", str(c).lower())
+            if any(re.search(e, n) for e in exclude):
+                continue
+            if re.search(pat, n):
+                return c
+    return None
+
+
+def discover_columns(df):
+    c = list(df.columns)
+    return {
+        "case":       find(c, [r"^source_row$", r"source.*row", r"^row$"]),
+        "turn":       find(c, [r"message_index", r"turn.*index", r"^index$"]),
+        "conv_label": find(c, [r"classification.*intent", r"case.*intent"]),
+        "cid":        find(c, [r"data_cid$", r"(^|_)cid$", r"conversation.*id"]),
+        "text":       find(c, [r"data_content$", r"content$", r"message.*text"]),
+        "predicted":  find(c, [r"intent_predicted", r"predicted"]),
+        "turn_label": find(c, [r"data_label$", r"(^|_)label$"],
+                           exclude=[r"predicted"]),
+        "role":       find(c, [r"^message_type$", r"message_type$", r"data_type$"]),
+    }
+
+
+# =============================================================================
+# 2. PII MASKING
+# =============================================================================
+# Salted HMAC surrogates. The same real value always becomes the same code, so
+# entity counting still works, but the raw identifier never reaches a chart, a
+# CSV or a model. Ordered most specific first: a 15-digit IMEI must be caught
+# before the generic phone-number rule can eat it.
+
+PII_PATTERNS = [
+    ("EMAIL",  re.compile(r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b")),
+    ("IPV4",   re.compile(r"\b(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}"
+                          r"(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\b")),
+    ("EID",    re.compile(r"\b[0-9a-f]{32}\b", re.IGNORECASE)),
+    ("ICCID",  re.compile(r"\b89\d{17,20}\b")),
+    ("IMEI",   re.compile(r"\b\d{15,16}\b")),
+    ("BAN",    re.compile(r"(?i)\b(?:BAN|account\s*(?:number|#)?)\s*[:#]?\s*(\d{8,12})\b")),
+    ("MSISDN", re.compile(r"(?<!\d)(?:\+?1[\s\-.]?)?\(?\d{3}\)?[\s\-.]?\d{3}[\s\-.]?\d{4}(?!\d)")),
+    ("LATLON", re.compile(r"(?<![\w.])-?\d{1,3}\.\d{4,}(?![\w.])")),
+    ("ZIP",    re.compile(r"\b\d{5}(?:-\d{4})?\b")),
+    ("URL",    re.compile(r"https?://\S+")),
+]
+
+NAME_FIELD_RE = re.compile(r"(?i)(customer\s*name|contact\s*name)\s*:\s*"
+                           r"([A-Z][A-Za-z'\-]+(?:\s+[A-Z][A-Za-z'\-]+){0,3})")
+ADDRESS_RE = re.compile(
+    r"\b\d{1,6}\s+(?:[A-Za-z0-9.'\-]+\s+){0,4}"
+    r"(?:st|street|rd|road|ave|avenue|blvd|boulevard|ln|lane|dr|drive|ct|court|"
+    r"way|pl|place|ter|terrace|pkwy|parkway|hwy|highway|cir|circle)\b\.?",
+    re.IGNORECASE)
+
+
+class Masker:
+    def __init__(self, salt):
+        self.salt = salt
+        self.counts = Counter()
+
+    def _sur(self, kind, value):
+        h = hmac.new(self.salt, f"{kind}|{value}".encode("utf-8", "ignore"),
+                     hashlib.sha256).hexdigest()[:10]
+        self.counts[kind] += 1
+        return f"<{kind}_{h}>"
+
+    def mask(self, text):
+        if not isinstance(text, str) or not text:
+            return text
+        s = NAME_FIELD_RE.sub(
+            lambda m: f"{m.group(1)}: {self._sur('NAME', m.group(2).lower())}", text)
+        s = ADDRESS_RE.sub(lambda m: self._sur("ADDRESS", m.group(0).lower()), s)
+        for kind, rx in PII_PATTERNS:
+            def rep(m, kind=kind):
+                g = m.group(1) if m.re.groups else m.group(0)
+                return self._sur(kind, re.sub(r"\D", "", g) or g)
+            s = rx.sub(rep, s)
+        return s
+
+
+def load_salt(path):
+    if os.path.exists(path):
+        with open(path) as f:
+            v = f.read().strip()
+        if v:
+            return v.encode()
+    v = secrets.token_hex(32)
+    with open(path, "w") as f:
+        f.write(v)
+    log(f"    created salt file {path} — KEEP THIS OUT OF ONEDRIVE AND GIT")
+    return v.encode()
+
+
+RESIDUE = [("residual_email", re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")),
+           ("residual_long_digits", re.compile(r"(?<![\w>])\d{9,}(?![\w<])"))]
+
+
+# =============================================================================
+# 3. STATISTICS
+# =============================================================================
+
+def cramers_v(a, b):
+    """Association between two categorical columns, 0 to 1, bias-corrected."""
+    ct = pd.crosstab(a, b)
+    if ct.shape[0] < 2 or ct.shape[1] < 2:
+        return np.nan
+    chi2 = chi2_contingency(ct, correction=False)[0]
+    n = ct.values.sum()
+    phi2 = chi2 / n
+    r, k = ct.shape
+    phi2c = max(0.0, phi2 - (k - 1) * (r - 1) / (n - 1))
+    rc = r - (r - 1) ** 2 / (n - 1)
+    kc = k - (k - 1) ** 2 / (n - 1)
+    d = min(kc - 1, rc - 1)
+    return float(np.sqrt(phi2c / d)) if d > 0 else np.nan
+
+
+def theils_u(x, y):
+    """U(x|y): how much of x's uncertainty y removes. Asymmetric, so it shows
+    direction of dependence, which Cramer's V cannot."""
+    px = pd.Series(x).value_counts(normalize=True)
+    hx = float(-(px * np.log(px + 1e-12)).sum())
+    if hx == 0:
+        return 0.0
+    d = pd.DataFrame({"x": x, "y": y})
+    hxy = 0.0
+    for _, g in d.groupby("y"):
+        p = g["x"].value_counts(normalize=True)
+        hxy += (len(g) / len(d)) * float(-(p * np.log(p + 1e-12)).sum())
+    return float((hx - hxy) / hx)
+
+
+def cohens_kappa(a, b):
+    """Agreement corrected for what chance alone would produce."""
+    a, b = pd.Series(a).astype(str), pd.Series(b).astype(str)
+    m = a.notna() & b.notna()
+    a, b = a[m], b[m]
+    if len(a) == 0:
+        return None
+    po = float((a == b).mean())
+    pa, pb = a.value_counts(normalize=True), b.value_counts(normalize=True)
+    pe = float(sum(pa.get(k, 0) * pb.get(k, 0)
+                   for k in set(pa.index) | set(pb.index)))
+    return round((po - pe) / (1 - pe), 4) if pe < 1 else None
+
+
+def weighted_log_odds(texts, labels, min_count=8, top_n=40):
+    """
+    Which words indicate which class, and how strongly.
+
+    Weighted log-odds with an informative Dirichlet prior (Monroe, Colaresi &
+    Quinn). Chosen over raw counts or plain PMI because both are dominated by
+    rare words - a term seen 3 times in one class looks infinitely predictive.
+    This shrinks rare terms toward zero and returns a z-score, so every keyword
+    carries a confidence instead of an impression.
+    """
+    docs = pd.Series(texts).fillna("").astype(str).str.lower()
+    y = pd.Series(labels).astype(str)
+    tok = docs.str.findall(r"[a-z][a-z_\-]{2,}")
+    total, per_class = Counter(), defaultdict(Counter)
+    for t, lab in zip(tok, y):
+        for w in set(t):
+            total[w] += 1
+            per_class[lab][w] += 1
+    vocab = [w for w, n in total.items() if n >= min_count]
+    if not vocab:
+        return pd.DataFrame()
+    a0 = sum(total[w] for w in vocab)
+    rows = []
+    for lab in per_class:
+        ni = sum(per_class[lab][w] for w in vocab)
+        nj = sum(total[w] - per_class[lab][w] for w in vocab)
+        for w in vocab:
+            yiw = per_class[lab][w]
+            yjw = total[w] - yiw
+            aw = total[w]
+            num_i, num_j = yiw + aw, yjw + aw
+            den_i, den_j = ni + a0 - num_i, nj + a0 - num_j
+            if min(num_i, num_j, den_i, den_j) <= 0:
+                continue
+            delta = np.log(num_i / den_i) - np.log(num_j / den_j)
+            z = delta / np.sqrt(1.0 / num_i + 1.0 / num_j)
+            rows.append({"class": lab, "keyword": w, "doc_freq": total[w],
+                         "in_class": yiw,
+                         "pct_of_class": round(100.0 * yiw / max(ni, 1), 2),
+                         "log_odds": round(float(delta), 4),
+                         "z_score": round(float(z), 3)})
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    out["strength"] = pd.cut(out["z_score"].abs(),
+                             bins=[-np.inf, 1.96, 3.29, 5.0, np.inf],
+                             labels=["not significant", "significant",
+                                     "strong", "very strong"])
+    return (out.sort_values(["class", "z_score"], ascending=[True, False])
+            .groupby("class").head(top_n).reset_index(drop=True))
+
+
+# =============================================================================
+# PHASE 1 - DATA ANALYSIS
+# =============================================================================
+
+def phase1(df, C, O):
+    log("\n=== PHASE 1  DATA ANALYSIS ===")
+    O.h("Phase 1 · Data analysis")
+
+    # ---- 1.1 column inventory
+    log("  1.1 column inventory")
+    inv = []
+    rev = {v: k for k, v in C.items() if v}
+    for col in df.columns:
+        s = df[col].dropna().astype(str)
+        s = s[s.str.strip() != ""]
+        inv.append({"column": col, "role": rev.get(col, ""),
+                    "fill_pct": round(100.0 * len(s) / len(df), 2),
+                    "distinct": int(s.nunique()),
+                    "median_len": int(s.str.len().median()) if len(s) else 0,
+                    "max_len": int(s.str.len().max()) if len(s) else 0,
+                    "sample": (s.iloc[0][:120] if len(s) else "")})
+    INV = pd.DataFrame(inv)
+    O.csv(INV, "p1_01_column_inventory.csv")
+    O.h("1.1 What is in each column", 3)
+    O.table(INV, max_rows=40)
+    missing = [k for k, v in C.items() if not v]
+    if missing:
+        O.warn(f"These roles were not found: {', '.join(missing)}. "
+               f"Sections that need them are skipped.")
+
+    # ---- 1.2 structure
+    log("  1.2 structure and grain")
+    O.h("1.2 Structure: what is one row?", 3)
+    facts = [{"metric": "rows (turns)", "value": len(df)}]
+    if C["case"]:
+        facts.append({"metric": "distinct cases", "value": int(df[C["case"]].nunique())})
+    if C["cid"]:
+        facts.append({"metric": "distinct conversation ids",
+                      "value": int(df[C["cid"]].nunique())})
+    per_case = None
+    if C["case"]:
+        vc = df[C["case"]].value_counts()
+        facts += [{"metric": "turns per case (mean)", "value": round(vc.mean(), 2)},
+                  {"metric": "turns per case (max)", "value": int(vc.max())}]
+        per_case = vc.value_counts().sort_index().rename_axis("turns_in_case") \
+                     .reset_index(name="cases")
+    F = pd.DataFrame(facts)
+    O.csv(F, "p1_02_structure_facts.csv")
+    O.table(F)
+
+    # key agreement
+    if C["case"] and C["cid"]:
+        a = df.groupby(C["cid"])[C["case"]].nunique()
+        b = df.groupby(C["case"])[C["cid"]].nunique()
+        if int((a > 1).sum()) or int((b > 1).sum()):
+            O.warn(f"{int((a > 1).sum())} conversation ids span several cases and "
+                   f"{int((b > 1).sum())} cases span several conversation ids. The "
+                   f"two keys disagree — the flattening is not a clean one-to-one "
+                   f"expansion. Resolve before quoting per-conversation figures.")
+        else:
+            O.p("Case id and conversation id agree exactly — one case is one "
+                "conversation.")
+
+    if per_case is not None:
+        fig, ax = plt.subplots(figsize=(8.5, 3.2))
+        ax.bar(per_case["turns_in_case"].astype(str), per_case["cases"],
+               color=PALETTE[2])
+        ax.set_yscale("log")
+        ax.set_xlabel("turns in the case")
+        ax.set_ylabel("cases")
+        ax.set_title("Turns per case", loc="left", fontweight="600")
+        O.fig(fig, "Multi-turn cases are why one case can hold more than one intent.")
+        O.csv(per_case, "p1_03_turns_per_case.csv")
+
+    # ---- 1.3 roles
+    if C["role"]:
+        log("  1.3 roles and conversation shape")
+        O.h("1.3 Who is speaking", 3)
+        rc = df["_role"].value_counts()
+        O.fig(barh(rc.index.tolist(), rc.values, "turns", "Turns by role"))
+        if C["case"]:
+            shape = (df.sort_values([C["case"], "_turn"]).groupby(C["case"])["_role"]
+                     .apply(lambda x: ",".join("U" if r == "user" else
+                                               "A" if r == "assistant" else "?"
+                                               for r in x)))
+            sh = (shape.value_counts().head(20).rename_axis("shape")
+                  .reset_index(name="cases"))
+            sh["pct"] = (100.0 * sh["cases"] / len(shape)).round(2)
+            O.csv(sh, "p1_04_conversation_shapes.csv")
+            O.table(sh)
+            runs = shape.str.contains("A,A")
+            O.p(f"{int(runs.sum()):,} cases ({100.0 * runs.mean():.1f}%) contain "
+                f"consecutive system turns. The dialogue is not a strict "
+                f"customer/system alternation, so turn-index parity cannot be used "
+                f"to infer who is speaking.")
+            firsts = (df.sort_values([C["case"], "_turn"]).groupby(C["case"])["_role"]
+                      .first().value_counts())
+            O.table(firsts.rename_axis("role_of_first_turn").reset_index(name="cases"))
+            if len(firsts) > 1:
+                O.warn("Turn 0 is not always the customer. A rule assuming "
+                       "'index 0 = user' would mislabel those cases.")
+
+    # ---- 1.4 labels
+    log("  1.4 labels")
+    O.h("1.4 The two label columns", 3)
+    cov = []
+    for key, nice in [("turn_label", "turn label"),
+                      ("conv_label", "case label"),
+                      ("predicted", "predicted (output slot)")]:
+        col = C.get(key)
+        if not col:
+            continue
+        v = df[col].fillna("").astype(str).str.strip()
+        for role, g in df.assign(_v=v).groupby("_role"):
+            cov.append({"column": col, "meaning": nice, "role": role,
+                        "turns": len(g), "populated": int((g["_v"] != "").sum()),
+                        "populated_pct": round(100.0 * (g["_v"] != "").mean(), 2),
+                        "distinct": int(g.loc[g["_v"] != "", "_v"].nunique())})
+    COV = pd.DataFrame(cov)
+    if len(COV):
+        O.csv(COV, "p1_05_label_coverage_by_role.csv")
+        O.table(COV)
+        O.note("A label that exists only on user turns is a TURN-level target. "
+               "The assistant turns are the system's answer — they are evidence "
+               "for building labels, never model input.")
+
+    for key, nice in [("turn_label", "turn label"), ("conv_label", "case label")]:
+        col = C.get(key)
+        if not col:
+            continue
+        v = df[col].fillna("").astype(str).str.strip()
+        v = v[v != ""]
+        if v.empty:
+            continue
+        d = v.value_counts().rename_axis("class").reset_index(name="rows")
+        d["pct"] = (100.0 * d["rows"] / d["rows"].sum()).round(2)
+        O.h(f"Class distribution — {nice} ({col})", 3)
+        O.csv(d, f"p1_06_classes_{key}.csv")
+        fig, axes = plt.subplots(1, 2, figsize=(12, 3.4))
+        axes[0].bar(range(len(d)), d["rows"], color=PALETTE[0])
+        axes[0].set_xticks(range(len(d)))
+        axes[0].set_xticklabels(d["class"].str.slice(0, 16), rotation=25, ha="right")
+        axes[0].set_title("linear", loc="left", fontsize=10)
+        axes[1].bar(range(len(d)), d["rows"], color=PALETTE[1])
+        axes[1].set_yscale("log")
+        axes[1].set_xticks(range(len(d)))
+        axes[1].set_xticklabels(d["class"].str.slice(0, 16), rotation=25, ha="right")
+        axes[1].set_title("log — reveals the rare classes", loc="left", fontsize=10)
+        O.fig(fig)
+        O.table(d)
+        if d["pct"].iloc[0] > 60:
+            O.warn(f"'{d['class'].iloc[0]}' is {d['pct'].iloc[0]}% of this column. "
+                   f"Accuracy is meaningless at that imbalance — macro-F1 only.")
+        tie = d["rows"].value_counts()
+        for cnt in tie[tie > 1].index:
+            O.warn(f"Classes {list(d.loc[d['rows'] == cnt, 'class'])} have "
+                   f"identical counts ({cnt:,}). Exact ties between independent "
+                   f"classes are very unlikely by chance — inspect the rule that "
+                   f"produced them.")
+
+    if C["turn_label"] and C["conv_label"]:
+        a = set(df[C["turn_label"]].dropna().astype(str).str.strip()) - {""}
+        b = set(df[C["conv_label"]].dropna().astype(str).str.strip()) - {""}
+        V = pd.DataFrame({"value": sorted(a | b),
+                          "in_turn_label": [x in a for x in sorted(a | b)],
+                          "in_case_label": [x in b for x in sorted(a | b)]})
+        O.csv(V, "p1_07_label_vocabulary.csv")
+        O.h("Do the two label columns use the same words?", 3)
+        O.table(V)
+        if a == b:
+            O.warn("Identical vocabularies. Consistent with both being produced by "
+                   "the same upstream rule, which would make them correlated by "
+                   "construction rather than independent evidence.")
+
+    # ---- 1.5 text
+    log("  1.5 text profile")
+    O.h("1.5 The text itself", 3)
+    L = df["_text"].str.len()
+    T = pd.DataFrame([{"metric": "empty text rows", "value": int((L == 0).sum())},
+                      {"metric": "empty %", "value": round(100.0 * (L == 0).mean(), 2)},
+                      {"metric": "median chars", "value": int(L.median())},
+                      {"metric": "p95 chars", "value": int(L.quantile(0.95))},
+                      {"metric": "max chars", "value": int(L.max())},
+                      {"metric": "distinct texts", "value": int(df["_text"].nunique())},
+                      {"metric": "duplicated rows %",
+                       "value": round(100.0 * df["_text"].duplicated(keep=False).mean(), 2)}])
+    O.csv(T, "p1_08_text_facts.csv")
+    O.table(T)
+    if C["role"]:
+        fig, ax = plt.subplots(figsize=(9, 3.4))
+        order = df.groupby("_role")["_text"].apply(lambda x: x.str.len().median()) \
+                  .sort_values().index
+        ax.boxplot([df.loc[df["_role"] == r, "_text"].str.len().values for r in order],
+                   tick_labels=[str(r)[:14] for r in order], showfliers=False,
+                   patch_artist=True,
+                   boxprops=dict(facecolor="#bee3f8", edgecolor="#2b6cb0"),
+                   medianprops=dict(color="#c05621", linewidth=2))
+        ax.set_ylabel("characters")
+        ax.set_title("Message length by role", loc="left", fontweight="600")
+        O.fig(fig, "User turns are short problem statements; assistant turns are "
+                   "long analyses. Two different populations.")
+    rep = df["_text"].value_counts().head(15).rename_axis("text").reset_index(name="rows")
+    rep["pct"] = (100.0 * rep["rows"] / len(df)).round(3)
+    rep["text"] = rep["text"].str.slice(0, 180)
+    O.h("Most repeated messages", 3)
+    O.csv(rep, "p1_09_most_repeated_text.csv")
+    O.table(rep)
+
+    # ---- 1.6 missingness
+    log("  1.6 missingness")
+    O.h("1.6 What is blank, and does blankness cluster", 3)
+    B = pd.DataFrame({c: df[c].fillna("").astype(str).str.strip().str.lower()
+                      .isin(["", "n/a", "na", "nan", "none", "null"])
+                      for c in df.columns})
+    rate = (B.mean() * 100).sort_values(ascending=False)
+    O.fig(barh(rate.index.tolist(), rate.values, "% blank", "Blank rate by column"))
+    O.csv(rate.rename_axis("column").reset_index(name="blank_pct"),
+          "p1_10_blank_rates.csv")
+    dead = rate[rate >= 100]
+    if len(dead):
+        O.warn(f"Entirely blank: {', '.join(list(dead.index)[:8])}. "
+               f"If one of these is the prediction output slot, that is expected.")
+
+    # ---- 1.7 association
+    if C["turn_label"]:
+        log("  1.7 association with the target")
+        O.h("1.7 Which columns relate to the label", 3)
+        y = df[C["turn_label"]].fillna("__blank__").astype(str)
+        cats = [c for c in df.columns
+                if c != C["turn_label"] and 1 < df[c].fillna("_").nunique() <= 400]
+        rows = []
+        for c in cats:
+            a = df[c].fillna("__blank__").astype(str)
+            if a.nunique() > 200:
+                a = a.where(a.isin(a.value_counts().head(200).index), "__other__")
+            rows.append({"column": c,
+                         "cramers_v": round(cramers_v(a, y), 4),
+                         "theils_u_label_given_column": round(theils_u(y, a), 4),
+                         "distinct": int(a.nunique())})
+        A = pd.DataFrame(rows).sort_values("cramers_v", ascending=False)
+        A["reads_as"] = np.where(A["cramers_v"] > 0.9,
+                                 "NEAR-DETERMINISTIC — this column effectively IS "
+                                 "the label (leakage)",
+                                 np.where(A["cramers_v"] > 0.5, "strong",
+                                          np.where(A["cramers_v"] > 0.2, "moderate",
+                                                   "weak")))
+        O.csv(A, "p1_11_association_with_label.csv")
+        O.table(A)
+        top = A.head(12)
+        if len(top):
+            O.fig(barh(top["column"].tolist(), top["cramers_v"].fillna(0).values,
+                       "Cramér's V", "Association with the turn label",
+                       color=PALETTE[3]))
+        O.note("Cramér's V runs 0 to 1 and is derived from the chi-square test of "
+               "independence. A value near 1 means that column already contains "
+               "the answer. Theil's U is asymmetric, so it shows the direction of "
+               "the dependence — which V cannot.")
+    return df
+
+
+# =============================================================================
+# PHASE 2 - CLEANING
+# =============================================================================
+
+BOILER_MIN_NGRAM = 6
+
+
+def find_boilerplate(texts, top_k=200):
+    """Data-derived template detection: long n-grams whose document frequency
+    sits far above the content curve. Cutoff is the knee, not a constant."""
+    dfc, n_docs = Counter(), 0
+    for t in texts:
+        if not isinstance(t, str) or len(t) < 60:
+            continue
+        n_docs += 1
+        toks = re.findall(r"[a-z0-9<>_]+", t.lower())
+        seen = set()
+        for k in (BOILER_MIN_NGRAM, 9, 12):
+            for i in range(0, max(0, len(toks) - k + 1), 2):
+                g = " ".join(toks[i:i + k])
+                if g not in seen:
+                    seen.add(g)
+                    dfc[g] += 1
+    if not n_docs:
+        return [], pd.DataFrame()
+    ser = (pd.Series(dfc).sort_values(ascending=False).head(4000)) / n_docs
+    v = ser.values[:top_k]
+    if len(v) < 5:
+        return [], pd.DataFrame()
+    knee = int(np.argmin(np.diff(np.log(v + 1e-9)))) + 1
+    cutoff = max(float(v[min(knee, len(v) - 1)]), 0.02)
+    cands = ser[ser >= cutoff]
+    keep = []
+    for g in sorted(cands.index, key=len, reverse=True):
+        if not any(g in k for k in keep):
+            keep.append(g)
+    return keep, pd.DataFrame({"template": keep,
+                               "doc_frequency": [round(float(ser[g]), 4) for g in keep],
+                               "derived_cutoff": round(cutoff, 4)})
+
+
+TELECOM_TERMS = {
+    r"\bhsi\b": "home internet service", r"\bmsisdn\b": "mobile number",
+    r"\bimei\b": "device identifier", r"\biccid\b": "sim identifier",
+    r"\bban\b": "billing account", r"\bsoc\b": "service code",
+    r"\bapn\b": "access point name", r"\bvolte\b": "voice over lte",
+    r"\bcpe\b": "customer premises equipment", r"\besim\b": "embedded sim",
+    r"\bsim\b": "sim card", r"\brca\b": "root cause analysis",
+}
+
+
+def phase2(df, C, O, masker):
+    log("\n=== PHASE 2  CLEANING ===")
+    O.h("Phase 2 · Cleaning, and how X is built")
+
+    steps = [{"step": "1 mask PII",
+              "detail": f"{sum(masker.counts.values()):,} spans replaced with "
+                        f"salted surrogates: {dict(masker.counts)}"}]
+
+    res = []
+    for name, rx in RESIDUE:
+        n = int(df["_text"].str.contains(rx).sum())
+        res.append({"check": name, "rows_with_residue": n,
+                    "status": "PASS" if n == 0 else "REVIEW"})
+    RES = pd.DataFrame(res)
+    O.csv(RES, "p2_01_pii_residue_check.csv")
+    if (RES["status"] == "REVIEW").any():
+        O.warn("PII residue detected — inspect p2_01_pii_residue_check.csv before "
+               "sharing any output from this run.")
+
+    # X = user turns only
+    if C["role"]:
+        user = df[df["_role"] == "user"].copy()
+        steps.append({"step": "2 keep user turns only",
+                      "detail": f"{len(user):,} of {len(df):,} rows kept. Assistant "
+                                f"turns removed from X — they contain the answer."})
+    else:
+        user = df.copy()
+        steps.append({"step": "2 keep user turns only",
+                      "detail": "no role column found; all rows kept"})
+
+    # boilerplate
+    tmpl, TM = find_boilerplate(user["_text"].str.lower().tolist())
+    clean = user["_text"].str.lower()
+    for g in tmpl:
+        clean = clean.str.replace(re.escape(g), " ", regex=True)
+    for pat, rep_ in TELECOM_TERMS.items():
+        clean = clean.str.replace(pat, rep_, regex=True)
+    clean = clean.str.replace(r"\s+", " ", regex=True).str.strip()
+    user["_clean"] = clean
+    if len(TM):
+        O.csv(TM, "p2_02_detected_boilerplate.csv")
+    steps.append({"step": "3 strip boilerplate",
+                  "detail": f"{len(tmpl)} repeated templates removed; cutoff "
+                            f"derived from the frequency curve, not chosen"})
+    steps.append({"step": "4 expand telecom abbreviations",
+                  "detail": f"{len(TELECOM_TERMS)} domain terms normalised"})
+
+    before = len(user)
+    user = user[user["_clean"].str.len() >= 3]
+    steps.append({"step": "5 drop empty after cleaning",
+                  "detail": f"{before - len(user):,} rows dropped"})
+
+    dup = int(user["_clean"].duplicated().sum())
+    steps.append({"step": "6 duplicate check",
+                  "detail": f"{dup:,} rows share cleaned text with another row "
+                            f"({100.0 * dup / max(len(user), 1):.1f}%). Kept for "
+                            f"analysis; must be collapsed before any train/test "
+                            f"split or the score is inflated."})
+
+    S = pd.DataFrame(steps)
+    O.csv(S, "p2_03_cleaning_steps.csv")
+    O.table(S)
+    O.note("X is now the cleaned text of user turns only. y_turn is the turn "
+           "label on those same rows. Assistant turns are excluded by design.")
+    O.csv(user[[c for c in [C["case"], C["turn"], C["turn_label"], C["conv_label"],
+                            "_text", "_clean"] if c]].head(2000),
+          "p2_04_cleaned_sample.csv")
+    return user
+
+
+# =============================================================================
+# PHASE 3 - EDA + PCA
+# =============================================================================
+
+def phase3(user, C, O, seed):
+    log("\n=== PHASE 3  EDA + PCA ===")
+    O.h("Phase 3 · EDA and PCA — is the label learnable at all?")
+
+    vec = TfidfVectorizer(max_features=40000, ngram_range=(1, 2), min_df=3,
+                          max_df=0.6, stop_words="english", sublinear_tf=True)
+    Xs = vec.fit_transform(user["_clean"])
+    log(f"  TF-IDF {Xs.shape}")
+    k = int(min(150, Xs.shape[1] - 1, max(2, Xs.shape[0] - 1)))
+    svd = TruncatedSVD(n_components=k, random_state=seed)
+    Xd = svd.fit_transform(Xs)
+    O.p(f"Vectorised to {Xs.shape[1]:,} TF-IDF features, compressed to {k} "
+        f"components holding {svd.explained_variance_ratio_.sum():.1%} of the "
+        f"variance.")
+
+    Z = StandardScaler().fit_transform(Xd)
+    npc = int(min(30, Z.shape[1]))
+    pca = PCA(n_components=npc, random_state=seed)
+    P = pca.fit_transform(Z)
+    ev = pca.explained_variance_ratio_
+    scree = pd.DataFrame({"component": range(1, npc + 1),
+                          "eigenvalue": np.round(pca.explained_variance_, 4),
+                          "explained_variance_ratio": np.round(ev, 5),
+                          "cumulative": np.round(np.cumsum(ev), 5)})
+    scree["kaiser_retain"] = scree["eigenvalue"] > 1.0
+    n90 = int((scree["cumulative"] < 0.90).sum()) + 1
+    O.csv(scree, "p3_01_pca_scree.csv")
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 3.8))
+    axes[0].bar(range(1, npc + 1), ev, color=PALETTE[0])
+    axes[0].plot(range(1, npc + 1), np.cumsum(ev), color=PALETTE[1], marker="o",
+                 markersize=3)
+    axes[0].axhline(0.9, color="#a0aec0", linestyle="--", linewidth=1)
+    axes[0].set_xlabel("component")
+    axes[0].set_ylabel("explained variance")
+    axes[0].set_title("scree (dashed = 90%)", loc="left", fontsize=10)
+
+    lab_col = C.get("turn_label")
+    if lab_col:
+        y = user[lab_col].fillna("__blank__").astype(str)
+        for i, u in enumerate(y.value_counts().head(8).index):
+            m = (y == u).values
+            axes[1].scatter(P[m, 0], P[m, 1], s=8, alpha=0.45,
+                            color=PALETTE[i % len(PALETTE)], label=str(u)[:18])
+        axes[1].legend(fontsize=7, markerscale=1.8, frameon=False)
+        axes[1].set_title("PC1 vs PC2, coloured by turn label", loc="left",
+                          fontsize=10)
+    else:
+        axes[1].scatter(P[:, 0], P[:, 1], s=8, alpha=0.45, color=PALETTE[0])
+    axes[1].set_xlabel("PC1")
+    axes[1].set_ylabel("PC2")
+    O.fig(fig, "If the colours separate, the labels are learnable from the text. "
+               "If they overlap completely, the taxonomy is the problem — not the "
+               "model.")
+    O.p(f"{int(scree['kaiser_retain'].sum())} components have eigenvalue > 1 "
+        f"(Kaiser criterion); {n90} are needed to reach 90% of the variance.")
+
+    # Fisher ratio: does any component actually separate the classes?
+    if lab_col:
+        y = user[lab_col].fillna("__blank__").astype(str).values
+        rows = []
+        for i in range(min(10, P.shape[1])):
+            s = pd.Series(P[:, i])
+            g = s.groupby(y)
+            between, within = float(g.mean().var()), float(g.var().mean())
+            rows.append({"component": f"PC{i+1}",
+                         "between_group_var": round(between, 5),
+                         "within_group_var": round(within, 5),
+                         "fisher_ratio": round(between / within, 5) if within else None})
+        FR = pd.DataFrame(rows).sort_values("fisher_ratio", ascending=False)
+        FR["reads_as"] = np.where(FR["fisher_ratio"].fillna(0) > 0.1,
+                                  "carries real class structure",
+                                  "mostly within-class noise")
+        O.csv(FR, "p3_02_pca_fisher_ratio.csv")
+        O.h("Does any component separate the classes?", 3)
+        O.table(FR)
+    return Xs, Xd, vec
+
+
+# =============================================================================
+# PHASE 4 - CLUSTERING
+# =============================================================================
+
+def phase4(user, Xd, C, O, max_k, seed):
+    log("\n=== PHASE 4  CLUSTERING ===")
+    O.h("Phase 4 · K-means, heat maps, and what each cluster is")
+
+    sample = Xd
+    if len(Xd) > 8000:
+        idx = np.random.RandomState(seed).choice(len(Xd), 8000, replace=False)
+        sample = Xd[idx]
+    scores = []
+    best_k, best_s = None, -2
+    hi = max(3, min(max_k, len(Xd) // 40))
+    for k in range(2, hi + 1):
+        km = KMeans(n_clusters=k, random_state=seed, n_init=4).fit(sample)
+        try:
+            s = silhouette_score(sample, km.labels_,
+                                 sample_size=min(4000, len(sample)),
+                                 random_state=seed)
+        except Exception:
+            continue
+        scores.append({"k": k, "silhouette": round(float(s), 4)})
+        if s > best_s:
+            best_k, best_s = k, s
+    SC = pd.DataFrame(scores)
+    O.csv(SC, "p4_01_silhouette_by_k.csv")
+    fig, ax = plt.subplots(figsize=(8, 3.2))
+    ax.plot(SC["k"], SC["silhouette"], marker="o", color=PALETTE[0])
+    if best_k:
+        ax.axvline(best_k, color=PALETTE[1], linestyle="--", linewidth=1)
+    ax.set_xlabel("number of clusters (k)")
+    ax.set_ylabel("silhouette score")
+    ax.set_title("k is chosen from the data, not assumed", loc="left",
+                 fontweight="600")
+    O.fig(fig, "Silhouette measures how well each message sits in its own cluster "
+               "versus the next nearest one. The peak is the natural number of "
+               "groups.")
+    log(f"  k={best_k} chosen by silhouette ({best_s:.3f})")
+    O.p(f"Best k = {best_k} (silhouette {best_s:.3f}). This answers 'how many "
+        f"clusters — 5, 6 or more?' from the data rather than by choice.")
+
+    km = KMeans(n_clusters=best_k, random_state=seed, n_init=10).fit(Xd)
+    user["_cluster"] = km.labels_
+
+    # name the clusters with c-TF-IDF
+    v2 = TfidfVectorizer(max_features=30000, ngram_range=(1, 2), min_df=2,
+                         max_df=0.7, stop_words="english", sublinear_tf=True)
+    M = v2.fit_transform(user["_clean"])
+    terms = np.array(v2.get_feature_names_out())
+    rows = []
+    for c in sorted(set(km.labels_)):
+        m = (km.labels_ == c)
+        inside = np.asarray(M[m].mean(axis=0)).ravel()
+        outside = np.asarray(M[~m].mean(axis=0)).ravel()
+        idx = (inside - outside).argsort()[::-1][:12]
+        ex = user.loc[m, "_text"].head(2).tolist()
+        rows.append({"cluster": int(c), "size": int(m.sum()),
+                     "pct": round(100.0 * m.mean(), 2),
+                     "top_terms": ", ".join(terms[idx]),
+                     "example_1": str(ex[0])[:160] if ex else "",
+                     "example_2": str(ex[1])[:160] if len(ex) > 1 else ""})
+    CT = pd.DataFrame(rows).sort_values("size", ascending=False)
+    O.csv(CT, "p4_02_cluster_terms.csv")
+    O.h("What each cluster is about", 3)
+    O.table(CT, max_rows=40)
+    O.note("Cluster names come from c-TF-IDF: the words that make this cluster "
+           "different from every other cluster, not simply its most common words. "
+           "An SME reads this table and gives each cluster a name — that is the "
+           "detailed intent layer.")
+
+    lab_col = C.get("turn_label")
+    if lab_col:
+        y = user[lab_col].fillna("__unlabelled__").astype(str)
+        ct = pd.crosstab(user["_cluster"], y)
+        keep = ct.sum(axis=1).sort_values(ascending=False).head(40).index
+        ct = ct.loc[keep]
+        rn = ct.div(ct.sum(axis=1).replace(0, np.nan), axis=0).fillna(0)
+        O.h("Cluster × intent heat map", 3)
+        O.fig(heat(rn.values, list(ct.columns), [f"cluster {i}" for i in ct.index],
+                   "Cluster (rows) × intent (columns), row-normalised",
+                   "share of cluster", cmap="YlGnBu"),
+              "Each row is one cluster. The colour shows what share of that "
+              "cluster carries each intent.")
+        O.csv(ct.reset_index(), "p4_03_cluster_x_intent.csv")
+
+        pur = pd.DataFrame({"cluster": ct.index,
+                            "size": ct.sum(axis=1).values,
+                            "dominant_intent": rn.idxmax(axis=1).values,
+                            "purity": rn.max(axis=1).round(3).values})
+        pur["reads_as"] = np.where(
+            pur["purity"] > 0.8, "clean — this cluster is one intent",
+            np.where(pur["purity"] > 0.5,
+                     "mixed — probably a sub-intent split",
+                     "impure — the intent label does not describe this group"))
+        O.csv(pur.sort_values("size", ascending=False), "p4_04_cluster_purity.csv")
+        O.h("Cluster purity and balance", 3)
+        O.table(pur.sort_values("size", ascending=False), max_rows=40)
+        O.note("Purity is the share of a cluster held by its dominant intent. "
+               "High purity confirms the label is meaningful for that group. A "
+               "large impure cluster is exactly where the taxonomy is failing and "
+               "where SME review pays back most.")
+
+        sub = pur[(pur["purity"] > 0.6) & (pur["size"] >= 20)]
+        grp = (sub.groupby("dominant_intent")
+               .agg(n_clusters=("cluster", "size"), turns=("size", "sum"))
+               .reset_index())
+        grp = grp[grp["n_clusters"] > 1]
+        if len(grp):
+            O.h("Sub-intents discovered beneath the coarse label", 3)
+            O.csv(grp, "p4_05_sub_intents.csv")
+            O.table(grp)
+            O.note("Where one intent splits into several clean clusters, the data "
+                   "is saying that label is an umbrella over distinct customer "
+                   "situations. Those are the detailed intents — discovered, not "
+                   "invented.")
+    O.csv(user[[c for c in [C["case"], C["turn"], lab_col, "_text", "_cluster"]
+                if c]], "p4_06_turns_with_clusters.csv")
+    return user
+
+
+# =============================================================================
+# PHASE 5 - TURN INTENT  ->  GLOBAL INTENT
+# =============================================================================
+
+def phase5(user, C, O):
+    log("\n=== PHASE 5  TURN -> GLOBAL INTENT ===")
+    O.h("Phase 5 · From turn intent to conversation intent")
+    lab, case, conv = C.get("turn_label"), C.get("case"), C.get("conv_label")
+    if not (lab and case):
+        O.warn("Needs both a turn label and a case key. Skipped.")
+        return
+
+    u = user[user[lab].fillna("").astype(str).str.strip() != ""].copy()
+    u = u.sort_values([case, "_turn"])
+    seqs, verdicts = [], []
+    for _, g in u.groupby(case):
+        seqs.append(list(g[lab].astype(str)))
+        if conv:
+            v = g[conv].dropna().astype(str)
+            verdicts.append(v.iloc[0] if len(v) else None)
+        else:
+            verdicts.append(None)
+
+    labs = sorted({x for s in seqs for x in s})
+    M = np.zeros((len(labs), len(labs)))
+    li = {l: i for i, l in enumerate(labs)}
+    for s in seqs:
+        for a, b in zip(s, s[1:]):
+            M[li[a], li[b]] += 1
+    rs = M.sum(axis=1, keepdims=True)
+    P = np.divide(M, rs, out=np.zeros_like(M), where=rs > 0)
+    O.h("How intent moves through a conversation", 3)
+    O.fig(heat(P, labs, labs, "Intent at turn t (rows) → turn t+1 (columns)",
+               "probability", cmap="Blues"),
+          "Read a row as: given what the customer wants now, what do they ask next?")
+    O.csv(pd.DataFrame(M, index=labs, columns=labs).reset_index()
+          .rename(columns={"index": "from\\to"}), "p5_01_transition_counts.csv")
+
+    multi = [s for s in seqs if len(s) > 1]
+    changed = [s for s in multi if len(set(s)) > 1]
+    O.p(f"{len(seqs):,} conversations have at least one labelled user turn. "
+        f"{len(multi):,} have more than one. Of those, {len(changed):,} "
+        f"({100.0 * len(changed) / max(len(multi), 1):.1f}%) change intent "
+        f"during the conversation.")
+    if changed:
+        J = pd.DataFrame(Counter(" → ".join(s) for s in changed).most_common(20),
+                         columns=["journey", "conversations"])
+        O.csv(J, "p5_02_intent_journeys.csv")
+        O.h("Most common intent journeys", 3)
+        O.table(J)
+        O.note("This is the concrete evidence that a customer can open in query "
+               "mode and end in RCA mode. A single label per conversation cannot "
+               "represent that.")
+
+    if conv and any(v is not None for v in verdicts):
+        pairs = [(s, v) for s, v in zip(seqs, verdicts) if v is not None]
+        cnt = Counter()
+        for s, _ in pairs:
+            cnt.update(s)
+        rarity = {k: i for i, (k, _) in enumerate(sorted(cnt.items(),
+                                                         key=lambda kv: kv[1]))}
+        rules = {
+            "first_turn": lambda s: s[0],
+            "last_turn": lambda s: s[-1],
+            "majority_vote": lambda s: Counter(s).most_common(1)[0][0],
+            "rarest_class_wins": lambda s: min(s, key=lambda x: rarity.get(x, 1e9)),
+        }
+        rows = []
+        for name, fn in rules.items():
+            ok = [fn(s) == v for s, v in pairs]
+            rows.append({"rule": name, "conversations": len(ok),
+                         "agreement_pct": round(100.0 * np.mean(ok), 2)})
+        RU = pd.DataFrame(rows).sort_values("agreement_pct", ascending=False)
+        O.csv(RU, "p5_03_global_intent_rules.csv")
+        O.h("Is the conversation label just a rule over the turns?", 3)
+        O.fig(barh(RU["rule"].tolist(), RU["agreement_pct"].values,
+                   "% agreement with the case label",
+                   "Do simple rules reproduce the conversation verdict?",
+                   color=PALETTE[2]))
+        O.table(RU)
+        best = RU.iloc[0]
+        if best["agreement_pct"] >= 95:
+            O.note(f"'{best['rule']}' reproduces the conversation label "
+                   f"{best['agreement_pct']}% of the time. Global intent is that "
+                   f"rule applied to the turn labels — so we implement the rule "
+                   f"and do NOT train a second model. One turn-level model does "
+                   f"the whole job.")
+        else:
+            O.warn(f"No simple rule explains the conversation label (best: "
+                   f"'{best['rule']}' at {best['agreement_pct']}%). Global intent "
+                   f"is a genuine second task and needs its own model over the "
+                   f"turn sequence.")
+
+
+# =============================================================================
+# PHASE 6 - TWO LABEL SETS
+# =============================================================================
+
+def build_rules(texts, labels, min_z=2.5, top_n=40):
+    KW = weighted_log_odds(texts, labels, top_n=top_n)
+    if KW.empty:
+        return {}
+    KW = KW[KW["z_score"] >= min_z]
+    r = defaultdict(dict)
+    for _, x in KW.iterrows():
+        r[x["class"]][x["keyword"]] = float(x["z_score"])
+    return dict(r)
+
+
+def apply_rules(texts, rules):
+    classes = sorted(rules.keys())
+    preds, confs = [], []
+    for t in texts:
+        toks = set(re.findall(r"[a-z][a-z_\-]{2,}", str(t).lower()))
+        sc = {c: sum(w for k, w in rules[c].items() if k in toks) for c in classes}
+        tot = sum(sc.values())
+        if tot <= 0:
+            preds.append(None); confs.append(0.0); continue
+        rk = sorted(sc.items(), key=lambda kv: kv[1], reverse=True)
+        top = rk[0][1]
+        second = rk[1][1] if len(rk) > 1 else 0.0
+        preds.append(rk[0][0])
+        confs.append(round((top - second) / tot, 4))
+    return preds, confs
+
+
+def phase6(user, C, O, seed):
+    log("\n=== PHASE 6  TWO LABEL SETS ===")
+    O.h("Phase 6 · Two label sets, and whether they agree")
+    lab = C.get("turn_label")
+    if not lab:
+        O.warn("No turn label column. Skipped.")
+        return
+
+    u = user[user[lab].fillna("").astype(str).str.strip() != ""].copy()
+    texts = u["_clean"].tolist()
+    y1 = u[lab].astype(str).values
+
+    # out-of-fold so the comparison is a measurement, not a tautology
+    pred = [None] * len(u)
+    conf = [0.0] * len(u)
+    vc = pd.Series(y1).value_counts()
+    usable = vc[vc >= 5].index
+    mask = np.array([v in usable for v in y1])
+    idx = np.where(mask)[0]
+    last_rules = {}
+    if len(idx) >= 20:
+        skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=seed)
+        Xa = np.array(texts, dtype=object)[idx]
+        ya = y1[idx]
+        for tr, te in skf.split(Xa, ya):
+            rules = build_rules(Xa[tr], ya[tr])
+            if not rules:
+                continue
+            last_rules = rules
+            p, c = apply_rules(Xa[te], rules)
+            for j, kk in enumerate(te):
+                pred[idx[kk]] = p[j]
+                conf[idx[kk]] = c[j]
+
+    u["_label_excel"] = y1
+    u["_label_keyword"] = pred
+    u["_confidence"] = conf
+
+    if last_rules:
+        RB = pd.DataFrame([{"class": c, "keyword": k, "weight": round(w, 3)}
+                           for c, d in last_rules.items()
+                           for k, w in sorted(d.items(), key=lambda kv: -kv[1])])
+        O.csv(RB, "p6_01_keyword_rule_block.csv")
+        O.h("The keyword rule block, learned from the data", 3)
+        O.table(RB.groupby("class").head(12), max_rows=60)
+        for i, cls in enumerate(sorted(last_rules)):
+            d = sorted(last_rules[cls].items(), key=lambda kv: -kv[1])[:12]
+            if d:
+                O.fig(barh([k for k, _ in d], [w for _, w in d],
+                           "z-score (higher = stronger indicator)",
+                           f"Keywords indicating '{cls}'",
+                           color=PALETTE[i % len(PALETTE)]))
+        O.note("Learned with weighted log-odds under a Dirichlet prior, not raw "
+               "counts. Fitted on one part of the data and scored on a part it "
+               "never saw, so the agreement below is a real measurement rather "
+               "than a restatement of the input.")
+
+    covered = u["_label_keyword"].notna()
+    O.p(f"The rule block reaches a decision on {int(covered.sum()):,} of "
+        f"{len(u):,} labelled user turns ({100.0 * covered.mean():.1f}%). The "
+        f"rest contain none of the learned keywords — an honest abstention "
+        f"rather than a forced guess.")
+
+    both = u[covered]
+    if len(both):
+        agree = float((both["_label_excel"] == both["_label_keyword"]).mean())
+        kap = cohens_kappa(both["_label_excel"], both["_label_keyword"])
+        K = pd.DataFrame([{"compared_rows": len(both),
+                           "raw_agreement_pct": round(100 * agree, 2),
+                           "cohens_kappa": kap,
+                           "reads_as": ("almost perfect" if (kap or 0) > .8 else
+                                        "substantial" if (kap or 0) > .6 else
+                                        "moderate" if (kap or 0) > .4 else
+                                        "fair" if (kap or 0) > .2 else "poor")}])
+        O.csv(K, "p6_02_agreement.csv")
+        O.h("Agreement between the two label sets", 3)
+        O.table(K)
+        O.note("Cohen's kappa corrects for the agreement two labellers would reach "
+               "by chance. Raw agreement always looks good when one class "
+               "dominates; kappa does not.")
+
+        labs = sorted(set(both["_label_excel"]) | set(both["_label_keyword"]))
+        CM = pd.crosstab(both["_label_excel"], both["_label_keyword"]) \
+               .reindex(index=labs, columns=labs, fill_value=0)
+        rn = CM.div(CM.sum(axis=1).replace(0, np.nan), axis=0).fillna(0)
+        O.fig(heat(rn.values, labs, labs,
+                   "Excel label (rows) vs keyword-derived label (columns)",
+                   "share of row", cmap="Greens"),
+              "The diagonal is agreement. Off-diagonal mass shows exactly which "
+              "intents the two methods confuse.")
+        O.csv(CM.reset_index(), "p6_03_label_confusion.csv")
+
+        dis = both[both["_label_excel"] != both["_label_keyword"]]
+        if len(dis):
+            cols = [c for c in [C["case"], C["turn"], "_text", "_label_excel",
+                                "_label_keyword", "_confidence"] if c]
+            O.csv(dis[cols].head(800), "p6_04_disagreements_for_sme_review.csv")
+            O.h("Where the two label sets disagree", 3)
+            O.table(dis[["_text", "_label_excel", "_label_keyword",
+                         "_confidence"]].head(25))
+            O.note("This is the highest-value SME task in the project. Every row "
+                   "is a case where two independent labelling methods reached "
+                   "different conclusions — exactly where a human ruling settles "
+                   "the taxonomy.")
+
+        b = both.copy()
+        b["_ok"] = (b["_label_excel"] == b["_label_keyword"])
+        try:
+            b["_bin"] = pd.qcut(b["_confidence"], 5, duplicates="drop")
+            cal = (b.groupby("_bin", observed=True)
+                   .agg(rows=("_ok", "size"), mean_confidence=("_confidence", "mean"),
+                        agreement=("_ok", "mean")).reset_index())
+            cal["_bin"] = cal["_bin"].astype(str)
+            O.csv(cal.round(4), "p6_05_confidence_calibration.csv")
+            fig, ax = plt.subplots(figsize=(7.5, 3.4))
+            ax.plot(cal["mean_confidence"], cal["agreement"], marker="o",
+                    color=PALETTE[1])
+            ax.plot([0, 1], [0, 1], "--", color="#a0aec0", linewidth=1)
+            ax.set_xlabel("confidence (margin between winner and runner-up)")
+            ax.set_ylabel("agreement with the Excel label")
+            ax.set_title("Is the confidence score meaningful?", loc="left",
+                         fontweight="600")
+            O.fig(fig, "A rising line means confidence carries real information. "
+                       "The fixed per-class confidence in the source export does "
+                       "not — it is the same number for every row of a class.")
+        except Exception:
+            pass
+
+    O.csv(u[[c for c in [C["case"], C["turn"], "_text", "_label_excel",
+                         "_label_keyword", "_confidence"] if c]],
+          "p6_06_both_label_sets.csv")
+
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="NORA intent analysis - data analysis then data science")
+    ap.add_argument("--input", required=True, help="flattened CSV")
+    ap.add_argument("--outdir", default="nora_out")
+    ap.add_argument("--salt-file", default="nora_salt.txt")
+    ap.add_argument("--max-k", type=int, default=30)
+    ap.add_argument("--sample", type=int, default=0)
+    ap.add_argument("--seed", type=int, default=42)
+    args = ap.parse_args()
+
+    log("=" * 72)
+    log("NORA INTENT ANALYSIS")
+    log("=" * 72)
+    log(f"reading {args.input}")
+    df = pd.read_csv(args.input, low_memory=False, dtype=str,
+                     keep_default_na=False,
+                     na_values=["", "NA", "NaN", "null", "None", "nan"])
+    log(f"  {len(df):,} rows x {len(df.columns)} columns")
+    if args.sample and args.sample < len(df):
+        df = df.sample(args.sample, random_state=args.seed).reset_index(drop=True)
+        log(f"  sampled to {len(df):,} rows")
+
+    C = discover_columns(df)
+    log("  discovered columns:")
+    for k, v in C.items():
+        log(f"    {k:<12} -> {v}")
+
+    if not C["text"]:
+        raise SystemExit("BLOCKED: no message-content column found. "
+                         "Check the header row of the CSV.")
+
+    O = Out(args.outdir, "NORA Intent Analysis")
+    O.p(f"Source: {os.path.basename(args.input)} — {len(df):,} rows, "
+        f"{len(df.columns)} columns.")
+    O.note("X is the text of user turns. y_turn is the per-turn label; y_global "
+           "is the conversation label. Assistant turns are excluded from X "
+           "because they contain the answer.")
+
+    # normalise and mask before anything else
+    salt = load_salt(args.salt_file)
+    masker = Masker(salt)
+    raw = (df[C["text"]].fillna("").astype(str)
+           .str.replace(r"\\n|\\r|\\t", " ", regex=True)
+           .str.replace(r"\s+", " ", regex=True).str.strip())
+    df["_text"] = raw.map(masker.mask)
+    log(f"  masked {sum(masker.counts.values()):,} PII spans "
+        f"{dict(masker.counts)}")
+
+    df["_role"] = (df[C["role"]].fillna("unknown").astype(str).str.strip().str.lower()
+                   if C["role"] else "unknown")
+    df["_turn"] = (pd.to_numeric(df[C["turn"]], errors="coerce")
+                   if C["turn"] else np.arange(len(df)))
+
+    df = phase1(df, C, O)
+    user = phase2(df, C, O, masker)
+    Xs, Xd, vec = phase3(user, C, O, args.seed)
+    user = phase4(user, Xd, C, O, args.max_k, args.seed)
+    phase5(user, C, O)
+    phase6(user, C, O, args.seed)
+
+    html = os.path.join(args.outdir, "nora_report.html")
+    O.save(html)
+    log("\n" + "=" * 72)
+    log("DONE")
+    log("=" * 72)
+    log(f"  report : {os.path.abspath(html)}")
+    log(f"  tables : {os.path.abspath(args.outdir)}")
+    log(f"  salt   : {os.path.abspath(args.salt_file)}  (keep out of OneDrive)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

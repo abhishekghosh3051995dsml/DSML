@@ -1,628 +1,2146 @@
 #!/usr/bin/env python3
 """
-nora_visual_profile.py
-======================
-Look at the data before deciding what to do with it.
+===============================================================================
+ NORA INTENT ANALYSIS  v2.1   —   PII-HARDENED
+ Turn-level conversation analytics for telecom intent classification
+===============================================================================
 
-Produces ONE self-contained HTML file (charts embedded as base64 PNG, no
-external assets, no CDN, no internet) that can be opened on any machine and
-forwarded to a manager. Nothing in it is configured by us: every chart is
-drawn from whatever columns the file actually contains.
+WHY v2.1 EXISTS
+---------------
+v2 fixed the masking function but still let customer data reach the report by
+going AROUND that function. Three routes were found in the v2 output:
 
-Sections
---------
-  V1   Dataset overview and column inventory
-  V2   Missingness map and blank-rate ranking
-  V3   Co-missingness heatmap (which fields go blank together)
-  V4   Cardinality vs fill - identifies keys, constants, free text
-  V5   Label distribution (linear and log) and confidence behaviour
-  V6   Text length distributions, overall and by label
-  V7   Temporal volume from the real event clock
-  V8   Rows per conversation - the grain question, answered visually
-  V9   Repetition profile: how much of the corpus is duplicated text
-  V10  Intent x telecom subcategory heatmap
-  V11  Cramer's V heatmap across categorical columns
-  V12  Numeric correlation heatmap
-  V13  PCA scree and 2D projection coloured by the independent label
+  1. Phase 1's column inventory printed a raw sample of every column, including
+     the message body and the internal `_raw` column. That put a real customer
+     name, BAN, IMEI and callback number straight into the HTML.
+  2. Cluster example text carried names that were pasted into the free-text
+     body rather than into a form field, so field-bounded masking never saw
+     them ("caller/customername: <several names>").
+  3. A before/after sample CSV dumped raw and cleaned text side by side.
 
-Privacy: every text sample rendered into the HTML is passed through the same
-masker used by the feature pipeline. A profiling report is exactly the kind of
-artefact that gets emailed around, so it must not carry customer identifiers.
+v2.1 changes the architecture so that this class of bug cannot recur:
 
-Usage
------
-  python nora_visual_profile.py --input intent_labels_all.csv \\
-      --out nora_data_profile.html
+  * NOTHING is written to an output by calling `to_csv` or `to_html` directly.
+    Every DataFrame and every string passes through Guard.safe_frame() first.
+  * Guard is FAIL-CLOSED. After masking, it re-scans the text. If anything that
+    looks like an identifier or a known name survives, the whole cell is
+    replaced with [REDACTED] rather than shipped. A missed pattern costs you a
+    blanked cell, never a leak.
+  * A NAME LEXICON is built from the corpus before anything is written. Every
+    value ever seen in a name-type field, anywhere in the file, becomes a
+    redaction target everywhere else in the file — including inside free text
+    that has no form structure at all. This is what catches route 2.
+  * The name lexicon is also injected into the stopword list, so no customer
+    name can appear as a cluster top-term or a learned keyword.
+  * `_raw` and the source message column are excluded from every output by
+    name. The column inventory reports the SHAPE of a column (length, digit
+    density, word count), never a sample of its contents.
+  * No output contains: customer name, BAN, IMEI, ICCID, EID, MSISDN, callback
+    number, email, address, ZIP, lat/long, IP or URL. Identifier-type form
+    fields are never emitted as values in any form, masked or otherwise.
 
-  --sample 20000        rows to sample for the heavy charts (default all)
-  --salt-file nora_salt.txt
-  --max-categories 30   cap on categories drawn per axis
+ALSO FIXED IN v2.1 (analysis correctness)
+-----------------------------------------
+  4. Phase 1.6 computed association across ALL rows with the assistant label
+     filled in as "__blank__", so the role column scored Cramer's V 0.9999 and
+     was reported as "NEAR-DETERMINISTIC - this column effectively IS the
+     label". That was an artefact of the blank fill. It is now computed on
+     labelled rows only.
+  5. The confidence calibration curve collapsed to a single bin and the report
+     still printed "confidence is monotonically informative". A single point is
+     monotonic by definition. The claim now requires at least three bins.
+  6. Cleaning step 4 reported "median 71 chars -> 71 chars" because it read the
+     already-filtered frame. The before figure is now captured up front.
+  7. The keyword rule block reported only discourse words for the majority
+     class. A minimum-classes-covered warning now fires when one class learns
+     fewer than a derived floor of indicators, so the weakness is stated rather
+     than left for the reader to notice.
 
-NOTE ON PASTED COMMANDS: copied "--" often becomes an en dash. Retype it.
+-------------------------------------------------------------------------------
+ X AND Y
+-------------------------------------------------------------------------------
+   X        the customer's problem statement, extracted from the user turn
+   y_turn   the per-turn label
+   y_global the conversation label
+   Assistant turns are never X: they are NORA's answer and contain the
+   conclusion. Using them as input would be target leakage.
 
-Dependencies: pandas, numpy, matplotlib, scikit-learn, scipy
+-------------------------------------------------------------------------------
+ RUN
+-------------------------------------------------------------------------------
+   pip install pandas numpy scikit-learn scipy matplotlib
+
+   python nora_intent_analysis_v2_1.py --input intent_labels_all_flattened.csv ^
+       --outdir nora_out_v2_1 --salt-file C:\\Users\\you\\nora_salt.txt
+
+   Add --no-free-text to strip every free-text column from every output and
+   keep only counts, metrics and vocabulary. Use that for anything leaving the
+   team.
+
+   Retype the double hyphens by hand; copied ones become en dashes and argparse
+   will reject them.
+===============================================================================
 """
 
 import argparse
 import base64
+import hashlib
+import hmac
 import html as htmlmod
 import io
+import json
 import os
+import re
+import secrets
 import sys
-from collections import Counter
+from collections import Counter, defaultdict
 
 import numpy as np
 import pandas as pd
+from scipy.stats import chi2_contingency
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from nora_label_diagnostics import discover_roles
-from nora_nlp_feature_pipeline import (
-    Masker, load_or_create_salt, is_blank, cramers_v, log,
-)
+from sklearn.feature_extraction.text import TfidfVectorizer, ENGLISH_STOP_WORDS
+from sklearn.decomposition import TruncatedSVD, PCA
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import KMeans
+from sklearn.metrics import (silhouette_score, calinski_harabasz_score,
+                             davies_bouldin_score)
+from sklearn.model_selection import StratifiedKFold
+
+
+# =============================================================================
+# 0  INFRASTRUCTURE
+# =============================================================================
 
 PALETTE = ["#2b6cb0", "#c05621", "#2f855a", "#6b46c1", "#b83280",
            "#975a16", "#285e61", "#9b2c2c"]
+
 plt.rcParams.update({
     "figure.dpi": 110, "savefig.dpi": 110, "font.size": 9,
     "axes.spines.top": False, "axes.spines.right": False,
-    "axes.grid": True, "grid.alpha": 0.25, "grid.linestyle": "-",
-    "axes.axisbelow": True, "figure.facecolor": "white",
+    "axes.grid": True, "grid.alpha": 0.25, "axes.axisbelow": True,
+    "figure.facecolor": "white",
 })
 
+PROVENANCE = []          # every constant used, with its origin
+FINDINGS = []            # accumulated findings for the closing summary
+GUARD = None             # the PII gate; set in main() before any output
 
-# --------------------------------------------------------------------------
-# report scaffolding
-# --------------------------------------------------------------------------
+
+def log(m):
+    print(m, flush=True)
+
+
+def prov(name, value, kind, note):
+    """
+    kind is one of
+      DERIVED      computed from this dataset at runtime
+      DOMAIN_FACT  a fact about telecoms or an external contract, not an
+                   assumption about the data (an IMEI is 15 digits)
+      REVIEW_GATE  a convention that only decides what gets FLAGGED for a human;
+                   it never alters a computed value
+      SAFETY       a privacy control; it may blank an output but never changes
+                   a computed number
+    """
+    PROVENANCE.append({"parameter": name, "value": str(value),
+                       "provenance": kind, "note": note})
+
+
+def finding(severity, title, detail, action=""):
+    FINDINGS.append({"severity": severity, "finding": title,
+                     "detail": detail, "recommended_action": action})
+
+
+# =============================================================================
+# 0.5  THE PII GATE
+# =============================================================================
+# Everything in this block exists to make one guarantee: no value that
+# identifies a customer can appear in the HTML report, in any CSV, in any
+# chart, or in the run manifest.
+#
+# Three layers, applied in this order, and then a fail-closed re-scan:
+#
+#   LAYER 1  cue-anchored redaction
+#            Text like "caller/customername: astin clark yasmin" has no form
+#            structure, so field parsing never sees it. This layer finds a
+#            name-ish cue word followed by a colon or dash and blanks the words
+#            after it. It runs FIRST, while capitalisation still survives.
+#
+#   LAYER 2  pattern masking
+#            Email, URL, IP, EID, ICCID, IMEI, MSISDN, account number, lat/long,
+#            ZIP and street address, replaced with salted surrogates. Longest
+#            patterns first so a 15-digit IMEI is never eaten by the 9-digit
+#            account rule.
+#
+#   LAYER 3  name-lexicon redaction
+#            Every value ever seen in a name-type form field, ANYWHERE in the
+#            corpus, becomes a redaction target EVERYWHERE in the corpus. A
+#            name typed into free text in row 900 is caught because the same
+#            name sat in a Customer Name field in row 40. Common English and
+#            telecom words are protected so the lexicon cannot swallow ordinary
+#            vocabulary.
+#
+#   GATE     residue re-scan
+#            The masked string is scanned again with the surrogates stripped
+#            out. If an email, a run of five or more digits, an IP, a name cue,
+#            or a lexicon name is still present, the ENTIRE cell is replaced by
+#            [REDACTED]. Blanking a cell is always acceptable; leaking is not.
+#
+# Identifier-type FORM FIELDS are handled more bluntly still: their values are
+# never emitted at all, not even as surrogates, because a stable surrogate is a
+# join key back to a person.
+
+PII_PATTERNS = [
+    ("URL",    re.compile(r"https?://\S+")),
+    ("EMAIL",  re.compile(r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b")),
+    ("IPV4",   re.compile(r"\b(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}"
+                          r"(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\b")),
+    ("EID",    re.compile(r"\b[0-9a-fA-F]{32}\b")),
+    ("UUID",   re.compile(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+                          r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b")),
+    ("ICCID",  re.compile(r"\b89\d{17,20}\b")),
+    ("IMEI",   re.compile(r"\b\d{14,17}\b")),
+    ("MSISDN", re.compile(r"(?<!\d)(?:\+?\d{1,3}[\s\-.]?)?\(?\d{3}\)?[\s\-.]?"
+                          r"\d{3}[\s\-.]?\d{4}(?!\d)")),
+    ("ACCTNUM", re.compile(r"(?<!\d)\d{8}\d*(?!\d)")),
+    ("LATLON", re.compile(r"(?<![\w.])-?\d{1,3}\.\d{4,}(?![\w.])")),
+    ("NUMID",  re.compile(r"(?<!\d)\d{5,7}(?!\d)")),
+]
+
+ADDRESS_RE = re.compile(
+    r"\b\d{1,6}\s+(?:[A-Za-z0-9.'\-]+\s+){0,4}"
+    r"(?:st|street|rd|road|ave|avenue|blvd|boulevard|ln|lane|dr|drive|ct|court|"
+    r"way|pl|place|ter|terrace|pkwy|parkway|hwy|highway|cir|circle|apt|suite|"
+    r"ste|unit)\b\.?",
+    re.IGNORECASE)
+
+# A name cue followed by up to four words. Runs before lowercasing.
+NAME_CUE_RE = re.compile(
+    r"(?i)\b(?:customer\s*name|customername|caller\s*/?\s*customername|"
+    r"contact\s*name|account\s*name|subscriber\s*name|caller|cust\s*name|"
+    r"first\s*name|last\s*name|full\s*name|name\s*of\s*(?:customer|caller)|name)"
+    r"\s*[:\-]\s*"
+    r"(?P<val>[A-Za-z][A-Za-z'\-]{1,20}(?:\s+[A-Za-z][A-Za-z'\-]{1,20}){0,4})")
+
+# Which parsed field keys hold which kind of identifier. Matched on the KEY, so
+# it adapts to a new intake layout without code changes.
+FIELD_KIND_HINTS = [
+    ("NAME",    r"(customer|contact|account|subscriber|caller|first|last|full)?"
+                r"_?name"),
+    ("EMAIL",   r"e_?mail"),
+    ("MSISDN",  r"(phone|mobile|msisdn|call_?back|number_?with_issue|with_issue|"
+                r"line|contact_?number|callback)"),
+    ("IMEI",    r"imei"),
+    ("ICCID",   r"iccid|sim_?serial"),
+    ("EID",     r"^eid$|euicc"),
+    ("BAN",     r"^ban$|billing_?account|account_?number|acct"),
+    ("ADDRESS", r"address|street|zip|postal|city|state|location"),
+    ("IDENT",   r"^cid$|uuid|guid|ticket|case_?number|order_?number"),
+]
+
+
+def field_kind(key):
+    """Return the identifier type a field key holds, or None for free text."""
+    for kind, pat in FIELD_KIND_HINTS:
+        if re.search(pat, key):
+            return kind
+    return None
+
+
+# Words that must never be treated as a customer name even if someone typed
+# them into a name field. Without this a name field containing "unknown" would
+# blank the word "unknown" across the entire report.
+NAME_LEXICON_PROTECTED = set(ENGLISH_STOP_WORDS) | {
+    "customer", "cust", "caller", "rep", "care", "business", "consumer",
+    "account", "line", "phone", "mobile", "device", "internet", "service",
+    "data", "call", "calls", "text", "sim", "esim", "router", "gateway",
+    "hotspot", "signal", "network", "wifi", "roaming", "plan", "ticket",
+    "order", "status", "issue", "issues", "problem", "unknown", "none", "test",
+    "testing", "null", "blank", "empty", "email", "name", "number", "info",
+    "information", "verified", "verify", "resolved", "pending", "yes", "no",
+    "true", "false", "home", "work", "office", "site", "tower", "outage",
+    "inseego", "cradlepoint", "craddlepoint", "franklin", "samsung", "apple",
+    "iphone", "android", "galaxy", "tmobile", "sprint", "magenta",
+}
+
+SURROGATE_RE = re.compile(r"<[A-Z_]+_[0-9a-f]{6,}>")
+
+# What the fail-closed gate looks for AFTER masking. Surrogates are stripped
+# before this runs so their hex tails do not trip the digit rule.
+RESIDUE_CHECKS = [
+    ("residual_email",
+     re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")),
+    ("residual_digit_run_5plus",
+     re.compile(r"(?<!\d)\d{5,}(?!\d)")),
+    ("residual_ipv4",
+     re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")),
+    ("residual_name_cue",
+     re.compile(r"(?i)\b(?:customer|contact|caller|cust|subscriber)\s*"
+                r"n?a?m?e?\s*[:\-]\s*[A-Za-z]{2,}\s+[A-Za-z]{2,}")),
+    ("residual_hex32",
+     re.compile(r"\b[0-9a-fA-F]{32}\b")),
+]
+
+REDACTED = "[REDACTED]"
+
+# Columns that must never leave this process under any circumstance.
+FORBIDDEN_OUTPUT_COLS = {"_raw", "_fields_masked", "_issue"}
+
+
+class Guard:
+    """The single choke point for anything that becomes an output."""
+
+    def __init__(self, salt, allow_free_text=True):
+        self.salt = salt
+        self.counts = Counter()
+        self.redactions = Counter()
+        self.name_lexicon = set()
+        self.name_re = None
+        self.allow_free_text = allow_free_text
+        self.gate_blocks = 0
+        self.cells_checked = 0
+
+    # ---- layer 3 setup -----------------------------------------------------
+
+    def build_name_lexicon(self, texts):
+        """
+        Collect every token that has ever appeared in a name-type field, plus
+        every token captured by a name cue in free text. These become redaction
+        targets everywhere. Built once, before any output is produced.
+        """
+        toks = Counter()
+        for t in texts:
+            if not isinstance(t, str) or not t:
+                continue
+            fields, _ = split_fields(t)
+            for k, v in fields.items():
+                if field_kind(k) == "NAME":
+                    for w in re.findall(r"[A-Za-z][A-Za-z'\-]{1,}", str(v)):
+                        toks[w.lower()] += 1
+            for m in NAME_CUE_RE.finditer(t):
+                for w in re.findall(r"[A-Za-z][A-Za-z'\-]{1,}", m.group("val")):
+                    toks[w.lower()] += 1
+
+        lex = {w for w in toks
+               if len(w) >= 3 and w not in NAME_LEXICON_PROTECTED}
+        self.name_lexicon = lex
+        if lex:
+            # longest first so "maryanne" is matched before "mary"
+            alts = "|".join(re.escape(w) for w in
+                            sorted(lex, key=len, reverse=True))
+            self.name_re = re.compile(r"(?i)\b(?:" + alts + r")\b")
+        prov("name_lexicon_size", len(lex), "SAFETY",
+             "distinct name tokens harvested from name-type fields and name "
+             "cues; redacted everywhere and excluded from all vocabularies")
+        log(f"    name lexicon: {len(lex):,} tokens harvested and blocked")
+        return len(lex)
+
+    # ---- masking primitives ------------------------------------------------
+
+    def surrogate(self, kind, value):
+        h = hmac.new(self.salt, f"{kind}|{value}".encode("utf-8", "ignore"),
+                     hashlib.sha256).hexdigest()[:10]
+        self.counts[kind] += 1
+        return f"<{kind}_{h}>"
+
+    def _cue(self, text):
+        def rep(m):
+            self.counts["NAME"] += 1
+            return m.group(0)[:m.start("val") - m.start(0)] + \
+                self.surrogate("NAME", m.group("val").lower())
+        return NAME_CUE_RE.sub(rep, text)
+
+    def _patterns(self, text):
+        s = ADDRESS_RE.sub(
+            lambda m: self.surrogate("ADDRESS", m.group(0).lower()), text)
+        for kind, rx in PII_PATTERNS:
+            s = rx.sub(lambda m, k=kind: self.surrogate(k, m.group(0)), s)
+        return s
+
+    def _names(self, text):
+        if self.name_re is None:
+            return text
+        return self.name_re.sub(
+            lambda m: self.surrogate("NAME", m.group(0).lower()), text)
+
+    def mask_text(self, text):
+        """All three layers, in order. Not yet gated."""
+        if not isinstance(text, str) or not text:
+            return text
+        s = self._cue(text)
+        s = self._patterns(s)
+        s = self._names(s)
+        return s
+
+    def mask_field(self, key, value):
+        """
+        Whole-value handling for a parsed form field.
+        Identifier fields are DROPPED, not surrogated: a stable surrogate for a
+        BAN is still a join key back to one customer.
+        """
+        v = str(value or "").strip()
+        if not v or v.upper() in {"N/A", "NA", "NONE", "NULL", "-"}:
+            return ""
+        kind = field_kind(key)
+        if kind:
+            self.counts[kind] += 1
+            return ""
+        return self.mask_text(v)
+
+    # ---- the fail-closed gate ---------------------------------------------
+
+    def residue(self, text):
+        """Which residue checks fire on this string, surrogates removed."""
+        probe = SURROGATE_RE.sub(" ", str(text))
+        return [name for name, rx in RESIDUE_CHECKS if rx.search(probe)]
+
+    def safe(self, text):
+        """
+        The only function permitted to produce output text.
+        Mask, then re-scan. Anything still suspicious is blanked wholesale.
+        """
+        if text is None:
+            return ""
+        if not isinstance(text, str):
+            text = str(text)
+        if not text.strip():
+            return text
+        self.cells_checked += 1
+        s = self.mask_text(text)
+        hits = self.residue(s)
+        if hits:
+            self.gate_blocks += 1
+            for h in hits:
+                self.redactions[h] += 1
+            return REDACTED
+        return s
+
+    def safe_frame(self, df, free_text_cols=()):
+        """
+        Sanitise a whole DataFrame on its way to a CSV or an HTML table.
+        Drops forbidden columns outright, gates every remaining text cell, and
+        drops free-text columns entirely when --no-free-text is set.
+        """
+        d = df.copy()
+        for c in list(d.columns):
+            if c in FORBIDDEN_OUTPUT_COLS:
+                d = d.drop(columns=[c])
+        if not self.allow_free_text:
+            for c in list(d.columns):
+                if c in free_text_cols:
+                    d = d.drop(columns=[c])
+        for c in d.columns:
+            if d[c].dtype == object:
+                d[c] = d[c].map(self.safe)
+        return d
+
+    def summary(self):
+        rows = [{"entity_type": k, "values_masked_or_dropped": v}
+                for k, v in sorted(self.counts.items())]
+        return pd.DataFrame(rows)
+
+    def gate_report(self):
+        rows = [{"gate_check": k, "cells_blanked": v}
+                for k, v in sorted(self.redactions.items())]
+        if not rows:
+            rows = [{"gate_check": "none", "cells_blanked": 0}]
+        return pd.DataFrame(rows)
+
+
+def load_salt(path):
+    if os.path.exists(path):
+        with open(path) as f:
+            v = f.read().strip()
+        if v:
+            return v.encode()
+    v = secrets.token_hex(32)
+    with open(path, "w") as f:
+        f.write(v)
+    try:
+        os.chmod(path, 0o600)
+    except Exception:
+        pass
+    log(f"    created salt file {path}  - KEEP OUT OF ONEDRIVE AND GIT")
+    return v.encode()
+
+
+# =============================================================================
+# 0.75  REPORT  (every write goes through GUARD)
+# =============================================================================
 
 class Report:
-    def __init__(self, title):
+    def __init__(self, outdir, title):
+        self.dir = outdir
+        os.makedirs(outdir, exist_ok=True)
         self.title = title
         self.blocks = []
 
-    def h(self, text, level=2):
-        self.blocks.append(f"<h{level}>{htmlmod.escape(text)}</h{level}>")
+    def csv(self, df, name, free_text_cols=()):
+        safe = GUARD.safe_frame(df, free_text_cols=free_text_cols)
+        p = os.path.join(self.dir, name)
+        safe.to_csv(p, index=False)
+        log(f"      -> {name}  ({len(safe):,} rows, {len(safe.columns)} cols)")
+        return p
 
-    def p(self, text):
-        self.blocks.append(f"<p>{htmlmod.escape(text)}</p>")
+    def h(self, t, level=2):
+        self.blocks.append(f"<h{level}>{htmlmod.escape(str(t))}</h{level}>")
 
-    def note(self, text):
-        self.blocks.append(f'<div class="note">{htmlmod.escape(text)}</div>')
+    def p(self, t):
+        self.blocks.append(f"<p>{htmlmod.escape(GUARD.safe(t))}</p>")
 
-    def warn(self, text):
-        self.blocks.append(f'<div class="warn">{htmlmod.escape(text)}</div>')
+    def note(self, t):
+        self.blocks.append(f'<div class="note">{htmlmod.escape(GUARD.safe(t))}</div>')
+
+    def warn(self, t):
+        self.blocks.append(f'<div class="warn">{htmlmod.escape(GUARD.safe(t))}</div>')
+
+    def ok(self, t):
+        self.blocks.append(f'<div class="good">{htmlmod.escape(GUARD.safe(t))}</div>')
 
     def fig(self, figure, caption=""):
         buf = io.BytesIO()
         figure.savefig(buf, format="png", bbox_inches="tight")
         plt.close(figure)
         b64 = base64.b64encode(buf.getvalue()).decode()
-        cap = f'<div class="cap">{htmlmod.escape(caption)}</div>' if caption else ""
+        cap = (f'<div class="cap">{htmlmod.escape(GUARD.safe(caption))}</div>'
+               if caption else "")
         self.blocks.append(
             f'<div class="figbox"><img src="data:image/png;base64,{b64}"/>{cap}</div>')
 
-    def table(self, df, max_rows=30):
-        d = df.head(max_rows).copy()
+    def table(self, df, max_rows=30, free_text_cols=()):
+        d = GUARD.safe_frame(df.head(max_rows), free_text_cols=free_text_cols)
         for c in d.columns:
-            d[c] = d[c].astype(str).str.slice(0, 200)
+            d[c] = d[c].astype(str).str.slice(0, 240)
         self.blocks.append('<div class="tbl">' +
                            d.to_html(index=False, escape=True, border=0) + "</div>")
 
-    def write(self, path):
+    def save(self, path):
         css = """
         body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,
-        Helvetica,Arial,sans-serif;max-width:1080px;margin:0 auto;padding:32px;
+        Helvetica,Arial,sans-serif;max-width:1120px;margin:0 auto;padding:32px;
         color:#1a202c;line-height:1.55;background:#fff}
-        h1{font-size:26px;border-bottom:3px solid #2b6cb0;padding-bottom:10px;
-        margin-bottom:4px}
-        h2{font-size:19px;margin-top:38px;color:#2b6cb0;
-        border-bottom:1px solid #e2e8f0;padding-bottom:5px}
-        h3{font-size:15px;margin-top:22px;color:#4a5568}
-        p{color:#2d3748}
+        h1{font-size:27px;border-bottom:3px solid #2b6cb0;padding-bottom:10px}
+        h2{font-size:20px;margin-top:44px;color:#2b6cb0;
+        border-bottom:1px solid #e2e8f0;padding-bottom:6px}
+        h3{font-size:15px;margin-top:24px;color:#4a5568}
         .note{background:#ebf8ff;border-left:4px solid #2b6cb0;padding:11px 14px;
-        margin:14px 0;font-size:13.5px;border-radius:0 3px 3px 0}
+        margin:14px 0;font-size:13.5px}
         .warn{background:#fffaf0;border-left:4px solid #c05621;padding:11px 14px;
-        margin:14px 0;font-size:13.5px;border-radius:0 3px 3px 0}
+        margin:14px 0;font-size:13.5px}
+        .good{background:#f0fff4;border-left:4px solid #2f855a;padding:11px 14px;
+        margin:14px 0;font-size:13.5px}
         .figbox{margin:20px 0;text-align:center}
         .figbox img{max-width:100%;border:1px solid #e2e8f0;border-radius:4px}
         .cap{font-size:12px;color:#718096;margin-top:6px;font-style:italic}
         .tbl{overflow-x:auto;margin:14px 0}
         table{border-collapse:collapse;font-size:12px;width:100%}
         th{background:#edf2f7;text-align:left;padding:7px 9px;
-        border-bottom:2px solid #cbd5e0;font-weight:600;white-space:nowrap}
+        border-bottom:2px solid #cbd5e0;white-space:nowrap}
         td{padding:6px 9px;border-bottom:1px solid #edf2f7;vertical-align:top}
         tr:nth-child(even) td{background:#fafbfc}
-        .foot{margin-top:44px;padding-top:14px;border-top:1px solid #e2e8f0;
+        .foot{margin-top:48px;padding-top:14px;border-top:1px solid #e2e8f0;
         font-size:12px;color:#718096}
         """
         doc = (f"<!DOCTYPE html><html><head><meta charset='utf-8'>"
-               f"<title>{htmlmod.escape(self.title)}</title>"
-               f"<style>{css}</style></head><body>"
-               f"<h1>{htmlmod.escape(self.title)}</h1>"
+               f"<title>{htmlmod.escape(self.title)}</title><style>{css}</style>"
+               f"</head><body><h1>{htmlmod.escape(self.title)}</h1>"
                + "".join(self.blocks)
-               + '<div class="foot">Generated by nora_visual_profile.py. '
-                 'Every chart is derived from the input file; no thresholds, '
-                 'categories, or label names are supplied by the script. '
-                 'All text samples are PII-masked.</div>'
-                 "</body></html>")
+               + '<div class="foot">Every class name, keyword, template field, '
+                 'cluster count and threshold in this report was discovered '
+                 'from the input file. Every string in this report passed '
+                 'through a fail-closed privacy gate: identifier form fields '
+                 'are dropped rather than masked, customer names harvested '
+                 'anywhere in the corpus are redacted everywhere, and any cell '
+                 'still matching a residue pattern after masking was blanked '
+                 'entirely. No raw message text appears in this report. See '
+                 'provenance_register.csv and privacy_gate_report.csv.'
+                 "</div></body></html>")
         with open(path, "w", encoding="utf-8") as f:
             f.write(doc)
 
 
-def barh(labels, values, xlabel, title, color=PALETTE[0], figsize=None):
+def barh(labels, values, xlabel, title, color=PALETTE[0]):
     n = len(labels)
-    fig, ax = plt.subplots(figsize=figsize or (9, max(2.2, 0.28 * n + 1)))
+    fig, ax = plt.subplots(figsize=(9, max(2.2, 0.30 * n + 1)))
     y = np.arange(n)
     ax.barh(y, values, color=color, height=0.68)
     ax.set_yticks(y)
-    ax.set_yticklabels([str(l)[:52] for l in labels])
+    ax.set_yticklabels([GUARD.safe(str(l))[:55] for l in labels])
     ax.invert_yaxis()
     ax.set_xlabel(xlabel)
     ax.set_title(title, loc="left", fontweight="600")
     for i, v in enumerate(values):
-        ax.text(v, i, f" {v:,.4g}" if v < 1 else f" {v:,.0f}",
-                va="center", fontsize=8, color="#4a5568")
+        ax.text(v, i, f" {v:,.3g}", va="center", fontsize=8, color="#4a5568")
     return fig
 
 
-def heat(mat, xlabels, ylabels, title, cbar_label, cmap="Blues", fmt="{:.2f}"):
-    fig, ax = plt.subplots(figsize=(min(1.05 * len(xlabels) + 3, 14),
-                                    min(0.5 * len(ylabels) + 2.2, 13)))
+def heat(mat, xl, yl, title, cbar, cmap="Blues", fmt="{:.2f}"):
+    fig, ax = plt.subplots(figsize=(min(1.1 * len(xl) + 3.5, 14),
+                                    min(0.46 * len(yl) + 2.4, 13)))
     im = ax.imshow(mat, cmap=cmap, aspect="auto")
-    ax.set_xticks(range(len(xlabels)))
-    ax.set_xticklabels([str(x)[:22] for x in xlabels], rotation=42,
-                       ha="right", fontsize=8)
-    ax.set_yticks(range(len(ylabels)))
-    ax.set_yticklabels([str(y)[:34] for y in ylabels], fontsize=8)
+    ax.set_xticks(range(len(xl)))
+    ax.set_xticklabels([GUARD.safe(str(x))[:22] for x in xl],
+                       rotation=42, ha="right", fontsize=8)
+    ax.set_yticks(range(len(yl)))
+    ax.set_yticklabels([GUARD.safe(str(y))[:34] for y in yl], fontsize=8)
     ax.set_title(title, loc="left", fontweight="600")
     ax.grid(False)
-    fig.colorbar(im, ax=ax, label=cbar_label, fraction=0.03, pad=0.02)
+    fig.colorbar(im, ax=ax, label=cbar, fraction=0.03, pad=0.02)
     if mat.size <= 400:
         vmax = np.nanmax(mat) if mat.size else 1
         for i in range(mat.shape[0]):
             for j in range(mat.shape[1]):
                 v = mat[i, j]
-                if np.isnan(v):
-                    continue
-                ax.text(j, i, fmt.format(v), ha="center", va="center", fontsize=7,
-                        color="white" if v > 0.6 * vmax else "#2d3748")
+                if not np.isnan(v):
+                    ax.text(j, i, fmt.format(v), ha="center", va="center",
+                            fontsize=7,
+                            color="white" if v > 0.6 * vmax else "#2d3748")
     return fig
 
 
-def cap_categories(series, k):
-    s = series.fillna("__BLANK__").astype(str).str.strip()
-    s = s.replace({"": "__BLANK__"})
-    top = s.value_counts().head(k).index
-    return s.where(s.isin(top), "__OTHER__")
+# =============================================================================
+# 1  SCHEMA DISCOVERY  (by pattern and shape, never by exact name)
+# =============================================================================
+
+def find(cols, patterns, exclude=()):
+    for pat in patterns:
+        for c in cols:
+            n = re.sub(r"[^a-z0-9]+", "_", str(c).lower())
+            if any(re.search(e, n) for e in exclude):
+                continue
+            if re.search(pat, n):
+                return c
+    return None
 
 
-# --------------------------------------------------------------------------
-# main
-# --------------------------------------------------------------------------
+def discover_columns(df):
+    c = list(df.columns)
+    roles = {
+        "case":       find(c, [r"^source_row$", r"source.*row", r"^row_?id$"]),
+        "turn":       find(c, [r"message_index", r"turn.*index", r"^index$", r"^seq"]),
+        "conv_label": find(c, [r"classification.*intent", r"case.*intent",
+                               r"conversation.*intent"]),
+        "cid":        find(c, [r"data_cid$", r"(^|_)cid$", r"conversation.*id"]),
+        "text":       find(c, [r"data_content$", r"content$", r"message.*text",
+                               r"^text$", r"utterance"]),
+        "predicted":  find(c, [r"intent_predicted", r"predicted"]),
+        "turn_label": find(c, [r"data_label$", r"(^|_)label$", r"turn.*intent"],
+                           exclude=[r"predicted"]),
+        "role":       find(c, [r"^message_type$", r"message_type$", r"data_type$",
+                               r"^role$", r"speaker"]),
+        "timestamp":  find(c, [r"time_?stamp", r"_ts$", r"created", r"^date"]),
+    }
+    rc = roles.get("role")
+    if rc and df[rc].nunique() > 12:
+        roles["role"] = None
+    return roles
+
+
+# =============================================================================
+# 2  TEMPLATE FIELD DISCOVERY
+# =============================================================================
+# A share of NORA's user turns are an intake form pasted into the message body.
+# Treating that blob as "the customer's words" is what made v1 learn the form
+# instead of the fault. So we discover the form, split it into fields, and
+# identify which field carries the free-text payload.
+#
+# v2.1 change: the discovery REPORT no longer prints an example value for each
+# field. An example of a field called `customer_name` is, by definition, a
+# customer name. The report now describes the field's SHAPE instead.
+
+FIELD_LINE_RE = re.compile(
+    r"(?m)^[ \t\-\*#>]*"
+    r"(?P<key>[A-Za-z][A-Za-z0-9 _\-/#\.]{1,44}?)"
+    r"\s*:\s*"
+    r"(?P<val>.*)$")
+
+MD_HEADER_RE = re.compile(r"(?m)^\s{0,3}#{1,6}\s*(?P<key>[^\n#]{2,60})\s*$")
+
+
+def norm_key(k):
+    return re.sub(r"[^a-z0-9]+", "_", str(k).strip().lower()).strip("_")
+
+
+def knee_cutoff(values, floor=0.0):
+    """Largest drop in the log-frequency curve. Derived, never assumed."""
+    v = np.sort(np.asarray(values, dtype=float))[::-1]
+    v = v[v > 0]
+    if len(v) < 4:
+        return float(v.min()) if len(v) else floor
+    drops = np.diff(np.log(v + 1e-9))
+    knee = int(np.argmin(drops)) + 1
+    return max(float(v[min(knee, len(v) - 1)]), floor)
+
+
+def split_fields(text):
+    """Parse one message into {field_key: value} plus the unmatched remainder."""
+    if not isinstance(text, str) or not text:
+        return {}, ""
+    fields, spans = {}, []
+    for m in FIELD_LINE_RE.finditer(text):
+        k = norm_key(m.group("key"))
+        if not k or len(k) < 2:
+            continue
+        fields.setdefault(k, m.group("val").strip())
+        spans.append((m.start(), m.end()))
+    if not spans:
+        return {}, text
+    rest, prev = [], 0
+    for a, b in spans:
+        rest.append(text[prev:a])
+        prev = b
+    rest.append(text[prev:])
+    return fields, re.sub(r"\s+", " ", " ".join(rest)).strip()
+
+
+def discover_template(texts, sample=8000, seed=42):
+    """Returns (promoted_field_keys, payload_key, report_dataframe)."""
+    s = pd.Series(texts).dropna().astype(str)
+    s = s[s.str.strip() != ""]
+    if s.empty:
+        return [], None, pd.DataFrame()
+    take = s.sample(min(sample, len(s)), random_state=seed)
+    n = len(take)
+
+    docs = Counter()
+    vals = defaultdict(list)
+    for t in take:
+        seen = set()
+        for m in FIELD_LINE_RE.finditer(t):
+            k = norm_key(m.group("key"))
+            if not k or len(k) < 2 or k.isdigit():
+                continue
+            if k not in seen:
+                docs[k] += 1
+                seen.add(k)
+            v = m.group("val").strip()
+            if len(vals[k]) < 4000:
+                vals[k].append(v)
+        for m in MD_HEADER_RE.finditer(t):
+            k = "hdr_" + norm_key(m.group("key"))
+            if k not in seen:
+                docs[k] += 1
+                seen.add(k)
+
+    if not docs:
+        return [], None, pd.DataFrame()
+
+    rows = []
+    for k, d in docs.items():
+        vv = [x for x in vals.get(k, []) if x]
+        lens = [len(x) for x in vv] or [0]
+        words = [len(x.split()) for x in vv] or [0]
+        digits = [sum(ch.isdigit() for ch in x) / max(len(x), 1) for x in vv] or [0]
+        uniq = len(set(vv)) / max(len(vv), 1)
+        rows.append({
+            "field": k,
+            "holds": field_kind(k) or "free_text",
+            "doc_count": d,
+            "coverage_pct": round(100.0 * d / n, 2),
+            "median_chars": float(np.median(lens)),
+            "median_words": float(np.median(words)),
+            "digit_density": round(float(np.median(digits)), 3),
+            "distinct_ratio": round(uniq, 3),
+        })
+    R = pd.DataFrame(rows).sort_values("coverage_pct", ascending=False)
+
+    cut = knee_cutoff(R["coverage_pct"].values, floor=1.0)
+    prov("template_field_coverage_cutoff", round(cut, 3), "DERIVED",
+         "knee of the field document-frequency curve")
+    R["promoted"] = R["coverage_pct"] >= cut
+
+    promoted = R[R["promoted"]]
+    payload = None
+    if len(promoted):
+        # The payload is the promoted field that is not an identifier field by
+        # its key and behaves like prose. Selecting on median word count rather
+        # than distinct ratio matters: a support corpus repeats the same
+        # complaint constantly, so a low distinct ratio is normal here.
+        cand = promoted[promoted["holds"] == "free_text"]
+        cand = cand[cand["median_words"] >= 3]
+        if len(cand):
+            payload = cand.sort_values("median_words", ascending=False)["field"].iloc[0]
+        else:
+            nonid = promoted[promoted["holds"] == "free_text"]
+            if len(nonid):
+                payload = nonid.sort_values("median_chars",
+                                            ascending=False)["field"].iloc[0]
+    R["is_payload"] = R["field"] == payload
+    return list(promoted["field"]), payload, R
+
+
+# =============================================================================
+# 3  STATISTICS
+# =============================================================================
+
+def cramers_v(a, b):
+    ct = pd.crosstab(a, b)
+    if ct.shape[0] < 2 or ct.shape[1] < 2:
+        return np.nan
+    chi2 = chi2_contingency(ct, correction=False)[0]
+    n = ct.values.sum()
+    phi2 = chi2 / n
+    r, k = ct.shape
+    phi2c = max(0.0, phi2 - (k - 1) * (r - 1) / (n - 1))
+    rc = r - (r - 1) ** 2 / (n - 1)
+    kc = k - (k - 1) ** 2 / (n - 1)
+    d = min(kc - 1, rc - 1)
+    return float(np.sqrt(phi2c / d)) if d > 0 else np.nan
+
+
+def theils_u(x, y):
+    px = pd.Series(x).value_counts(normalize=True)
+    hx = float(-(px * np.log(px + 1e-12)).sum())
+    if hx == 0:
+        return 0.0
+    d = pd.DataFrame({"x": x, "y": y})
+    hxy = 0.0
+    for _, g in d.groupby("y"):
+        p = g["x"].value_counts(normalize=True)
+        hxy += (len(g) / len(d)) * float(-(p * np.log(p + 1e-12)).sum())
+    return float((hx - hxy) / hx)
+
+
+def cohens_kappa(a, b):
+    a, b = pd.Series(a).astype(str), pd.Series(b).astype(str)
+    m = a.notna() & b.notna()
+    a, b = a[m], b[m]
+    if len(a) == 0:
+        return None
+    po = float((a == b).mean())
+    pa, pb = a.value_counts(normalize=True), b.value_counts(normalize=True)
+    pe = float(sum(pa.get(k, 0) * pb.get(k, 0)
+                   for k in set(pa.index) | set(pb.index)))
+    return round((po - pe) / (1 - pe), 4) if pe < 1 else None
+
+
+def build_stopwords(texts, template_fields, name_lexicon, df_ceiling=None):
+    """
+    Four layers, all justified:
+      1. generic English function words
+      2. TEMPLATE FIELD LABEL WORDS, discovered from this corpus. If "email"
+         and "call back number" are form labels here, then those words are
+         structural furniture, not telecom concepts. This is what stops the
+         model learning the paperwork.
+      3. corpus-specific over-frequent tokens above a derived ceiling
+      4. NEW IN v2.1: every token in the harvested name lexicon, so a customer
+         name can never surface as a cluster term or a learned keyword
+    """
+    sw = set(ENGLISH_STOP_WORDS)
+    n0 = len(sw)
+
+    field_words = set()
+    for f in template_fields:
+        for w in re.split(r"[^a-z]+", f):
+            if len(w) >= 2:
+                field_words.add(w)
+    sw |= field_words
+
+    s = pd.Series(texts).fillna("").astype(str).str.lower()
+    n = len(s)
+    dfc = Counter()
+    for t in s:
+        for w in set(re.findall(r"[a-z][a-z_\-]{1,}", t)):
+            dfc[w] += 1
+    freqs = np.array([v / max(n, 1) for v in dfc.values()])
+    ceiling = df_ceiling if df_ceiling else float(np.quantile(freqs, 0.999))
+    ceiling = max(ceiling, 0.40)
+    over = {w for w, v in dfc.items() if v / max(n, 1) >= ceiling}
+    sw |= over
+
+    sw |= set(name_lexicon)
+
+    prov("stopwords_english", n0, "DOMAIN_FACT",
+         "scikit-learn English function-word list")
+    prov("stopwords_from_template_fields", len(field_words), "DERIVED",
+         "words appearing as form field labels in THIS corpus")
+    prov("stopword_df_ceiling", round(ceiling, 4), "DERIVED",
+         "document-frequency ceiling from the corpus token distribution")
+    prov("stopwords_from_name_lexicon", len(name_lexicon), "SAFETY",
+         "harvested customer-name tokens, excluded from every vocabulary")
+    return sw, sorted(field_words), sorted(over)
+
+
+def weighted_log_odds(texts, labels, stopwords, min_count=8, top_n=40):
+    """
+    Weighted log-odds with an informative Dirichlet prior (Monroe, Colaresi and
+    Quinn). Preferred over raw counts or plain PMI because both are dominated by
+    rare words: a term seen three times in one class looks perfectly predictive.
+    This shrinks rare terms toward zero and returns a z-score, so every keyword
+    carries a confidence rather than an impression.
+    """
+    docs = pd.Series(texts).fillna("").astype(str).str.lower()
+    y = pd.Series(labels).astype(str)
+    tok = docs.str.findall(r"[a-z][a-z_\-]{2,}")
+    total, per_class = Counter(), defaultdict(Counter)
+    for t, lab in zip(tok, y):
+        for w in set(t):
+            if w in stopwords or len(w) < 3:
+                continue
+            total[w] += 1
+            per_class[lab][w] += 1
+    vocab = [w for w, c in total.items() if c >= min_count]
+    if not vocab:
+        return pd.DataFrame()
+    a0 = sum(total[w] for w in vocab)
+    rows = []
+    for lab in per_class:
+        ni = sum(per_class[lab][w] for w in vocab)
+        nj = sum(total[w] - per_class[lab][w] for w in vocab)
+        for w in vocab:
+            yiw = per_class[lab][w]
+            yjw = total[w] - yiw
+            aw = total[w]
+            num_i, num_j = yiw + aw, yjw + aw
+            den_i, den_j = ni + a0 - num_i, nj + a0 - num_j
+            if min(num_i, num_j, den_i, den_j) <= 0:
+                continue
+            delta = np.log(num_i / den_i) - np.log(num_j / den_j)
+            z = delta / np.sqrt(1.0 / num_i + 1.0 / num_j)
+            rows.append({"class": lab, "keyword": w, "doc_freq": total[w],
+                         "in_class": yiw,
+                         "pct_of_class": round(100.0 * yiw / max(ni, 1), 2),
+                         "log_odds": round(float(delta), 4),
+                         "z_score": round(float(z), 3)})
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    out["strength"] = pd.cut(out["z_score"].abs(),
+                             bins=[-np.inf, 1.96, 3.29, 5.0, np.inf],
+                             labels=["not significant", "significant",
+                                     "strong", "very strong"])
+    return (out.sort_values(["class", "z_score"], ascending=[True, False])
+            .groupby("class").head(top_n).reset_index(drop=True))
+
+
+# =============================================================================
+# PHASE 1  DATA ANALYSIS
+# =============================================================================
+
+def phase1(df, C, R):
+    log("\n=== PHASE 1  DATA ANALYSIS ===")
+    R.h("Phase 1 - Data analysis")
+
+    log("  1.1 column inventory")
+    rev = {v: k for k, v in C.items() if v}
+    inv = []
+    for col in df.columns:
+        s = df[col].dropna().astype(str)
+        s = s[s.str.strip() != ""]
+        if len(s):
+            lens = s.str.len()
+            digit_share = s.head(2000).map(
+                lambda x: sum(ch.isdigit() for ch in x) / max(len(x), 1)).median()
+            words = s.head(2000).str.split().map(len).median()
+        else:
+            lens, digit_share, words = pd.Series([0]), 0.0, 0
+        inv.append({"column": col, "role": rev.get(col, ""),
+                    "fill_pct": round(100.0 * len(s) / len(df), 2),
+                    "distinct": int(s.nunique()) if len(s) else 0,
+                    "median_len": int(lens.median()),
+                    "max_len": int(lens.max()),
+                    "median_words": int(words),
+                    "digit_density": round(float(digit_share), 3)})
+    INV = pd.DataFrame(inv)
+    R.csv(INV, "p1_01_column_inventory.csv")
+    R.h("1.1 What is in each column", 3)
+    R.table(INV, max_rows=40)
+    R.note("This inventory describes the SHAPE of each column - how long the "
+           "values are, how many words, how numeric - and deliberately shows "
+           "no sample value. A sample of a column called customer_name is a "
+           "customer name. In v2 this table was the single largest privacy "
+           "leak in the report.")
+    miss = [k for k, v in C.items() if not v]
+    if miss:
+        R.warn(f"Roles not found in this export: {', '.join(miss)}. "
+               f"Sections needing them are skipped rather than guessed.")
+
+    log("  1.2 structure")
+    R.h("1.2 Structure: what is one row?", 3)
+    facts = [{"metric": "rows (messages)", "value": len(df)}]
+    for key, nice in [("case", "distinct cases"), ("cid", "distinct conversation ids")]:
+        if C.get(key):
+            facts.append({"metric": nice, "value": int(df[C[key]].nunique())})
+    per_case = None
+    if C.get("case"):
+        vc = df[C["case"]].value_counts()
+        facts += [{"metric": "messages per case (mean)", "value": round(vc.mean(), 2)},
+                  {"metric": "messages per case (max)", "value": int(vc.max())}]
+        per_case = (vc.value_counts().sort_index()
+                    .rename_axis("messages_in_case").reset_index(name="cases"))
+    F = pd.DataFrame(facts)
+    R.csv(F, "p1_02_structure.csv")
+    R.table(F)
+
+    if C.get("case") and C.get("cid"):
+        a = df.groupby(C["cid"])[C["case"]].nunique()
+        b = df.groupby(C["case"])[C["cid"]].nunique()
+        na, nb = int((a > 1).sum()), int((b > 1).sum())
+        if na or nb:
+            R.warn(f"{na} conversation ids span several cases and {nb} cases span "
+                   f"several conversation ids. The two keys disagree, so the "
+                   f"flattening is not a clean one-to-one expansion.")
+            finding("MEDIUM", "Case key and conversation key disagree",
+                    f"{na} cid span >1 case; {nb} cases span >1 cid.",
+                    "Confirm with the data owner which key defines a conversation.")
+        else:
+            R.ok("Case id and conversation id agree exactly - one case is one "
+                 "conversation.")
+
+    if per_case is not None:
+        fig, ax = plt.subplots(figsize=(8.5, 3.2))
+        ax.bar(per_case["messages_in_case"].astype(str), per_case["cases"],
+               color=PALETTE[2])
+        ax.set_yscale("log")
+        ax.set_xlabel("messages in the case")
+        ax.set_ylabel("cases")
+        ax.set_title("Messages per case", loc="left", fontweight="600")
+        R.fig(fig)
+        R.csv(per_case, "p1_03_messages_per_case.csv")
+
+    if C.get("role"):
+        log("  1.3 roles")
+        R.h("1.3 Who is speaking", 3)
+        rc = df["_role"].value_counts()
+        R.fig(barh(rc.index.tolist(), rc.values, "messages", "Messages by role"))
+        if C.get("case"):
+            shape = (df.sort_values([C["case"], "_turn"]).groupby(C["case"])["_role"]
+                     .apply(lambda x: ",".join("U" if r == "user" else
+                                               "A" if r == "assistant" else "?"
+                                               for r in x)))
+            sh = (shape.value_counts().head(20).rename_axis("shape")
+                  .reset_index(name="cases"))
+            sh["pct_of_cases"] = (100.0 * sh["cases"] / len(shape)).round(2)
+            R.csv(sh, "p1_04_conversation_shapes.csv")
+            R.table(sh)
+            R.note("A shape is the order of speakers in one case. U is a user "
+                   "turn, A is an assistant turn, so U,A,A means the user "
+                   "posted once and NORA replied twice. pct_of_cases is the "
+                   "share of all cases with that shape.")
+            runs = shape.str.contains("A,A")
+            R.p(f"{int(runs.sum()):,} cases ({100.0 * runs.mean():.1f}%) contain "
+                f"consecutive system messages. The dialogue is not a strict "
+                f"alternation, so message-index parity cannot be used to infer "
+                f"who is speaking.")
+
+    log("  1.4 labels")
+    R.h("1.4 The label columns", 3)
+    cov = []
+    for key, nice in [("turn_label", "per-message label"),
+                      ("conv_label", "conversation label"),
+                      ("predicted", "prediction output slot")]:
+        col = C.get(key)
+        if not col:
+            continue
+        v = df[col].fillna("").astype(str).str.strip()
+        for role, g in df.assign(_v=v).groupby("_role"):
+            cov.append({"column": col, "meaning": nice, "role": role,
+                        "messages": len(g), "populated": int((g["_v"] != "").sum()),
+                        "populated_pct": round(100.0 * (g["_v"] != "").mean(), 2),
+                        "distinct": int(g.loc[g["_v"] != "", "_v"].nunique())})
+    COV = pd.DataFrame(cov)
+    if len(COV):
+        R.csv(COV, "p1_05_label_coverage.csv")
+        R.table(COV)
+        R.note("A label present only on user messages is a per-message target. "
+               "Assistant messages are NORA's answer - evidence for building "
+               "labels, never model input.")
+
+    n_classes = None
+    for key, nice in [("turn_label", "per-message label"),
+                      ("conv_label", "conversation label")]:
+        col = C.get(key)
+        if not col:
+            continue
+        v = df[col].fillna("").astype(str).str.strip()
+        v = v[v != ""]
+        if v.empty:
+            continue
+        d = v.value_counts().rename_axis("class").reset_index(name="rows")
+        d["pct"] = (100.0 * d["rows"] / d["rows"].sum()).round(2)
+        if key == "turn_label":
+            n_classes = len(d)
+        R.h(f"Class distribution - {nice} ({col})", 3)
+        R.csv(d, f"p1_06_classes_{key}.csv")
+        fig, axes = plt.subplots(1, 2, figsize=(12, 3.4))
+        for ax, scale, colr, ttl in [(axes[0], "linear", PALETTE[0], "linear"),
+                                     (axes[1], "log", PALETTE[1],
+                                      "log - reveals rare classes")]:
+            ax.bar(range(len(d)), d["rows"], color=colr)
+            if scale == "log":
+                ax.set_yscale("log")
+            ax.set_xticks(range(len(d)))
+            ax.set_xticklabels(d["class"].str.slice(0, 16), rotation=25, ha="right")
+            ax.set_title(ttl, loc="left", fontsize=10)
+        R.fig(fig)
+        R.table(d)
+        if d["pct"].iloc[0] > 60:
+            R.warn(f"'{d['class'].iloc[0]}' is {d['pct'].iloc[0]}% of this column. "
+                   f"Accuracy is meaningless at that imbalance - macro-F1 only.")
+
+    if n_classes is not None and n_classes <= 2:
+        R.warn(f"Only {n_classes} distinct classes are present in this export. "
+               f"If the operational taxonomy has more (for example modify, "
+               f"ticket, or an abstention class), this file is a FILTERED "
+               f"SUBSET and no rate computed from it describes production "
+               f"traffic.")
+        finding("HIGH", f"Only {n_classes} classes present",
+                "The per-message label takes very few distinct values here.",
+                "Confirm with the data owner whether other classes were "
+                "filtered out before export, and request the full extract.")
+
+    log("  1.5 text")
+    R.h("1.5 The text itself", 3)
+    L = df["_masked"].str.len()
+    T = pd.DataFrame([
+        {"metric": "empty messages", "value": int((L == 0).sum())},
+        {"metric": "median characters", "value": int(L.median())},
+        {"metric": "p95 characters", "value": int(L.quantile(0.95))},
+        {"metric": "max characters", "value": int(L.max())},
+        {"metric": "distinct messages", "value": int(df["_masked"].nunique())},
+        {"metric": "duplicated rows %",
+         "value": round(100.0 * df["_masked"].duplicated(keep=False).mean(), 2)}])
+    R.csv(T, "p1_07_text_facts.csv")
+    R.table(T)
+    if C.get("role"):
+        order = (df.groupby("_role")["_masked"].apply(lambda x: x.str.len().median())
+                 .sort_values().index)
+        fig, ax = plt.subplots(figsize=(9, 3.4))
+        ax.boxplot([df.loc[df["_role"] == r, "_masked"].str.len().values
+                    for r in order],
+                   tick_labels=[str(r)[:14] for r in order], showfliers=False,
+                   patch_artist=True,
+                   boxprops=dict(facecolor="#bee3f8", edgecolor="#2b6cb0"),
+                   medianprops=dict(color="#c05621", linewidth=2))
+        ax.set_ylabel("characters")
+        ax.set_title("Message length by role", loc="left", fontweight="600")
+        R.fig(fig, "User messages are short problem statements; assistant "
+                   "messages are long analyses. Two different populations.")
+
+    # ---- 1.6 association, FIXED: labelled rows only -------------------------
+    log("  1.6 association")
+    if C.get("turn_label"):
+        R.h("1.6 Which columns relate to the label", 3)
+        lab_col = C["turn_label"]
+        labelled = df[df[lab_col].fillna("").astype(str).str.strip() != ""].copy()
+        R.note(f"Computed on the {len(labelled):,} rows that actually carry a "
+               f"label. In v2 this ran across all {len(df):,} rows with the "
+               f"unlabelled assistant rows filled in as a blank category, which "
+               f"made the role column score 0.9999 and read as "
+               f"'NEAR-DETERMINISTIC'. That was an artefact of the blank fill: "
+               f"the role column was predicting whether a label existed, not "
+               f"which label it was.")
+        y = labelled[lab_col].astype(str)
+        rows = []
+        for c in labelled.columns:
+            if c == lab_col or c in FORBIDDEN_OUTPUT_COLS or c == "_masked":
+                continue
+            nun = labelled[c].fillna("_").nunique()
+            if nun < 2 or nun > 400:
+                continue
+            a = labelled[c].fillna("__blank__").astype(str)
+            if a.nunique() > 200:
+                a = a.where(a.isin(a.value_counts().head(200).index), "__other__")
+            rows.append({"column": c, "cramers_v": round(cramers_v(a, y), 4),
+                         "theils_u_label_given_column": round(theils_u(y, a), 4),
+                         "distinct": int(a.nunique())})
+        A = pd.DataFrame(rows).sort_values("cramers_v", ascending=False)
+        if len(A):
+            A["reads_as"] = np.where(
+                A["cramers_v"] > 0.9,
+                "NEAR-DETERMINISTIC - this column effectively IS the label",
+                np.where(A["cramers_v"] > 0.5, "strong",
+                         np.where(A["cramers_v"] > 0.2, "moderate", "weak")))
+            R.csv(A, "p1_08_association_with_label.csv")
+            R.table(A)
+            R.fig(barh(A.head(12)["column"].tolist(),
+                       A.head(12)["cramers_v"].fillna(0).values,
+                       "Cramer's V", "Association with the per-message label",
+                       color=PALETTE[3]))
+            R.note("Cramer's V comes from the chi-square test of independence "
+                   "and runs 0 to 1. Near 1 means that column already contains "
+                   "the answer. Theil's U is asymmetric, so it also shows the "
+                   "direction of the dependence.")
+    return df
+
+
+# =============================================================================
+# PHASE 2  TEMPLATE EXTRACTION, MASKING, CLEANING
+# =============================================================================
+
+TELECOM_TERMS = {
+    r"\bhsi\b": "home internet service", r"\bmsisdn\b": "mobile number",
+    r"\bimei\b": "device identifier", r"\biccid\b": "sim identifier",
+    r"\bban\b": "billing account", r"\bsoc\b": "service code",
+    r"\bapn\b": "access point name", r"\bvolte\b": "voice over lte",
+    r"\bcpe\b": "customer premises equipment", r"\besim\b": "embedded sim",
+    r"\bcx\b": "customer", r"\brca\b": "root cause analysis",
+}
+
+
+def phase2(df, C, R):
+    log("\n=== PHASE 2  TEMPLATE, MASKING, CLEANING ===")
+    R.h("Phase 2 - Extracting the real problem statement")
+
+    if C.get("role"):
+        user = df[df["_role"] == "user"].copy()
+    else:
+        user = df.copy()
+    log(f"  user messages: {len(user):,} of {len(df):,}")
+
+    # capture the BEFORE median now, on the unfiltered frame (v2.1 fix)
+    median_before = int(user["_raw"].str.len().median())
+
+    log("  2.1 discovering the intake template")
+    fields, payload, TR = discover_template(user["_raw"].tolist())
+    if len(TR):
+        R.h("2.1 The intake form, discovered from the data", 3)
+        R.csv(TR, "p2_01_template_fields.csv")
+        R.table(TR[TR["promoted"]], max_rows=30)
+        R.note("These field labels were found by pattern and ranked by how "
+               "often they appear; the cutoff is the knee of that frequency "
+               "curve. Nothing about this form is written into the code, so a "
+               "different intake layout in a future export is discovered the "
+               "same way. The 'holds' column records what kind of identifier "
+               "each field carries. No example VALUES are shown, and every "
+               "field whose 'holds' is not free_text has its values dropped "
+               "entirely rather than masked - a stable surrogate for a BAN is "
+               "still a join key back to one customer.")
+    if payload:
+        cov = float(TR.loc[TR['field'] == payload, 'coverage_pct'].iloc[0])
+        R.ok(f"Free-text payload field identified: '{payload}' "
+             f"(present in {cov:.1f}% of user messages). This is the "
+             f"customer's actual problem statement. Everything else on the "
+             f"form is identifiers and is discarded.")
+        prov("payload_field", payload, "DERIVED",
+             "promoted free-text field with the greatest median word count")
+        finding("INFO", "Intake form detected and split",
+                f"{len(fields)} recurring fields; payload = '{payload}'.",
+                "Model on the payload, not the whole form.")
+        if cov < 30:
+            R.warn(f"The payload field appears in only {cov:.1f}% of user "
+                   f"messages, so the form-splitting path applies to a small "
+                   f"minority of the data. The rest are free text and reach "
+                   f"the model through span masking alone. Do not read the "
+                   f"'model on the payload' fix as covering the corpus.")
+            finding("MEDIUM", "Payload field has low coverage",
+                    f"'{payload}' present in {cov:.1f}% of user messages.",
+                    "Treat form-splitting as a minority path; most X is free "
+                    "text.")
+    else:
+        R.warn("No free-text payload field could be identified. Falling back to "
+               "the whole message as X.")
+
+    log("  2.2 field-aware masking and gating")
+    issue_txt, n_templated = [], 0
+    for t in user["_raw"]:
+        f, rest = split_fields(t)
+        if f:
+            n_templated += 1
+        if payload and payload in f:
+            body = GUARD.mask_field(payload, f[payload])
+        elif f:
+            # no payload field present: keep only free-text field values
+            parts = [GUARD.mask_field(k, v) for k, v in f.items()
+                     if field_kind(k) is None]
+            body = " ".join(p for p in parts if p)
+            if rest.strip():
+                body = (body + " " + GUARD.mask_text(rest)).strip()
+        else:
+            body = GUARD.mask_text(t)
+        issue_txt.append(body or "")
+
+    user["_issue"] = pd.Series(issue_txt, index=user.index).fillna("")
+    R.p(f"{n_templated:,} of {len(user):,} user messages "
+        f"({100.0 * n_templated / max(len(user), 1):.1f}%) are form-structured; "
+        f"the remainder are free text. Both paths converge on a single problem "
+        f"statement field.")
+
+    log("  2.3 normalising")
+    clean = user["_issue"].str.lower()
+    for pat, rep in TELECOM_TERMS.items():
+        clean = clean.str.replace(pat, rep, regex=True)
+    clean = (clean.str.replace(r"<([a-z]+)_[0-9a-f]+>", r" ", regex=True,
+                               flags=re.IGNORECASE)
+             .str.replace(r"\s+", " ", regex=True).str.strip())
+    user["_clean"] = clean
+    prov("telecom_abbreviations", len(TELECOM_TERMS), "DOMAIN_FACT",
+         "SME lexicon; exported for review")
+
+    before = len(user)
+    user = user[user["_clean"].str.len() >= 3].copy()
+    dup = int(user["_clean"].duplicated().sum())
+
+    # ---- residue check on exactly what will be modelled --------------------
+    res = []
+    for name, rx in RESIDUE_CHECKS:
+        probe = user["_clean"].map(lambda x: SURROGATE_RE.sub(" ", x))
+        n = int(probe.str.contains(rx).sum())
+        res.append({"check": name, "rows_with_residue": n,
+                    "pct": round(100.0 * n / max(len(user), 1), 3),
+                    "status": "PASS" if n == 0 else "REVIEW"})
+    RES = pd.DataFrame(res)
+    R.csv(RES, "p2_02_pii_residue_check.csv")
+    R.h("PII residue check on the modelled text", 3)
+    R.table(RES)
+    if (RES["status"] == "REVIEW").any():
+        R.warn("Residue detected in the modelled text. Note that these rows "
+               "are still SAFE TO SHIP: any cell that fails these same checks "
+               "is blanked by the output gate before it reaches this report or "
+               "any CSV. This table tells you the masker missed something, not "
+               "that something leaked.")
+        finding("MEDIUM", "Masker missed a pattern",
+                RES[RES.status == "REVIEW"].to_dict("records"),
+                "Extend PII_PATTERNS so the gate has less work to do; no "
+                "output is exposed either way.")
+    else:
+        R.ok("Nothing matching an identifier pattern remains in the text that "
+             "will be modelled.")
+
+    R.csv(GUARD.summary(), "p2_03_masking_summary.csv")
+
+    steps = pd.DataFrame([
+        {"step": "1 split the intake form into fields",
+         "detail": f"{len(fields)} recurring fields discovered; "
+                   f"payload = {payload or 'n/a'}"},
+        {"step": "2 drop identifier fields, mask free text",
+         "detail": f"{sum(GUARD.counts.values()):,} values dropped or replaced "
+                   f"with salted surrogates"},
+        {"step": "3 keep user messages only",
+         "detail": f"{len(user):,} kept; assistant messages excluded from X "
+                   f"because they contain the answer"},
+        {"step": "4 reduce to the problem statement",
+         "detail": f"median length {median_before} chars -> "
+                   f"{int(user['_clean'].str.len().median())} chars after "
+                   f"removing form furniture and identifiers"},
+        {"step": "5 expand telecom abbreviations",
+         "detail": f"{len(TELECOM_TERMS)} domain terms normalised"},
+        {"step": "6 drop empty after cleaning",
+         "detail": f"{before - len(user):,} dropped"},
+        {"step": "7 duplicate check",
+         "detail": f"{dup:,} messages repeat text already seen "
+                   f"({100.0 * dup / max(len(user), 1):.1f}%). Kept for "
+                   f"analysis; collapsed before clustering and before any "
+                   f"train/test split."},
+    ])
+    R.h("2.2 Cleaning steps", 3)
+    R.csv(steps, "p2_04_cleaning_steps.csv")
+    R.table(steps)
+    R.note("X is the customer's problem statement with every identifier "
+           "removed. There is deliberately no before/after sample export in "
+           "this version: v2 wrote one, and a before column is by definition "
+           "raw customer data.")
+    return user, fields, payload
+
+
+# =============================================================================
+# PHASE 3  EDA + PCA
+# =============================================================================
+
+def phase3(user, C, R, stopwords, seed):
+    log("\n=== PHASE 3  EDA + PCA ===")
+    R.h("Phase 3 - EDA and PCA: is the label learnable from the text?")
+
+    vec = TfidfVectorizer(max_features=60000, ngram_range=(1, 2), min_df=3,
+                          max_df=0.6, stop_words=list(stopwords),
+                          sublinear_tf=True)
+    Xs = vec.fit_transform(user["_clean"])
+    log(f"  TF-IDF {Xs.shape}")
+    k = int(min(200, Xs.shape[1] - 1, max(2, Xs.shape[0] - 1)))
+    svd = TruncatedSVD(n_components=k, random_state=seed)
+    Xd = svd.fit_transform(Xs)
+    R.p(f"Vectorised to {Xs.shape[1]:,} TF-IDF features, compressed to {k} "
+        f"components holding {svd.explained_variance_ratio_.sum():.1%} of the "
+        f"variance.")
+    prov("tfidf_vocabulary", Xs.shape[1], "DERIVED", "learned from this corpus")
+    prov("svd_components", k, "REVIEW_GATE",
+         "extraction width; retention decided by the criteria below")
+
+    Z = StandardScaler().fit_transform(Xd)
+    npc = int(min(30, Z.shape[1]))
+    pca = PCA(n_components=npc, random_state=seed)
+    P = pca.fit_transform(Z)
+    ev = pca.explained_variance_ratio_
+    scree = pd.DataFrame({"component": range(1, npc + 1),
+                          "eigenvalue": np.round(pca.explained_variance_, 4),
+                          "explained_variance_ratio": np.round(ev, 5),
+                          "cumulative": np.round(np.cumsum(ev), 5)})
+    scree["kaiser_retain"] = scree["eigenvalue"] > 1.0
+    R.csv(scree, "p3_01_pca_scree.csv")
+    n90 = int((scree["cumulative"] < 0.90).sum()) + 1
+    prov("pca_components_kaiser", int(scree["kaiser_retain"].sum()), "DERIVED",
+         "eigenvalue > 1")
+    prov("pca_components_for_90pct", n90, "DERIVED", "cumulative variance")
+
+    lab = C.get("turn_label")
+    fig, axes = plt.subplots(1, 2, figsize=(12, 3.9))
+    axes[0].bar(range(1, npc + 1), ev, color=PALETTE[0])
+    axes[0].plot(range(1, npc + 1), np.cumsum(ev), color=PALETTE[1], marker="o",
+                 markersize=3)
+    axes[0].axhline(0.9, color="#a0aec0", linestyle="--", linewidth=1)
+    axes[0].set_xlabel("component")
+    axes[0].set_ylabel("explained variance")
+    axes[0].set_title("scree (dashed = 90%)", loc="left", fontsize=10)
+    if lab:
+        y = user[lab].fillna("__blank__").astype(str)
+        for i, u in enumerate(y.value_counts().head(8).index):
+            m = (y == u).values
+            axes[1].scatter(P[m, 0], P[m, 1], s=7, alpha=0.4,
+                            color=PALETTE[i % len(PALETTE)], label=str(u)[:18])
+        axes[1].legend(fontsize=7, markerscale=1.8, frameon=False)
+        axes[1].set_title("PC1 vs PC2, coloured by label", loc="left", fontsize=10)
+    axes[1].set_xlabel("PC1")
+    axes[1].set_ylabel("PC2")
+    R.fig(fig, "If the colours separate, the labels are learnable from the "
+               "text. If they overlap completely, the taxonomy is the problem, "
+               "not the model.")
+    R.p(f"{int(scree['kaiser_retain'].sum())} components have eigenvalue > 1 "
+        f"(Kaiser criterion); {n90} are needed for 90% of the variance.")
+
+    if lab:
+        y = user[lab].fillna("__blank__").astype(str).values
+        rows = []
+        for i in range(min(10, P.shape[1])):
+            s = pd.Series(P[:, i])
+            g = s.groupby(y)
+            between, within = float(g.mean().var()), float(g.var().mean())
+            rows.append({"component": f"PC{i+1}",
+                         "between_group_var": round(between, 5),
+                         "within_group_var": round(within, 5),
+                         "fisher_ratio": round(between / within, 5) if within else None})
+        FR = pd.DataFrame(rows).sort_values("fisher_ratio", ascending=False)
+        FR["reads_as"] = np.where(FR["fisher_ratio"].fillna(0) > 0.1,
+                                  "carries real class structure",
+                                  "mostly within-class noise")
+        R.csv(FR, "p3_02_pca_fisher_ratio.csv")
+        R.h("Does any component separate the classes?", 3)
+        R.table(FR)
+        best = float(FR["fisher_ratio"].max() or 0)
+        if best < 0.1:
+            R.warn("No principal component separates the classes. The label is "
+                   "not expressible as a direction in this representation - "
+                   "expect weak linear performance and treat the taxonomy "
+                   "itself as suspect.")
+            finding("MEDIUM", "No component separates the classes",
+                    f"best Fisher ratio {best:.3f}",
+                    "Prioritise SME review of the taxonomy over model tuning.")
+        elif best < 0.3:
+            R.warn(f"The best component reaches a Fisher ratio of only "
+                   f"{best:.3f}. There is some class structure but it is thin, "
+                   f"and it sits on one component while the rest are noise.")
+    return Xs, Xd, vec
+
+
+# =============================================================================
+# PHASE 4  CLUSTERING  (deduplicated, multi-criterion)
+# =============================================================================
+
+def phase4(user, C, R, stopwords, max_k, seed):
+    log("\n=== PHASE 4  CLUSTERING ===")
+    R.h("Phase 4 - Clustering: what customers actually talk about")
+
+    # Deduplicate first. In v1 one sentence repeated 112 times became its own
+    # cluster; that is a duplicate, not a topic. Weights keep the frequency
+    # information without letting it dominate the geometry.
+    grp = (user.groupby("_clean").size().rename("weight").reset_index())
+    grp = grp[grp["_clean"].str.len() >= 8]
+    R.p(f"{len(user):,} user messages collapse to {len(grp):,} distinct problem "
+        f"statements. Clustering runs on the distinct texts with frequency "
+        f"weights, so a single repeated sentence cannot form its own cluster.")
+    prov("dedup_distinct_texts", len(grp), "DERIVED", "unique cleaned statements")
+    if len(grp) < 40:
+        R.warn("Too few distinct statements to cluster meaningfully.")
+        return user
+
+    vec = TfidfVectorizer(max_features=40000, ngram_range=(1, 2), min_df=2,
+                          max_df=0.6, stop_words=list(stopwords), sublinear_tf=True)
+    S = vec.fit_transform(grp["_clean"])
+    kk = int(min(120, S.shape[1] - 1, max(2, S.shape[0] - 1)))
+    D = TruncatedSVD(n_components=kk, random_state=seed).fit_transform(S)
+
+    hi = max(3, min(max_k, len(grp) // 30))
+    rows, models = [], {}
+    for k in range(2, hi + 1):
+        km = KMeans(n_clusters=k, random_state=seed, n_init=6).fit(D)
+        try:
+            sil = silhouette_score(D, km.labels_, sample_size=min(4000, len(D)),
+                                   random_state=seed)
+            ch = calinski_harabasz_score(D, km.labels_)
+            db = davies_bouldin_score(D, km.labels_)
+        except Exception:
+            continue
+        rows.append({"k": k, "silhouette": round(float(sil), 4),
+                     "calinski_harabasz": round(float(ch), 1),
+                     "davies_bouldin": round(float(db), 4)})
+        models[k] = km
+    SC = pd.DataFrame(rows)
+    if SC.empty:
+        R.warn("Cluster quality could not be computed.")
+        return user
+    R.csv(SC, "p4_01_cluster_quality_by_k.csv")
+
+    k_sil = int(SC.loc[SC["silhouette"].idxmax(), "k"])
+    k_ch = int(SC.loc[SC["calinski_harabasz"].idxmax(), "k"])
+    k_db = int(SC.loc[SC["davies_bouldin"].idxmin(), "k"])
+    votes = Counter([k_sil, k_ch, k_db])
+    k_best = votes.most_common(1)[0][0]
+    prov("k_selected", k_best, "DERIVED",
+         f"majority of three criteria: silhouette={k_sil}, "
+         f"Calinski-Harabasz={k_ch}, Davies-Bouldin={k_db}")
+
+    fig, axes = plt.subplots(1, 3, figsize=(13, 3.2))
+    for ax, col, ttl, best in [
+            (axes[0], "silhouette", "silhouette (higher better)", k_sil),
+            (axes[1], "calinski_harabasz", "Calinski-Harabasz (higher better)", k_ch),
+            (axes[2], "davies_bouldin", "Davies-Bouldin (lower better)", k_db)]:
+        ax.plot(SC["k"], SC[col], marker="o", markersize=3, color=PALETTE[0])
+        ax.axvline(best, color=PALETTE[1], linestyle="--", linewidth=1)
+        ax.set_xlabel("k")
+        ax.set_title(ttl, loc="left", fontsize=9)
+    R.fig(fig, "Three independent measures of cluster quality. Where they "
+               "agree, the structure is real; where they disagree, it is weak.")
+    R.table(SC)
+    R.p(f"Selected k = {k_best}. Silhouette prefers {k_sil}, "
+        f"Calinski-Harabasz prefers {k_ch}, Davies-Bouldin prefers {k_db}.")
+
+    sil_best = float(SC["silhouette"].max())
+    if sil_best < 0.25:
+        R.warn(f"Peak silhouette is only {sil_best:.3f}. The problem statements "
+               f"do not form well-separated groups in this representation - "
+               f"the clusters below are weak and should be read as suggestive, "
+               f"not as a taxonomy. Sentence embeddings would likely separate "
+               f"this text better than TF-IDF.")
+        finding("MEDIUM", "Weak cluster separation",
+                f"peak silhouette {sil_best:.3f} at k={k_sil}",
+                "Re-run with sentence embeddings before treating clusters as "
+                "an intent taxonomy.")
+
+    km = models[k_best]
+    grp["_cluster"] = km.labels_
+
+    # name the clusters with c-TF-IDF
+    terms = np.array(vec.get_feature_names_out())
+    rows = []
+    for c in sorted(set(km.labels_)):
+        m = (km.labels_ == c)
+        inside = np.asarray(S[m].mean(axis=0)).ravel()
+        outside = np.asarray(S[~m].mean(axis=0)).ravel()
+        idx = (inside - outside).argsort()[::-1][:12]
+        ex = (grp.loc[m].sort_values("weight", ascending=False)["_clean"]
+              .head(3).tolist())
+        rows.append({"cluster": int(c),
+                     "distinct_statements": int(m.sum()),
+                     "messages": int(grp.loc[m, "weight"].sum()),
+                     "pct_of_messages": round(100.0 * grp.loc[m, "weight"].sum()
+                                              / grp["weight"].sum(), 2),
+                     "top_terms": ", ".join(terms[idx]),
+                     "example_1": (ex[0][:150] if ex else ""),
+                     "example_2": (ex[1][:150] if len(ex) > 1 else ""),
+                     "example_3": (ex[2][:150] if len(ex) > 2 else "")})
+    CT = pd.DataFrame(rows).sort_values("messages", ascending=False)
+    ex_cols = ("example_1", "example_2", "example_3")
+    R.csv(CT, "p4_02_cluster_terms.csv", free_text_cols=ex_cols)
+    R.h("What each cluster is about", 3)
+    R.table(CT, max_rows=40, free_text_cols=ex_cols)
+    R.note("Cluster names come from c-TF-IDF: the words that make a cluster "
+           "different from every other cluster, not simply its most common "
+           "words. An SME reads this table and names each cluster - that is "
+           "the detailed-intent layer, discovered rather than invented. The "
+           "example columns are masked problem statements that also passed the "
+           "output gate; any example that still looked like it held an "
+           "identifier or a name was blanked rather than shown.")
+
+    # a catch-all cluster is its own kind of degeneracy: flag it
+    top = CT.iloc[0]
+    if float(top["pct_of_messages"]) > 30:
+        R.warn(f"Cluster {int(top['cluster'])} holds "
+               f"{top['pct_of_messages']}% of all messages. A cluster that "
+               f"absorbs a third or more of the corpus is a catch-all, not a "
+               f"topic - it is where everything the representation could not "
+               f"separate has landed. Read its terms as a residue list, not as "
+               f"an intent.")
+        finding("MEDIUM", "Catch-all cluster dominates",
+                f"cluster {int(top['cluster'])} holds "
+                f"{top['pct_of_messages']}% of messages",
+                "Split it with sentence embeddings, and check whether a canned "
+                "template (for example an outage notice) is pooling inside it.")
+
+    user = user.merge(grp[["_clean", "_cluster"]], on="_clean", how="left")
+
+    lab = C.get("turn_label")
+    if lab:
+        y = user[lab].fillna("__unlabelled__").astype(str)
+        ct = pd.crosstab(user["_cluster"], y)
+        keep = ct.sum(axis=1).sort_values(ascending=False).head(40).index
+        ct = ct.loc[keep]
+        rn = ct.div(ct.sum(axis=1).replace(0, np.nan), axis=0).fillna(0)
+        R.h("Cluster x intent heat map", 3)
+        R.fig(heat(rn.values, list(ct.columns),
+                   [f"cluster {int(i)}" for i in ct.index],
+                   "Cluster (rows) x intent (columns), row-normalised",
+                   "share of cluster", cmap="YlGnBu"))
+        R.csv(ct.reset_index(), "p4_03_cluster_x_intent.csv")
+
+        pur = pd.DataFrame({"cluster": ct.index, "messages": ct.sum(axis=1).values,
+                            "dominant_intent": rn.idxmax(axis=1).values,
+                            "purity": rn.max(axis=1).round(3).values})
+        base = float(y.value_counts(normalize=True).max())
+        pur["lift_over_base_rate"] = (pur["purity"] - base).round(3)
+        pur["reads_as"] = np.where(
+            pur["lift_over_base_rate"] > 0.15,
+            "informative - this cluster really is mostly one intent",
+            np.where(pur["lift_over_base_rate"] > 0.05, "mildly informative",
+                     "no better than guessing the majority class"))
+        R.csv(pur.sort_values("messages", ascending=False), "p4_04_cluster_purity.csv")
+        R.h("Cluster purity, compared against the base rate", 3)
+        R.table(pur.sort_values("messages", ascending=False), max_rows=40)
+        R.note(f"The majority class is {100 * base:.1f}% of messages, so a "
+               f"cluster with purity below that is telling us nothing. The lift "
+               f"column is the honest measure - purity minus the base rate.")
+        prov("majority_class_base_rate", round(base, 4), "DERIVED",
+             "share of the most common label")
+
+    keepcols = [c for c in [C.get("case"), C.get("turn"), lab, "_clean", "_cluster"]
+                if c]
+    R.csv(user[keepcols], "p4_05_messages_with_clusters.csv",
+          free_text_cols=("_clean",))
+    return user
+
+
+# =============================================================================
+# PHASE 5  TURN INTENT -> CONVERSATION INTENT
+# =============================================================================
+
+def phase5(user, C, R):
+    log("\n=== PHASE 5  TURN -> CONVERSATION INTENT ===")
+    R.h("Phase 5 - From per-message intent to conversation intent")
+    lab, case, conv = C.get("turn_label"), C.get("case"), C.get("conv_label")
+    if not (lab and case):
+        R.warn("Needs both a per-message label and a case key. Skipped.")
+        return
+
+    u = user[user[lab].fillna("").astype(str).str.strip() != ""].copy()
+    u = u.sort_values([case, "_turn"])
+    seqs, verdicts = [], []
+    for _, g in u.groupby(case):
+        seqs.append(list(g[lab].astype(str)))
+        if conv:
+            v = g[conv].dropna().astype(str)
+            verdicts.append(v.iloc[0] if len(v) else None)
+        else:
+            verdicts.append(None)
+
+    multi = [s for s in seqs if len(s) > 1]
+    changed = [s for s in multi if len(set(s)) > 1]
+    change_rate = len(changed) / max(len(multi), 1)
+
+    labs = sorted({x for s in seqs for x in s})
+    M = np.zeros((len(labs), len(labs)))
+    li = {l: i for i, l in enumerate(labs)}
+    for s in seqs:
+        for a, b in zip(s, s[1:]):
+            M[li[a], li[b]] += 1
+    rs = M.sum(axis=1, keepdims=True)
+    P = np.divide(M, rs, out=np.zeros_like(M), where=rs > 0)
+    R.h("How intent moves through a conversation", 3)
+    R.fig(heat(P, labs, labs, "Intent at message t (rows) -> message t+1 (columns)",
+               "probability", cmap="Blues"))
+    R.csv(pd.DataFrame(M, index=labs, columns=labs).reset_index()
+          .rename(columns={"index": "from_to"}), "p5_01_transition_counts.csv")
+
+    R.p(f"{len(seqs):,} conversations have at least one labelled user message. "
+        f"{len(multi):,} have more than one. Of those, {len(changed):,} "
+        f"({100 * change_rate:.1f}%) change intent during the conversation.")
+
+    if change_rate == 0 and len(multi) > 0:
+        R.warn("THE INTENT NEVER CHANGES WITHIN A CONVERSATION. Every labelled "
+               "message in a conversation carries the same value. That means "
+               "the per-message label is the CONVERSATION label copied down "
+               "onto the messages - it is not an independent per-message "
+               "judgement. Two consequences: (1) we do not actually have two "
+               "label sources, we have one; (2) the rule test below is "
+               "arithmetic, not a finding, because when every message shares a "
+               "label, first / last / majority all return the same answer by "
+               "construction.")
+        finding("HIGH", "Per-message label does not vary within a conversation",
+                f"{len(multi)} multi-message conversations, 0 with any change.",
+                "Ask the data owner whether the per-message label is generated "
+                "per message or inherited from the case. If inherited, a "
+                "genuine per-message target must be created before "
+                "message-level modelling means anything.")
+    elif changed:
+        J = pd.DataFrame(Counter(" -> ".join(s) for s in changed).most_common(20),
+                         columns=["journey", "conversations"])
+        R.csv(J, "p5_02_intent_journeys.csv")
+        R.h("Most common intent journeys", 3)
+        R.table(J)
+        R.ok("Intent does change within conversations - the evidence for "
+             "modelling the conversation as a sequence rather than a single "
+             "label.")
+
+    if conv and any(v is not None for v in verdicts):
+        pairs = [(s, v) for s, v in zip(seqs, verdicts) if v is not None]
+        cnt = Counter()
+        for s, _ in pairs:
+            cnt.update(s)
+        rarity = {k: i for i, (k, _) in enumerate(sorted(cnt.items(),
+                                                         key=lambda kv: kv[1]))}
+        rules = {"first_message": lambda s: s[0],
+                 "last_message": lambda s: s[-1],
+                 "majority_vote": lambda s: Counter(s).most_common(1)[0][0],
+                 "rarest_class_wins": lambda s: min(s, key=lambda x: rarity.get(x, 1e9))}
+        rows = []
+        for name, fn in rules.items():
+            ok = [fn(s) == v for s, v in pairs]
+            rows.append({"rule": name, "conversations": len(ok),
+                         "agreement_pct": round(100.0 * np.mean(ok), 2)})
+        RU = pd.DataFrame(rows).sort_values("agreement_pct", ascending=False)
+        R.csv(RU, "p5_03_global_intent_rules.csv")
+        R.h("Is the conversation label just a rule over the messages?", 3)
+        R.fig(barh(RU["rule"].tolist(), RU["agreement_pct"].values,
+                   "% agreement with the conversation label",
+                   "Do simple rules reproduce the conversation verdict?",
+                   color=PALETTE[2]))
+        R.table(RU)
+        spread = float(RU["agreement_pct"].max() - RU["agreement_pct"].min())
+        if change_rate == 0:
+            R.warn("All rules score identically because the label never varies "
+                   "within a conversation. This table is VACUOUS on this export "
+                   "and must not be reported as evidence that a rule was "
+                   "discovered.")
+        elif spread < 1.0:
+            R.warn("All rules score within one point of each other, so this "
+                   "test does not distinguish between them.")
+        else:
+            best = RU.iloc[0]
+            R.ok(f"'{best['rule']}' reproduces the conversation label "
+                 f"{best['agreement_pct']}% of the time, clearly ahead of the "
+                 f"alternatives. Implement that rule rather than training a "
+                 f"second model.")
+
+
+# =============================================================================
+# PHASE 6  TWO LABEL SETS
+# =============================================================================
+
+def build_rules(texts, labels, stopwords, min_z=2.5, top_n=40):
+    KW = weighted_log_odds(texts, labels, stopwords, top_n=top_n)
+    if KW.empty:
+        return {}
+    KW = KW[KW["z_score"] >= min_z]
+    r = defaultdict(dict)
+    for _, x in KW.iterrows():
+        r[x["class"]][x["keyword"]] = float(x["z_score"])
+    return dict(r)
+
+
+def apply_rules(texts, rules):
+    classes = sorted(rules.keys())
+    preds, confs = [], []
+    for t in texts:
+        toks = set(re.findall(r"[a-z][a-z_\-]{2,}", str(t).lower()))
+        sc = {c: sum(w for k, w in rules[c].items() if k in toks) for c in classes}
+        tot = sum(sc.values())
+        if tot <= 0:
+            preds.append(None)
+            confs.append(0.0)
+            continue
+        rk = sorted(sc.items(), key=lambda kv: kv[1], reverse=True)
+        top = rk[0][1]
+        second = rk[1][1] if len(rk) > 1 else 0.0
+        preds.append(rk[0][0])
+        confs.append(round((top - second) / tot, 4))
+    return preds, confs
+
+
+def phase6(user, C, R, stopwords, field_words, seed):
+    log("\n=== PHASE 6  TWO LABEL SETS ===")
+    R.h("Phase 6 - Two label sets, and whether they agree")
+    lab = C.get("turn_label")
+    if not lab:
+        R.warn("No per-message label column. Skipped.")
+        return
+
+    u = user[user[lab].fillna("").astype(str).str.strip() != ""].copy()
+    texts = u["_clean"].tolist()
+    y1 = u[lab].astype(str).values
+
+    R.note("The keyword vocabulary excludes generic English words, words that "
+           "appear as intake-form field labels in this corpus, tokens above a "
+           "derived frequency ceiling, and every customer name harvested from "
+           "the corpus. In v1 none of these were removed, so the top "
+           "'indicators' were 'can', 'what', 'the', 'name' and 'email' - the "
+           "model was detecting which form a message used, not what the "
+           "customer wanted.")
+
+    pred = [None] * len(u)
+    conf = [0.0] * len(u)
+    vc = pd.Series(y1).value_counts()
+    usable = vc[vc >= 5].index
+    mask = np.array([v in usable for v in y1])
+    idx = np.where(mask)[0]
+    last_rules = {}
+    if len(idx) >= 25 and len(usable) >= 2:
+        skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=seed)
+        Xa = np.array(texts, dtype=object)[idx]
+        ya = y1[idx]
+        for tr, te in skf.split(Xa, ya):
+            rules = build_rules(Xa[tr], ya[tr], stopwords)
+            if not rules:
+                continue
+            last_rules = rules
+            p, c = apply_rules(Xa[te], rules)
+            for j, kk in enumerate(te):
+                pred[idx[kk]] = p[j]
+                conf[idx[kk]] = c[j]
+        prov("keyword_rule_cv_folds", 5, "REVIEW_GATE",
+             "out-of-fold so agreement is a measurement, not a tautology")
+
+    u["_label_existing"] = y1
+    u["_label_keyword"] = pred
+    u["_confidence"] = conf
+
+    if last_rules:
+        RB = pd.DataFrame([{"class": c, "keyword": k, "weight": round(w, 3)}
+                           for c, d in last_rules.items()
+                           for k, w in sorted(d.items(), key=lambda kv: -kv[1])])
+        R.csv(RB, "p6_01_keyword_rule_block.csv")
+        R.h("The keyword rule block, learned from the data", 3)
+        R.table(RB.groupby("class").head(14), max_rows=70)
+        for i, cls in enumerate(sorted(last_rules)):
+            d = sorted(last_rules[cls].items(), key=lambda kv: -kv[1])[:12]
+            if d:
+                R.fig(barh([k for k, _ in d], [w for _, w in d],
+                           "z-score (higher = stronger indicator)",
+                           f"Keywords indicating '{cls}'",
+                           color=PALETTE[i % len(PALETTE)]))
+
+        # v2.1: state it plainly when a class learns almost nothing
+        counts = RB.groupby("class").size()
+        floor = max(5, int(0.25 * counts.max()))
+        thin = counts[counts < floor]
+        for cls, n in thin.items():
+            R.warn(f"The '{cls}' class learned only {n} indicator words, "
+                   f"against {int(counts.max())} for the strongest class. "
+                   f"Inspect them before trusting this side of the rule block: "
+                   f"if they are discourse words such as 'today' or "
+                   f"'regarding' rather than fault vocabulary, the rule is "
+                   f"detecting how the note was written, not what the problem "
+                   f"was.")
+            finding("MEDIUM", f"Thin keyword evidence for '{cls}'",
+                    f"{n} indicators above the z threshold, vs "
+                    f"{int(counts.max())} for the strongest class.",
+                    "Check whether the indicators are telecom terms or note "
+                    "boilerplate before using this class in a rule.")
+
+    covered = u["_label_keyword"].notna()
+    R.p(f"The rule block reaches a decision on {int(covered.sum()):,} of "
+        f"{len(u):,} labelled user messages ({100.0 * covered.mean():.1f}%). "
+        f"The rest contain none of the learned keywords - an honest abstention "
+        f"rather than a forced guess.")
+
+    both = u[covered]
+    if len(both):
+        agree = float((both["_label_existing"] == both["_label_keyword"]).mean())
+        kap = cohens_kappa(both["_label_existing"], both["_label_keyword"])
+        base = float(both["_label_existing"].value_counts(normalize=True).max())
+        K = pd.DataFrame([{"compared_messages": len(both),
+                           "raw_agreement_pct": round(100 * agree, 2),
+                           "majority_class_base_rate_pct": round(100 * base, 2),
+                           "cohens_kappa": kap,
+                           "reads_as": ("almost perfect" if (kap or 0) > .8 else
+                                        "substantial" if (kap or 0) > .6 else
+                                        "moderate" if (kap or 0) > .4 else
+                                        "fair" if (kap or 0) > .2 else "poor")}])
+        R.csv(K, "p6_02_agreement.csv")
+        R.h("Agreement between the two label sets", 3)
+        R.table(K)
+        R.note("Cohen's kappa corrects for the agreement two labellers would "
+               "reach by chance. Raw agreement always flatters an imbalanced "
+               "problem; kappa does not. Compare the raw figure against the "
+               "majority base rate in the same row.")
+
+        labs = sorted(set(both["_label_existing"]) | set(both["_label_keyword"]))
+        CM = (pd.crosstab(both["_label_existing"], both["_label_keyword"])
+              .reindex(index=labs, columns=labs, fill_value=0))
+        rn = CM.div(CM.sum(axis=1).replace(0, np.nan), axis=0).fillna(0)
+        R.fig(heat(rn.values, labs, labs,
+                   "Existing label (rows) vs keyword-derived label (columns)",
+                   "share of row", cmap="Greens"),
+              "The diagonal is agreement. Off-diagonal mass shows which intents "
+              "the two methods confuse.")
+        R.csv(CM.reset_index(), "p6_03_label_confusion.csv")
+
+        dis = both[both["_label_existing"] != both["_label_keyword"]].copy()
+        if len(dis):
+            dis = dis.sort_values("_confidence", ascending=False)
+            cols = [c for c in [C.get("case"), C.get("turn"), "_clean",
+                                "_label_existing", "_label_keyword",
+                                "_confidence"] if c]
+            R.csv(dis[cols].head(800),
+                  "p6_04_disagreements_for_sme_review.csv",
+                  free_text_cols=("_clean",))
+            R.h("Where the two label sets disagree, highest confidence first", 3)
+            R.table(dis[["_clean", "_label_existing", "_label_keyword",
+                         "_confidence"]].head(25), free_text_cols=("_clean",))
+            R.note("Sorted by confidence so the most clear-cut disagreements "
+                   "come first. This file is the highest-value SME task in the "
+                   "project: each row is a case where two independent methods "
+                   "reached different conclusions. The text column is the "
+                   "masked problem statement and has passed the output gate; "
+                   "the case and turn ids let an SME find the original record "
+                   "in the source system, which is where any identifier should "
+                   "be looked up.")
+
+        # ---- calibration, FIXED: needs at least three bins ------------------
+        b = both.copy()
+        b["_ok"] = (b["_label_existing"] == b["_label_keyword"])
+        try:
+            b["_bin"] = pd.qcut(b["_confidence"], 5, duplicates="drop")
+            cal = (b.groupby("_bin", observed=True)
+                   .agg(messages=("_ok", "size"),
+                        mean_confidence=("_confidence", "mean"),
+                        agreement=("_ok", "mean")).reset_index())
+            cal["_bin"] = cal["_bin"].astype(str)
+            R.csv(cal.round(4), "p6_05_confidence_calibration.csv")
+            fig, ax = plt.subplots(figsize=(7.5, 3.4))
+            ax.plot(cal["mean_confidence"], cal["agreement"], marker="o",
+                    color=PALETTE[1], label="observed")
+            ax.axhline(base, color="#a0aec0", linestyle=":", linewidth=1,
+                       label="majority base rate")
+            ax.plot([0, 1], [0, 1], "--", color="#cbd5e0", linewidth=1,
+                    label="perfect calibration")
+            ax.set_xlabel("confidence (margin between winner and runner-up)")
+            ax.set_ylabel("agreement with the existing label")
+            ax.legend(fontsize=7, frameon=False)
+            ax.set_title("Is the confidence score meaningful?", loc="left",
+                         fontweight="600")
+            R.fig(fig, "A rising line means confidence carries real "
+                       "information.")
+            if len(cal) < 3:
+                R.warn(f"The confidence score collapsed into {len(cal)} bin(s), "
+                       f"so this chart has too few points to say anything. In "
+                       f"v2 the monotonic check passed here trivially - a "
+                       f"single point is monotonic by definition - and the "
+                       f"report wrongly declared confidence a usable abstention "
+                       f"threshold. It is not usable until the margin spreads "
+                       f"out.")
+                finding("MEDIUM", "Confidence score is degenerate",
+                        f"qcut produced only {len(cal)} bin(s); the margin is "
+                        f"near-constant.",
+                        "Do not use confidence as an abstention threshold on "
+                        "this export.")
+            elif cal["agreement"].is_monotonic_increasing:
+                R.ok("Confidence is monotonically informative across "
+                     f"{len(cal)} bins: higher confidence really does mean "
+                     "higher agreement. This is a usable abstention threshold "
+                     "for production.")
+        except Exception:
+            pass
+
+    outcols = [c for c in [C.get("case"), C.get("turn"), "_clean",
+                           "_label_existing", "_label_keyword", "_confidence"]
+               if c]
+    R.csv(u[outcols], "p6_06_both_label_sets.csv", free_text_cols=("_clean",))
+
+
+# =============================================================================
+# PHASE 7  FINDINGS AND NEXT ACTIONS
+# =============================================================================
+
+def phase7(R):
+    log("\n=== PHASE 7  FINDINGS ===")
+    R.h("Phase 7 - Findings and recommended actions")
+    if not FINDINGS:
+        R.ok("No blocking issues detected in this run.")
+        return
+    F = pd.DataFrame(FINDINGS)
+    F["detail"] = F["detail"].astype(str)
+    order = {"HIGH": 0, "MEDIUM": 1, "INFO": 2}
+    F["_o"] = F["severity"].map(order).fillna(3)
+    F = F.sort_values("_o").drop(columns="_o")
+    R.csv(F, "p7_01_findings.csv")
+    R.table(F, max_rows=40)
+    R.note("Severity HIGH means a number from this run should not be reported "
+           "until the issue is resolved. MEDIUM means the analysis stands but "
+           "the interpretation is constrained. INFO is context.")
+
+
+# =============================================================================
+# MAIN
+# =============================================================================
 
 def main():
-    ap = argparse.ArgumentParser(description="Visual data profile for NORA")
+    global GUARD
+
+    ap = argparse.ArgumentParser(
+        description="NORA intent analysis v2.1 - PII-hardened")
     ap.add_argument("--input", required=True)
-    ap.add_argument("--out", default="nora_data_profile.html")
+    ap.add_argument("--outdir", default="nora_out_v2_1")
     ap.add_argument("--salt-file", default="nora_salt.txt")
+    ap.add_argument("--max-k", type=int, default=30)
     ap.add_argument("--sample", type=int, default=0)
-    ap.add_argument("--max-categories", type=int, default=30)
+    ap.add_argument("--chunksize", type=int, default=200000)
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--no-free-text", action="store_true",
+                    help="Strip every free-text column from every output. Use "
+                         "this for anything leaving the team.")
     args = ap.parse_args()
 
-    log(f"reading {args.input} ...")
-    df = pd.read_csv(args.input, low_memory=False, dtype=str, keep_default_na=False,
-                     na_values=["", "NA", "NaN", "null", "None"])
-    n_full = len(df)
+    log("=" * 74)
+    log("NORA INTENT ANALYSIS  v2.1   (PII-hardened)")
+    log("=" * 74)
+    log(f"reading {args.input}")
+
+    reader = pd.read_csv(args.input, low_memory=False, dtype=str,
+                         keep_default_na=False,
+                         na_values=["", "NA", "NaN", "null", "None", "nan"],
+                         chunksize=args.chunksize)
+    df = pd.concat([c for c in reader], ignore_index=True)
+    log(f"  {len(df):,} rows x {len(df.columns)} columns")
     if args.sample and args.sample < len(df):
         df = df.sample(args.sample, random_state=args.seed).reset_index(drop=True)
-    log(f"  {n_full:,} rows x {len(df.columns)} columns"
-        f"{f' (sampled to {len(df):,})' if len(df) < n_full else ''}")
+        log(f"  sampled to {len(df):,}")
 
-    roles = discover_roles(df.columns)
-    salt = load_or_create_salt(args.salt_file)
+    C = discover_columns(df)
+    log("  discovered columns:")
+    for k, v in C.items():
+        log(f"    {k:<12} -> {v}")
+    if not C.get("text"):
+        raise SystemExit("BLOCKED: no message-content column found. Check the "
+                         "header row of the CSV.")
 
-    # name gazetteer, so masked samples do not leak names from free text
-    gaz = []
-    ncol = roles.get("customer_name")
-    if ncol and ncol in df.columns:
-        for full in df[ncol].dropna().astype(str).unique()[:20000]:
-            gaz += [p.lower() for p in str(full).split() if len(p) >= 3 and p.isalpha()]
-        gaz = list(dict.fromkeys(gaz))
-    masker = Masker(salt, gaz)
+    salt = load_salt(args.salt_file)
+    GUARD = Guard(salt, allow_free_text=not args.no_free_text)
+    prov("free_text_in_outputs", not args.no_free_text, "SAFETY",
+         "when False, every free-text column is dropped from every output")
 
-    R = Report("NORA Intent Export — Visual Data Profile")
-    R.p(f"Source: {os.path.basename(args.input)} — {n_full:,} rows × "
-        f"{len(df.columns)} columns."
-        + (f" Charts drawn from a random sample of {len(df):,} rows."
-           if len(df) < n_full else ""))
-    R.note("Read this before choosing any modelling approach. Nothing here is "
-           "configured: the label names, category lists, bin edges and axis "
-           "ranges are all read from the file itself.")
+    df["_raw"] = (df[C["text"]].fillna("").astype(str)
+                  .str.replace(r"\\r", " ", regex=True)
+                  .str.replace(r"\\n", "\n", regex=True))
 
-    # ---------------- V1 inventory
-    R.h("V1 · Column inventory")
-    inv = []
-    inv_rev = {v: k for k, v in roles.items()}
-    for c in df.columns:
-        s = df[c].dropna().astype(str)
-        s = s[s.str.strip() != ""]
-        inv.append({
-            "column": c, "discovered_role": inv_rev.get(c, ""),
-            "fill_%": round(100.0 * len(s) / len(df), 1),
-            "distinct": int(s.nunique()),
-            "uniqueness": round(s.nunique() / max(len(s), 1), 3),
-            "median_len": int(s.str.len().median()) if len(s) else 0,
-            "max_len": int(s.str.len().max()) if len(s) else 0,
-        })
-    inv = pd.DataFrame(inv)
-    R.table(inv.sort_values("fill_%"), max_rows=60)
-    R.note(f"{len(inv[inv['discovered_role'] != ''])} of {len(inv)} columns "
-           f"resolved to a known role. Check this table first: if a column "
-           f"mapped to the wrong role, every chart below inherits the error.")
+    # Build the name lexicon BEFORE anything is written anywhere.
+    log("\n  building the name lexicon from the whole corpus")
+    GUARD.build_name_lexicon(df["_raw"].tolist())
 
-    # ---------------- V2 missingness
-    R.h("V2 · Missingness")
-    B = pd.DataFrame({c: is_blank(df[c]) for c in df.columns})
-    rate = (B.mean() * 100).sort_values(ascending=False)
-    live = rate[(rate > 0) & (rate < 100)]
-    R.fig(barh(rate.index.tolist(), rate.values, "% blank",
-               "Blank rate by column"),
-          "Derived from the data: a value counts as blank if it is empty, or "
-          "one of the null-like strings actually present in this file.")
-    dead = rate[rate >= 100]
-    if len(dead):
-        R.warn(f"{len(dead)} column(s) are 100% blank and carry no information: "
-               f"{', '.join(list(dead.index)[:10])}")
-    if len(live):
-        R.p(f"{len(live)} columns are partially populated. Partial fill is the "
-            f"interesting case: it may be a broken pipeline, or it may be a "
-            f"genuine signal about which situations produce which fields.")
+    df["_masked"] = df["_raw"].str.replace(r"\s+", " ", regex=True).str.strip() \
+                              .map(GUARD.mask_text)
+    df["_role"] = (df[C["role"]].fillna("unknown").astype(str).str.strip().str.lower()
+                   if C.get("role") else "unknown")
+    df["_turn"] = (pd.to_numeric(df[C["turn"]], errors="coerce")
+                   if C.get("turn") else np.arange(len(df)))
 
-    # ---------------- V3 co-missingness
-    if len(live) >= 2:
-        R.h("V3 · Co-missingness")
-        cols = list(live.index)[:24]
-        M = np.zeros((len(cols), len(cols)))
-        for i, a in enumerate(cols):
-            for j, b in enumerate(cols):
-                inter = (B[a] & B[b]).sum()
-                union = (B[a] | B[b]).sum()
-                M[i, j] = inter / union if union else np.nan
-        R.fig(heat(M, cols, cols, "Jaccard similarity of blankness",
-                   "Jaccard", cmap="Purples"),
-              "Blocks of high similarity are fields that go blank together, "
-              "i.e. one upstream condition switches them all off at once.")
+    # The source content column and _raw never reach an output.
+    FORBIDDEN_OUTPUT_COLS.add(C["text"])
+    if C.get("cid"):
+        FORBIDDEN_OUTPUT_COLS.add(C["cid"])
 
-    # ---------------- V4 cardinality
-    R.h("V4 · Cardinality vs fill")
-    fig, ax = plt.subplots(figsize=(8.5, 5.2))
-    ax.scatter(inv["fill_%"], inv["distinct"].clip(lower=1), s=42,
-               c=PALETTE[0], alpha=0.75, edgecolors="white", linewidths=0.6)
-    ax.set_yscale("log")
-    ax.set_xlabel("fill %")
-    ax.set_ylabel("distinct values (log)")
-    ax.set_title("Column shape", loc="left", fontweight="600")
-    for _, r in inv.nlargest(6, "distinct").iterrows():
-        ax.annotate(str(r["column"])[:26], (r["fill_%"], max(r["distinct"], 1)),
-                    fontsize=7, alpha=0.85, xytext=(4, 3),
-                    textcoords="offset points")
-    R.fig(fig, "Top right = identifiers or free text. Bottom right = "
-               "categoricals. Bottom left = mostly-empty fields.")
+    R = Report(args.outdir, "NORA Intent Analysis - v2.1 (PII-hardened)")
+    R.p(f"Source: {os.path.basename(args.input)} - {len(df):,} rows, "
+        f"{len(df.columns)} columns.")
+    R.note("X is the customer's problem statement extracted from user "
+           "messages. y_turn is the per-message label; y_global is the "
+           "conversation label. Assistant messages are excluded from X because "
+           "they contain NORA's answer.")
+    R.note("PRIVACY: every string in this report passed through a fail-closed "
+           "gate. Identifier form fields (name, BAN, IMEI, ICCID, EID, MSISDN, "
+           "callback number, email, address) are DROPPED, not masked. Customer "
+           "names harvested from anywhere in the corpus are redacted "
+           "everywhere and excluded from every vocabulary. The raw message "
+           "column and the conversation id are excluded from all outputs by "
+           "name. Any cell that still matched an identifier pattern after "
+           "masking was blanked entirely rather than shown.")
 
-    # ---------------- V5 labels
-    intent = roles.get("intent")
-    if intent:
-        R.h("V5 · Label distribution")
-        vc = df[intent].fillna("__NULL__").value_counts()
-        fig, axes = plt.subplots(1, 2, figsize=(12, 3.6))
-        axes[0].bar(range(len(vc)), vc.values, color=PALETTE[0])
-        axes[0].set_xticks(range(len(vc)))
-        axes[0].set_xticklabels([str(x)[:16] for x in vc.index],
-                                rotation=25, ha="right")
-        axes[0].set_ylabel("rows")
-        axes[0].set_title("linear scale", loc="left", fontsize=10)
-        axes[1].bar(range(len(vc)), vc.values, color=PALETTE[1])
-        axes[1].set_yscale("log")
-        axes[1].set_xticks(range(len(vc)))
-        axes[1].set_xticklabels([str(x)[:16] for x in vc.index],
-                                rotation=25, ha="right")
-        axes[1].set_title("log scale — reveals the rare classes", loc="left",
-                          fontsize=10)
-        fig.suptitle("Class distribution", x=0.09, ha="left", fontweight="600")
-        R.fig(fig)
-        share = (100.0 * vc / vc.sum()).round(2)
-        R.table(pd.DataFrame({"label": vc.index, "rows": vc.values,
-                              "share_%": share.values}))
-        if share.iloc[0] > 60:
-            R.warn(f"'{vc.index[0]}' accounts for {share.iloc[0]:.1f}% of rows. "
-                   f"A model predicting only this label would score that as "
-                   f"accuracy while learning nothing. Macro-F1, not accuracy.")
-        if vc.min() < 500:
-            R.warn(f"Smallest class '{vc.index[-1]}' has {vc.min():,} rows. "
-                   f"Check whether it can support a train/val/test split at all.")
-        dupct = vc.value_counts()
-        tied = dupct[dupct > 1]
-        if len(tied):
-            for cnt in tied.index:
-                names = list(vc[vc == cnt].index)
-                R.warn(f"Classes {names} have identical counts ({cnt:,}). "
-                       f"Exact ties across independent semantic classes are "
-                       f"very unlikely by chance — inspect the rule that "
-                       f"produced them.")
+    df = phase1(df, C, R)
+    user, fields, payload = phase2(df, C, R)
 
-        conf = roles.get("confidence")
-        if conf:
-            R.h("Confidence behaviour", 3)
-            c = pd.to_numeric(df[conf], errors="coerce")
-            g = pd.DataFrame({"lab": df[intent], "c": c}).dropna()
-            grp = g.groupby("lab")["c"]
-            nuniq = grp.nunique()
-            fig, ax = plt.subplots(figsize=(8.5, 3.6))
-            labs = list(grp.groups.keys())
-            ax.scatter([str(l)[:16] for l in labs], grp.mean().reindex(labs).values,
-                       s=90, c=PALETTE[2], zorder=3, label="mean")
-            ax.errorbar([str(l)[:16] for l in labs],
-                        grp.mean().reindex(labs).values,
-                        yerr=grp.std().reindex(labs).fillna(0).values,
-                        fmt="none", ecolor="#a0aec0", capsize=4, zorder=2)
-            ax.set_ylabel("confidence")
-            ax.set_title("Confidence per class (error bar = std dev)",
-                         loc="left", fontweight="600")
-            plt.setp(ax.get_xticklabels(), rotation=25, ha="right")
-            R.fig(fig)
-            if (nuniq <= 1).all():
-                R.warn("Every class has exactly one confidence value. This is a "
-                       "lookup table, not a probability. It carries no row-level "
-                       "information and cannot be used for thresholding, active "
-                       "learning, or calibration.")
+    stopwords, field_words, over = build_stopwords(
+        user["_clean"], fields, GUARD.name_lexicon)
+    R.h("Vocabulary control", 3)
+    R.csv(pd.DataFrame({"excluded_token": sorted(
+        t for t in stopwords if t not in GUARD.name_lexicon)}),
+        "p2_06_stopwords_used.csv")
+    R.p(f"{len(stopwords):,} tokens excluded from keyword learning: generic "
+        f"English function words, {len(field_words)} words that appear as "
+        f"intake-form field labels in this corpus, {len(over)} tokens above "
+        f"the derived frequency ceiling, and "
+        f"{len(GUARD.name_lexicon)} harvested name tokens.")
+    R.note("The exported stopword list deliberately omits the name tokens. "
+           "Publishing the list of names we are blocking would defeat the "
+           "point of blocking them.")
 
-    # ---------------- V6 text length
-    ut = roles.get("user_text")
-    if ut:
-        R.h("V6 · Text length")
-        t = df[ut].fillna("").astype(str)
-        L = t.str.len()
-        fig, axes = plt.subplots(1, 2, figsize=(12, 3.6))
-        pos = L[L > 0]
-        axes[0].hist(pos, bins=60, color=PALETTE[0])
-        axes[0].set_xlabel("characters")
-        axes[0].set_ylabel("rows")
-        axes[0].set_title("length distribution", loc="left", fontsize=10)
-        if len(pos):
-            axes[1].hist(np.log10(pos + 1), bins=60, color=PALETTE[3])
-            axes[1].set_xlabel("log10(characters)")
-            axes[1].set_title("log scale — reveals multiple populations",
-                              loc="left", fontsize=10)
-        R.fig(fig, "Multiple humps mean multiple kinds of row are mixed "
-                   "together — for example short customer utterances alongside "
-                   "long machine-generated diagnostic dumps.")
-        R.table(pd.DataFrame([{
-            "empty_rows": int((L == 0).sum()),
-            "empty_%": round(100.0 * (L == 0).mean(), 2),
-            "p05": int(L.quantile(.05)), "median": int(L.median()),
-            "p95": int(L.quantile(.95)), "max": int(L.max())}]))
-        if intent:
-            byl = pd.DataFrame({"lab": df[intent].astype(str), "len": L})
-            order = byl.groupby("lab")["len"].median().sort_values().index
-            fig, ax = plt.subplots(figsize=(9, 3.8))
-            ax.boxplot([byl.loc[byl["lab"] == l, "len"].values for l in order],
-                       tick_labels=[str(l)[:16] for l in order], showfliers=False,
-                       patch_artist=True,
-                       boxprops=dict(facecolor="#bee3f8", edgecolor="#2b6cb0"),
-                       medianprops=dict(color="#c05621", linewidth=2))
-            ax.set_ylabel("characters")
-            ax.set_title("Text length by label", loc="left", fontweight="600")
-            plt.setp(ax.get_xticklabels(), rotation=25, ha="right")
-            R.fig(fig, "If length alone separates the classes, the labeller may "
-                       "be keying on document type rather than on meaning.")
+    Xs, Xd, vec = phase3(user, C, R, stopwords, args.seed)
+    user = phase4(user, C, R, stopwords, args.max_k, args.seed)
+    phase5(user, C, R)
+    phase6(user, C, R, stopwords, field_words, args.seed)
+    phase7(R)
 
-    # ---------------- V7 temporal
-    ts = roles.get("cosmos_ts")
-    if ts:
-        R.h("V7 · Volume over time")
-        v = pd.to_numeric(df[ts], errors="coerce")
-        best, unit, score = None, None, -1
-        for nm, div in [("s", 1), ("ms", 1e3), ("us", 1e6)]:
-            dt = pd.to_datetime(v / div, unit="s", errors="coerce", utc=True)
-            sc = float(dt.dt.year.between(2020, 2030).mean(skipna=True) or 0)
-            if sc > score:
-                best, unit, score = dt, nm, sc
-        if score >= 0.5:
-            R.p(f"Epoch unit auto-detected as {unit} "
-                f"({100 * score:.1f}% of values land in a plausible window). "
-                f"Range: {best.min()} to {best.max()}.")
-            daily = best.dt.date.value_counts().sort_index()
-            fig, ax = plt.subplots(figsize=(11, 3.4))
-            ax.plot(daily.index, daily.values, color=PALETTE[0], linewidth=1.3)
-            ax.fill_between(daily.index, daily.values, alpha=0.18,
-                            color=PALETTE[0])
-            ax.set_ylabel("rows per day")
-            ax.set_title("Ingest volume on the real event clock", loc="left",
-                         fontweight="600")
-            fig.autofmt_xdate()
-            R.fig(fig, "Gaps and step changes here indicate pipeline outages or "
-                       "instrumentation changes, and both break a temporal split.")
-        else:
-            R.warn(f"Could not resolve {ts} to a plausible timestamp under any "
-                   f"epoch unit. A temporal train/test split is not currently "
-                   f"possible; fix this before relying on holdout results.")
-        va = roles.get("validated_at")
-        if va and df[va].dropna().nunique() <= 2:
-            R.warn(f"'{va}' has {df[va].dropna().nunique()} distinct value(s) "
-                   f"across the whole file. That is batch-run time, not event "
-                   f"time. Never split on it.")
+    # ---- privacy gate report ----------------------------------------------
+    R.h("Privacy gate", 2)
+    GR = GUARD.gate_report()
+    R.csv(GR, "privacy_gate_report.csv")
+    R.table(GR)
+    R.p(f"{GUARD.cells_checked:,} text cells were checked on their way to an "
+        f"output. {GUARD.gate_blocks:,} were blanked because something "
+        f"identifier-shaped survived masking.")
+    prov("output_cells_checked", GUARD.cells_checked, "SAFETY",
+         "text cells passed through the fail-closed gate")
+    prov("output_cells_blanked", GUARD.gate_blocks, "SAFETY",
+         "cells replaced with [REDACTED] rather than shipped")
+    if GUARD.gate_blocks:
+        R.note("Blanked cells are not a failure - they are the control "
+               "working. Each one is a cell the masker did not fully clean and "
+               "the gate refused to publish. If the count is large, extend "
+               "PII_PATTERNS so more content survives review intact.")
+    else:
+        R.ok("No cell needed blanking: masking handled every string that "
+             "reached an output.")
 
-    # ---------------- V8 grain
-    conv = roles.get("conversation_id")
-    if conv:
-        R.h("V8 · Grain — what is one row?")
-        vc = df[conv].fillna("__BLANK__").value_counts()
-        dist = vc.value_counts().sort_index()
-        fig, ax = plt.subplots(figsize=(8.5, 3.4))
-        ax.bar(dist.index.astype(str), dist.values, color=PALETTE[2])
-        ax.set_xlabel("rows sharing one conversation id")
-        ax.set_ylabel("conversations")
-        ax.set_yscale("log")
-        ax.set_title("Rows per conversation", loc="left", fontweight="600")
-        R.fig(fig)
-        multi = int((vc > 1).sum())
-        R.p(f"{len(vc):,} distinct conversation ids across {len(df):,} rows. "
-            f"{multi:,} conversations contain more than one row "
-            f"(mean {vc.mean():.2f}, max {vc.max():,}).")
-        if multi:
-            R.warn("Because conversations span multiple rows, a random "
-                   "row-level train/test split would place related rows on both "
-                   "sides and inflate every score. Splits must be grouped.")
+    PR = pd.DataFrame(PROVENANCE)
+    R.csv(PR, "provenance_register.csv")
+    R.h("Provenance of every constant used", 2)
+    R.table(PR, max_rows=60)
+    R.note("DERIVED means computed from this dataset at runtime. DOMAIN_FACT "
+           "means a fact about telecoms or an external contract, not an "
+           "assumption about the data. REVIEW_GATE means a convention that "
+           "only decides what gets flagged for a human. SAFETY means a privacy "
+           "control: it may blank an output but never changes a computed "
+           "number.")
 
-    # ---------------- V9 repetition
-    if ut:
-        R.h("V9 · Repetition")
-        t = df[ut].fillna("").astype(str).str.strip()
-        vc = t.value_counts()
-        cum = (vc.cumsum() / vc.sum() * 100)
-        fig, ax = plt.subplots(figsize=(8.5, 3.6))
-        ax.plot(range(1, min(len(cum), 3000) + 1), cum.values[:3000],
-                color=PALETTE[1], linewidth=1.6)
-        ax.set_xlabel("distinct texts, ranked by frequency")
-        ax.set_ylabel("cumulative % of corpus")
-        ax.set_xscale("log")
-        ax.set_title("How concentrated is the corpus?", loc="left",
-                     fontweight="600")
-        R.fig(fig, "A curve that rises steeply means a handful of templated "
-                   "strings make up most of the data.")
-        dup = t.duplicated(keep=False)
-        R.p(f"{int(dup.sum()):,} rows ({100 * dup.mean():.1f}%) share their text "
-            f"with at least one other row. {t.nunique():,} distinct texts.")
-        top = vc.head(10).reset_index()
-        top.columns = ["text", "rows"]
-        top["% of corpus"] = (100.0 * top["rows"] / len(t)).round(2)
-        top["text"] = top["text"].map(lambda x: masker.mask_text(str(x))[:180])
-        R.h("Most repeated texts (PII-masked)", 3)
-        R.table(top)
+    html = os.path.join(args.outdir, "nora_report_v2_1.html")
+    R.save(html)
 
-    # ---------------- V10 intent x subcategory
-    sc = roles.get("subcategory")
-    if intent and sc:
-        R.h("V10 · Intent vs telecom subcategory")
-        a = cap_categories(df[sc], args.max_categories)
-        b = df[intent].fillna("__NULL__").astype(str)
-        ct = pd.crosstab(a, b)
-        ct = ct.loc[ct.sum(axis=1).sort_values(ascending=False).index]
-        rownorm = ct.div(ct.sum(axis=1).replace(0, np.nan), axis=0).fillna(0)
-        R.fig(heat(rownorm.values, list(ct.columns), list(ct.index),
-                   "Row-normalised: share of each subcategory by intent",
-                   "share of row", cmap="YlGnBu"))
-        R.note("This is the most valuable panel in the report. The subcategory "
-               "column is an independent label axis that did not come from the "
-               "rules engine. If intent and subcategory were unrelated, every "
-               "row here would look identical. Where they differ, there is real "
-               "structure to learn.")
-        R.table(ct.reset_index())
+    # The manifest lists column NAMES and settings only. No values, no samples.
+    json.dump({"input": os.path.basename(args.input),
+               "rows": int(len(df)),
+               "columns": list(df.columns),
+               "roles": C,
+               "template_fields": fields,
+               "payload_field": payload,
+               "free_text_in_outputs": not args.no_free_text,
+               "name_lexicon_size": len(GUARD.name_lexicon),
+               "output_cells_checked": GUARD.cells_checked,
+               "output_cells_blanked": GUARD.gate_blocks,
+               "findings": [{k: str(v) for k, v in f.items()} for f in FINDINGS],
+               "provenance": PROVENANCE},
+              open(os.path.join(args.outdir, "run_manifest.json"), "w"), indent=2)
 
-    # ---------------- V11 categorical association
-    cat_roles = ["subdomain", "domain", "record_producer", "rca_complete",
-                 "ticket_stage", "category", "subcategory", "rule_id",
-                 "validator", "intent"]
-    cats = [roles[r] for r in cat_roles if roles.get(r) and roles[r] in df.columns]
-    cats = [c for c in cats if 1 < df[c].fillna("__B__").nunique() <= 500]
-    if len(cats) >= 2:
-        R.h("V11 · Association between categorical columns")
-        S = {c: cap_categories(df[c], 60) for c in cats}
-        M = np.full((len(cats), len(cats)), np.nan)
-        for i, a in enumerate(cats):
-            for j, b in enumerate(cats):
-                M[i, j] = 1.0 if i == j else cramers_v(S[a], S[b])
-        R.fig(heat(M, cats, cats, "Cramér's V (bias-corrected)", "V",
-                   cmap="Oranges"))
-        R.note("Cramér's V runs 0 to 1. A value near 1 between the label and "
-               "any other column means that column effectively IS the label — "
-               "which is leakage, not a useful feature.")
-
-    # ---------------- V12/V13 numeric structure
-    R.h("V12 · Derived numeric structure")
-    num = pd.DataFrame(index=df.index)
-    if ut:
-        t = df[ut].fillna("").astype(str)
-        num["text_chars"] = t.str.len()
-        num["text_words"] = t.str.split().str.len().fillna(0)
-        num["digit_ratio"] = (t.str.count(r"\d") /
-                              t.str.len().replace(0, np.nan)).fillna(0)
-        num["punct_ratio"] = (t.str.count(r"[^\w\s]") /
-                              t.str.len().replace(0, np.nan)).fillna(0)
-        num["upper_ratio"] = (t.str.count(r"[A-Z]") /
-                              t.str.len().replace(0, np.nan)).fillna(0)
-        num["question_marks"] = t.str.count(r"\?")
-    for r in ["latitude", "longitude"]:
-        c = roles.get(r)
-        if c:
-            v = pd.to_numeric(df[c], errors="coerce")
-            if v.notna().sum() > 10:
-                num[r] = v.fillna(v.median())
-    for c in df.columns:
-        if c in num.columns:
-            continue
-        v = pd.to_numeric(df[c], errors="coerce")
-        if v.notna().mean() > 0.7 and v.nunique() > 10 and c != roles.get("cosmos_ts"):
-            num[f"num_{c[:28]}"] = v.fillna(v.median())
-    num = num.replace([np.inf, -np.inf], np.nan).fillna(0)
-    num = num.loc[:, num.std() > 0]
-
-    if num.shape[1] >= 2:
-        C = num.corr()
-        R.fig(heat(C.values, list(C.columns), list(C.index),
-                   "Pearson correlation between derived numeric features",
-                   "r", cmap="RdBu_r", fmt="{:.2f}"))
-        R.note("These features are computed here on the fly from the text; they "
-               "are not assumed to exist in the file. Pairs near |r| = 1 are "
-               "redundant and only one should survive into a linear model.")
-
-    if num.shape[1] >= 3 and len(num) >= 20:
-        from sklearn.preprocessing import StandardScaler
-        from sklearn.decomposition import PCA
-        R.h("V13 · PCA")
-        Z = StandardScaler().fit_transform(num.values)
-        k = int(min(10, Z.shape[1]))
-        pca = PCA(n_components=k, random_state=args.seed)
-        P = pca.fit_transform(Z)
-        ev = pca.explained_variance_ratio_
-        fig, axes = plt.subplots(1, 2, figsize=(12, 3.8))
-        axes[0].bar(range(1, k + 1), ev, color=PALETTE[0])
-        axes[0].plot(range(1, k + 1), np.cumsum(ev), color=PALETTE[1],
-                     marker="o", markersize=4)
-        axes[0].axhline(0.9, color="#a0aec0", linestyle="--", linewidth=1)
-        axes[0].set_xlabel("component")
-        axes[0].set_ylabel("explained variance")
-        axes[0].set_title("scree (dashed = 90%)", loc="left", fontsize=10)
-        colour_col = sc if sc else intent
-        if colour_col:
-            lab = cap_categories(df[colour_col], 8)
-            for i, u in enumerate(lab.value_counts().head(8).index):
-                m = (lab == u).values
-                axes[1].scatter(P[m, 0], P[m, 1], s=9, alpha=0.5,
-                                color=PALETTE[i % len(PALETTE)],
-                                label=str(u)[:20])
-            axes[1].legend(fontsize=6.5, markerscale=1.6, loc="best",
-                           frameon=False)
-        else:
-            axes[1].scatter(P[:, 0], P[:, 1], s=9, alpha=0.5, color=PALETTE[0])
-        axes[1].set_xlabel("PC1")
-        axes[1].set_ylabel("PC2")
-        axes[1].set_title(f"projection coloured by {colour_col}", loc="left",
-                          fontsize=10)
-        R.fig(fig, "If the colours overlap completely, these surface features "
-                   "carry no class information and the signal must come from "
-                   "the text content itself.")
-        n90 = int((np.cumsum(ev) < 0.9).sum()) + 1
-        R.p(f"{int((pca.explained_variance_ > 1).sum())} components have "
-            f"eigenvalue > 1 (Kaiser); {n90} are needed to reach 90% of "
-            f"variance across {num.shape[1]} derived features.")
-
-    R.write(args.out)
-    log(f"\nwrote {os.path.abspath(args.out)}")
-    log("Open it in a browser. It is one self-contained file, safe to forward.")
+    log("\n" + "=" * 74)
+    log("DONE")
+    log("=" * 74)
+    for f in sorted(FINDINGS,
+                    key=lambda x: {"HIGH": 0, "MEDIUM": 1}.get(x["severity"], 2)):
+        log(f"  [{f['severity']}] {f['finding']}")
+    log(f"\n  report : {os.path.abspath(html)}")
+    log(f"  tables : {os.path.abspath(args.outdir)}")
+    log(f"  salt   : {os.path.abspath(args.salt_file)}   (keep out of OneDrive)")
+    log(f"  privacy: {GUARD.cells_checked:,} cells gated, "
+        f"{GUARD.gate_blocks:,} blanked, "
+        f"{len(GUARD.name_lexicon):,} names blocked corpus-wide")
     return 0
 
 

@@ -1,0 +1,3173 @@
+#!/usr/bin/env python3
+"""
+NORA offline ML/NLP intent analysis.
+
+The pipeline keeps the held-out test partition isolated from feature fitting,
+topic discovery, entity-candidate discovery and assistant-finding discovery.
+
+Outputs:
+- one JSON dictionary containing the complete analysis
+- CSV review tables for each phase
+- PNG charts for review/presentation
+
+The implementation uses only local corpus-derived representations. UMAP and
+HDBSCAN are used when already installed; otherwise clustering falls back to
+KMeans without downloading anything.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import re
+import sys
+import warnings
+from collections import defaultdict
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+
+from sklearn.cluster import KMeans
+from sklearn.decomposition import TruncatedSVD
+from sklearn.feature_extraction.text import CountVectorizer, TfidfVectorizer
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import (
+    accuracy_score,
+    adjusted_rand_score,
+    balanced_accuracy_score,
+    classification_report,
+    confusion_matrix,
+    f1_score,
+    normalized_mutual_info_score,
+    silhouette_score,
+)
+from sklearn.model_selection import GroupKFold, StratifiedShuffleSplit
+from sklearn.pipeline import FeatureUnion
+from sklearn.preprocessing import LabelEncoder, Normalizer
+
+try:
+    from sklearn.model_selection import StratifiedGroupKFold
+except ImportError:
+    StratifiedGroupKFold = None
+
+
+DEFAULT_SEED = 42
+
+# Privacy controls. These patterns are not used as predictive/model features.
+IDENTIFIER_FIELD_PATTERNS: Sequence[Tuple[str, str]] = (
+    ("name", r"^(?:(?:customer|contact|account|subscriber|caller|first|last|full)_?)?name$"),
+    ("email", r"^(?:e_?mail|email_?address)$"),
+    ("phone", r"^(?:phone|phone_?number|mobile_?number|contact_?number|msisdn|"
+              r"call_?back(?:_?number)?|callback(?:_?number)?|number_?with_?issue)$"),
+    ("imei", r"^imei(?:_?number)?$"),
+    ("iccid", r"^(?:iccid|sim_?serial(?:_?number)?)$"),
+    ("eid", r"^(?:eid|euicc(?:_?id)?)$"),
+    ("ban", r"^(?:ban|billing_?account(?:_?number)?|account_?number|acct_?number)$"),
+    ("address", r"^(?:address|street(?:_?address)?|zip|zip_?code|postal(?:_?code)?)$"),
+    ("reference", r"^(?:cid|uuid|guid|ticket(?:_?number)?|case_?number|order_?number)$"),
+)
+
+FIELD_LINE_RE = re.compile(
+    r"(?m)^[ \t\-\*#>]*(?P<key>[A-Za-z][A-Za-z0-9 _\-/#\.]{1,60}?)"
+    r"\s*:\s*(?P<value>.*)$"
+)
+
+NAME_CUE_RE = re.compile(
+    r"(?i)\b(?:customer\s*name|customername|contact\s*name|account\s*name|"
+    r"caller|cust\s*name|first\s*name|last\s*name|full\s*name)\s*[:\-]\s*"
+    r"(?P<value>[A-Za-z][A-Za-z'\-]{1,24}"
+    r"(?:\s+[A-Za-z][A-Za-z'\-]{1,24}){0,4})"
+)
+
+PII_PATTERNS: Sequence[Tuple[str, re.Pattern]] = (
+    ("url", re.compile(r"https?://\S+", re.I)),
+    ("email", re.compile(r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b")),
+    ("ipv4", re.compile(
+        r"\b(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}"
+        r"(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\b"
+    )),
+    ("uuid", re.compile(
+        r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+        r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"
+    )),
+    ("eid", re.compile(r"\b[0-9a-fA-F]{32}\b")),
+    ("iccid", re.compile(r"\b89\d{17,20}\b")),
+    ("imei", re.compile(r"\b\d{14,17}\b")),
+    ("phone", re.compile(
+        r"(?<!\d)(?:\+?\d{1,3}[\s\-.]?)?\(?\d{3}\)?[\s\-.]?"
+        r"\d{3}[\s\-.]?\d{4}(?!\d)"
+    )),
+    ("long_number", re.compile(r"(?<!\d)\d{7,}(?!\d)")),
+    ("latlon", re.compile(r"(?<![\w.])-?\d{1,3}\.\d{4,}(?![\w.])")),
+)
+
+ADDRESS_RE = re.compile(
+    r"\b\d{1,6}\s+(?:[A-Za-z0-9.'\-]+\s+){0,5}"
+    r"(?:st|street|rd|road|ave|avenue|blvd|boulevard|ln|lane|dr|drive|"
+    r"ct|court|way|pl|place|ter|terrace|pkwy|parkway|hwy|highway|"
+    r"cir|circle|apt|suite|ste|unit)\b\.?",
+    re.I,
+)
+
+SENTENCE_RE = re.compile(r"(?<=[.!?;])\s+|\n+")
+
+# These markers are used only to exploit explicit assistant response structure.
+# They do not classify free text semantically.
+SECTION_MARKER_RE = re.compile(
+    r"(?i)\b(?P<header>"
+    r"root\s*cause(?:\s*analysis)?|"
+    r"probable\s*cause|"
+    r"likely\s*cause|"
+    r"recommendations?|"
+    r"remediation|"
+    r"resolution|"
+    r"next\s*steps?|"
+    r"diagnostic(?:\s*checks?)?|"
+    r"limitations?"
+    r")\s*[:\-]\s*"
+)
+
+REDACT = "[redacted]"
+
+
+@dataclass(frozen=True)
+class RunConfig:
+    input_path: str
+    output_json: str
+    seed: int
+    sample_rows: int
+    test_size: float
+    cv_splits: int
+    word_max_features: int
+    char_max_features: int
+    topic_svd_components: int
+    topic_min_cluster_size: int
+    topic_umap_neighbors: int
+    topic_max_k: int
+    entity_max_features: int
+    entity_top_phrases: int
+    entity_max_values_per_cluster: int
+    entity_min_cluster_size: int
+    entity_max_k: int
+    assistant_svd_components: int
+    assistant_min_cluster_size: int
+    assistant_max_k: int
+    max_sentences_per_message: int
+    skip_assistant: bool
+
+
+@dataclass
+class LatentRepresentation:
+    vectorizer: FeatureUnion
+    svd: TruncatedSVD
+    normalizer: Normalizer
+
+    def transform(self, texts: Sequence[str]) -> np.ndarray:
+        sparse = self.vectorizer.transform(list(texts))
+        dense = self.svd.transform(sparse)
+        dense = self.normalizer.transform(dense)
+        return np.asarray(dense, dtype=np.float32)
+
+
+@dataclass
+class ClusterModel:
+    method: str
+    reducer: Any
+    clusterer: Any
+    centroids: Dict[int, np.ndarray]
+    silhouette: Optional[float]
+    parameters: Dict[str, Any]
+
+
+def log(message: str = "") -> None:
+    print(message, flush=True)
+
+
+def pct(numerator: int, denominator: int) -> float:
+    return round(100.0 * numerator / denominator, 2) if denominator else 0.0
+
+
+def to_plain(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return {str(key): to_plain(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [to_plain(item) for item in value]
+    if isinstance(value, np.integer):
+        return int(value)
+    if isinstance(value, np.floating):
+        return None if np.isnan(value) else float(value)
+    if isinstance(value, np.ndarray):
+        return [to_plain(item) for item in value.tolist()]
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    return value
+
+
+# ---------------------------------------------------------------------------
+# Schema and raw frame
+# ---------------------------------------------------------------------------
+
+def normalise_key(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", str(value).strip().lower()).strip("_")
+
+
+def is_identifier_key(key: str) -> bool:
+    normalised = normalise_key(key)
+    return any(
+        re.search(pattern, normalised)
+        for _, pattern in IDENTIFIER_FIELD_PATTERNS
+    )
+
+
+def find_column(
+    columns: Sequence[str],
+    patterns: Sequence[str],
+    exclude: Sequence[str] = (),
+) -> Optional[str]:
+    for pattern in patterns:
+        for column in columns:
+            name = normalise_key(column)
+            if any(re.search(item, name) for item in exclude):
+                continue
+            if re.search(pattern, name):
+                return column
+    return None
+
+
+def discover_schema(df: pd.DataFrame) -> Dict[str, Optional[str]]:
+    columns = list(df.columns)
+    return {
+        "case": find_column(
+            columns,
+            [r"^source_row$", r"source.*row", r"^row_?id$"],
+        ),
+        "turn": find_column(
+            columns,
+            [r"message_index", r"turn.*index", r"^index$", r"^seq"],
+        ),
+        "conversation": find_column(
+            columns,
+            [r"data_cid$", r"(^|_)cid$", r"conversation.*id"],
+        ),
+        "text": find_column(
+            columns,
+            [r"data_content$", r"content$", r"message.*text", r"^text$", r"utterance"],
+        ),
+        "role": find_column(
+            columns,
+            [r"^message_type$", r"message_type$", r"data_type$", r"^role$", r"speaker"],
+        ),
+        "turn_label": find_column(
+            columns,
+            [r"data_label$", r"(^|_)label$", r"turn.*intent"],
+            exclude=[r"predict"],
+        ),
+        "case_label": find_column(
+            columns,
+            [r"classification.*intent", r"case.*intent", r"conversation.*intent"],
+        ),
+    }
+
+
+def profile_columns(
+    df: pd.DataFrame,
+    schema: Dict[str, Optional[str]],
+) -> List[Dict[str, Any]]:
+    resolved = {column: role for role, column in schema.items() if column}
+    rows: List[Dict[str, Any]] = []
+
+    for column in df.columns:
+        series = df[column].dropna().astype(str)
+        series = series[series.str.strip().ne("")]
+        rows.append({
+            "column": column,
+            "resolved_role": resolved.get(column, ""),
+            "fill_pct": pct(len(series), len(df)),
+            "distinct": int(series.nunique()),
+            "median_chars": int(series.str.len().median()) if len(series) else 0,
+            "max_chars": int(series.str.len().max()) if len(series) else 0,
+        })
+
+    return rows
+
+
+def load_input(
+    config: RunConfig,
+) -> Tuple[pd.DataFrame, Dict[str, Optional[str]]]:
+    log("\n[1/10] Loading input and resolving schema")
+
+    path = Path(config.input_path)
+    if not path.is_file():
+        raise FileNotFoundError(f"Input CSV not found: {path}")
+
+    df = pd.read_csv(
+        path,
+        dtype=str,
+        keep_default_na=False,
+        na_values=["", "NA", "NaN", "null", "None", "nan"],
+        low_memory=False,
+    )
+
+    if config.sample_rows and config.sample_rows < len(df):
+        df = df.sample(
+            config.sample_rows,
+            random_state=config.seed,
+        ).reset_index(drop=True)
+
+    schema = discover_schema(df)
+    if not schema["text"]:
+        raise RuntimeError(
+            "No message-content column could be resolved from the CSV header."
+        )
+
+    log(f"  rows={len(df):,} columns={len(df.columns)}")
+    for role, column in schema.items():
+        log(f"  {role:<13} -> {column}")
+
+    return df, schema
+
+
+def prepare_raw_frame(
+    df: pd.DataFrame,
+    schema: Dict[str, Optional[str]],
+) -> pd.DataFrame:
+    work = df.copy()
+    text_col = schema["text"]
+    role_col = schema["role"]
+
+    work["_raw"] = (
+        work[text_col]
+        .fillna("")
+        .astype(str)
+        .str.replace(r"\\r", " ", regex=True)
+        .str.replace(r"\\n", "\n", regex=True)
+    )
+
+    if role_col:
+        work["_role"] = (
+            work[role_col]
+            .fillna("unknown")
+            .astype(str)
+            .str.strip()
+            .str.lower()
+        )
+    else:
+        work["_role"] = "unknown"
+
+    return work
+
+
+# ---------------------------------------------------------------------------
+# Locked split
+# ---------------------------------------------------------------------------
+
+def resolve_label_and_group(
+    schema: Dict[str, Optional[str]],
+) -> Tuple[Optional[str], Optional[str]]:
+    label_col = schema.get("case_label") or schema.get("turn_label")
+    group_col = schema.get("case") or schema.get("conversation")
+    return label_col, group_col
+
+
+def create_group_key(
+    frame: pd.DataFrame,
+    group_col: Optional[str],
+) -> pd.Series:
+    if group_col:
+        groups = frame[group_col].fillna("").astype(str).str.strip().copy()
+        missing = groups.eq("")
+        if missing.any():
+            groups.loc[missing] = [
+                f"missing_group_{index}"
+                for index in frame.index[missing]
+            ]
+        return groups
+
+    return pd.Series(
+        [f"row_{index}" for index in frame.index],
+        index=frame.index,
+        dtype=str,
+    )
+
+
+def create_locked_split(
+    work: pd.DataFrame,
+    schema: Dict[str, Optional[str]],
+    config: RunConfig,
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """
+    Create one stratified group-level 80/20 split.
+
+    The split is learned from labelled customer groups and then propagated to
+    every row in those groups, including unlabelled customer turns and assistant
+    turns. This prevents a held-out case leaking back through another turn.
+    """
+    log("\n[2/10] Creating locked 80/20 development-test split")
+
+    frame = work.copy()
+    frame["data_split"] = "unlabelled"
+
+    label_col, group_col = resolve_label_and_group(schema)
+    frame["group_key"] = create_group_key(frame, group_col)
+
+    if not label_col:
+        return frame, {
+            "status": "skipped",
+            "reason": "no_existing_label_column",
+        }
+
+    labels = frame[label_col].fillna("").astype(str).str.strip()
+    customer_mask = frame["_role"].eq("user") if schema.get("role") else pd.Series(
+        True, index=frame.index
+    )
+    labelled_customer = customer_mask & labels.ne("")
+
+    if labelled_customer.sum() < 30 or labels.loc[labelled_customer].nunique() < 2:
+        return frame, {
+            "status": "skipped",
+            "reason": "insufficient_labelled_customer_variation",
+        }
+
+    labelled_table = pd.DataFrame({
+        "group": frame.loc[labelled_customer, "group_key"].to_numpy(),
+        "label": labels.loc[labelled_customer].to_numpy(),
+    })
+
+    labels_per_group = labelled_table.groupby("group")["label"].nunique()
+    conflicting_groups = set(
+        labels_per_group[labels_per_group.gt(1)].index.tolist()
+    )
+
+    consistent = labelled_table[
+        ~labelled_table["group"].isin(conflicting_groups)
+    ]
+
+    group_table = (
+        consistent[["group", "label"]]
+        .drop_duplicates("group")
+        .reset_index(drop=True)
+    )
+
+    if group_table["label"].nunique() < 2:
+        return frame, {
+            "status": "skipped",
+            "reason": "fewer_than_two_consistent_classes",
+            "conflicting_groups": int(len(conflicting_groups)),
+        }
+
+    groups_per_class = group_table["label"].value_counts()
+    if int(groups_per_class.min()) < 2:
+        return frame, {
+            "status": "skipped",
+            "reason": "fewer_than_two_independent_groups_in_a_class",
+            "groups_per_class": {
+                str(key): int(value)
+                for key, value in groups_per_class.items()
+            },
+        }
+
+    splitter = StratifiedShuffleSplit(
+        n_splits=1,
+        test_size=config.test_size,
+        random_state=config.seed,
+    )
+
+    try:
+        development_pos, test_pos = next(
+            splitter.split(
+                np.zeros(len(group_table)),
+                group_table["label"].to_numpy(),
+            )
+        )
+    except ValueError as exc:
+        raise RuntimeError(
+            "Unable to create a stratified group split. "
+            "Check class counts at case/conversation level."
+        ) from exc
+
+    development_groups = set(
+        group_table.iloc[development_pos]["group"].tolist()
+    )
+    locked_test_groups = set(
+        group_table.iloc[test_pos]["group"].tolist()
+    )
+
+    # Important: propagate split to every row in a group, not only labelled rows.
+    frame.loc[
+        frame["group_key"].isin(development_groups),
+        "data_split",
+    ] = "development"
+
+    frame.loc[
+        frame["group_key"].isin(locked_test_groups),
+        "data_split",
+    ] = "locked_test"
+
+    frame.loc[
+        frame["group_key"].isin(conflicting_groups),
+        "data_split",
+    ] = "excluded_conflict"
+
+    customer_supervised = (
+        customer_mask
+        & frame["data_split"].isin(["development", "locked_test"])
+        & labels.ne("")
+    )
+    total_supervised = int(customer_supervised.sum())
+
+    development_rows = int(
+        (customer_supervised & frame["data_split"].eq("development")).sum()
+    )
+    test_rows = int(
+        (customer_supervised & frame["data_split"].eq("locked_test")).sum()
+    )
+
+    metrics = {
+        "status": "completed",
+        "label_column": label_col,
+        "grouping_column": group_col or "row_index",
+        "protocol": {
+            "development_target_pct": 80.0,
+            "locked_test_target_pct": 20.0,
+            "cv_folds_inside_development": int(config.cv_splits),
+            "approximate_per_cv_fold_pct_of_total": {
+                "train": 64.0,
+                "validation": 16.0,
+                "locked_test": 20.0,
+            },
+            "note": (
+                "The hold-out split is group-aware. Labels are used only to "
+                "stratify the split; test text/features are not used for fitting."
+            ),
+        },
+        "development_groups": int(len(development_groups)),
+        "locked_test_groups": int(len(locked_test_groups)),
+        "conflicting_groups_excluded": int(len(conflicting_groups)),
+        "customer_supervised_rows": {
+            "development": development_rows,
+            "locked_test": test_rows,
+        },
+        "customer_supervised_row_pct": {
+            "development": pct(development_rows, total_supervised),
+            "locked_test": pct(test_rows, total_supervised),
+        },
+    }
+
+    log(json.dumps(metrics["customer_supervised_row_pct"], indent=2))
+    return frame, metrics
+
+
+# ---------------------------------------------------------------------------
+# Privacy and corpora
+# ---------------------------------------------------------------------------
+
+def parse_fields(text: str) -> Tuple[List[Tuple[str, str]], str]:
+    if not isinstance(text, str) or not text:
+        return [], ""
+
+    fields: List[Tuple[str, str]] = []
+    spans: List[Tuple[int, int]] = []
+
+    for match in FIELD_LINE_RE.finditer(text):
+        key = normalise_key(match.group("key"))
+        value = match.group("value").strip()
+        if len(key) >= 2:
+            fields.append((key, value))
+            spans.append((match.start(), match.end()))
+
+    if not spans:
+        return [], text
+
+    remainder: List[str] = []
+    cursor = 0
+    for start, end in spans:
+        remainder.append(text[cursor:start])
+        cursor = end
+    remainder.append(text[cursor:])
+
+    return fields, re.sub(r"\s+", " ", " ".join(remainder)).strip()
+
+
+def harvest_name_tokens(
+    texts: Iterable[str],
+) -> Tuple[set[str], int]:
+    """
+    Build a privacy-only name block list from development text.
+
+    A token is blocked only when most of its occurrences are in explicit name
+    fields, which avoids masking ordinary words that also happen to be surnames.
+    """
+    in_name: Dict[str, int] = {}
+    everywhere: Dict[str, int] = {}
+
+    def increment(counter: Dict[str, int], token: str) -> None:
+        counter[token] = counter.get(token, 0) + 1
+
+    name_field_pattern = IDENTIFIER_FIELD_PATTERNS[0][1]
+
+    for text in texts:
+        if not isinstance(text, str) or not text:
+            continue
+
+        fields, _ = parse_fields(text)
+        for key, value in fields:
+            if re.search(name_field_pattern, key):
+                for token in re.findall(r"[A-Za-z][A-Za-z'\-]{1,}", value):
+                    increment(in_name, token.lower())
+
+        for match in NAME_CUE_RE.finditer(text):
+            for token in re.findall(r"[A-Za-z][A-Za-z'\-]{1,}", match.group("value")):
+                increment(in_name, token.lower())
+
+        for token in re.findall(r"[A-Za-z][A-Za-z'\-]{2,}", text.lower()):
+            increment(everywhere, token)
+
+    blocked = {
+        token
+        for token, count in in_name.items()
+        if len(token) >= 3
+        and count / max(everywhere.get(token, count), 1) >= 0.5
+    }
+
+    return blocked, len(in_name) - len(blocked)
+
+
+def build_name_regex(tokens: set[str]) -> Optional[re.Pattern]:
+    if not tokens:
+        return None
+    ordered = sorted(tokens, key=len, reverse=True)
+    return re.compile(
+        r"(?i)\b(?:" + "|".join(re.escape(token) for token in ordered) + r")\b"
+    )
+
+
+def scrub(
+    text: str,
+    name_regex: Optional[re.Pattern],
+) -> str:
+    if not isinstance(text, str) or not text:
+        return ""
+
+    value = NAME_CUE_RE.sub(" ", text)
+    value = ADDRESS_RE.sub(f" {REDACT} ", value)
+
+    for _, pattern in PII_PATTERNS:
+        value = pattern.sub(f" {REDACT} ", value)
+
+    if name_regex is not None:
+        value = name_regex.sub(f" {REDACT} ", value)
+
+    return value
+
+
+def extract_customer_problem(
+    text: str,
+    name_regex: Optional[re.Pattern],
+) -> str:
+    fields, remainder = parse_fields(text)
+
+    if not fields:
+        body = scrub(text, name_regex)
+    else:
+        parts = [
+            scrub(value, name_regex)
+            for key, value in fields
+            if value and not is_identifier_key(key)
+        ]
+        if remainder:
+            parts.append(scrub(remainder, name_regex))
+        body = " ".join(part for part in parts if part)
+
+    body = body.replace(REDACT, " ")
+    return re.sub(r"\s+", " ", body).strip()
+
+
+def residue_flags(text: str) -> List[str]:
+    hits = [
+        name
+        for name, pattern in PII_PATTERNS
+        if pattern.search(text)
+    ]
+    if ADDRESS_RE.search(text):
+        hits.append("address")
+    return hits
+
+
+def repair_residual_pii(
+    series: pd.Series,
+) -> Tuple[pd.Series, int, int]:
+    repaired: List[str] = []
+    touched = 0
+    blanked = 0
+
+    for text in series:
+        if not residue_flags(text):
+            repaired.append(text)
+            continue
+
+        touched += 1
+        fixed = ADDRESS_RE.sub(" ", text)
+        for _, pattern in PII_PATTERNS:
+            fixed = pattern.sub(" ", fixed)
+        fixed = re.sub(r"\s+", " ", fixed).strip()
+
+        if residue_flags(fixed):
+            repaired.append("")
+            blanked += 1
+        else:
+            repaired.append(fixed)
+
+    return pd.Series(repaired, index=series.index), touched, blanked
+
+
+def build_corpora(
+    work: pd.DataFrame,
+    schema: Dict[str, Optional[str]],
+) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, Any]]:
+    log("\n[3/10] Building privacy-safe customer and assistant corpora")
+
+    # The learned name list is built only from development rows. Deterministic
+    # PII regexes are still applied to every partition.
+    development_name_source = work.loc[
+        work["data_split"].eq("development"),
+        "_raw",
+    ].tolist()
+
+    blocked_names, released_count = harvest_name_tokens(
+        development_name_source
+    )
+    name_regex = build_name_regex(blocked_names)
+
+    if schema.get("role"):
+        user = work[work["_role"].eq("user")].copy()
+        assistant = work[work["_role"].eq("assistant")].copy()
+    else:
+        user = work.copy()
+        assistant = work.iloc[0:0].copy()
+
+    if user.empty:
+        raise RuntimeError("No user/customer turns were found.")
+
+    user["text"] = user["_raw"].map(
+        lambda value: extract_customer_problem(value, name_regex)
+    )
+    user["text"], user_repaired, user_blanked = repair_residual_pii(
+        user["text"]
+    )
+    user = user[user["text"].str.len().ge(3)].reset_index(drop=True)
+
+    if user.empty:
+        raise RuntimeError(
+            "No usable customer problem statements remain after cleaning."
+        )
+
+    if not assistant.empty:
+        assistant["text"] = assistant["_raw"].map(
+            lambda value: scrub(value, name_regex).replace(REDACT, " ")
+        )
+        assistant["text"], assistant_repaired, assistant_blanked = repair_residual_pii(
+            assistant["text"]
+        )
+        assistant = assistant[assistant["text"].str.len().ge(3)].reset_index(drop=True)
+    else:
+        assistant_repaired = 0
+        assistant_blanked = 0
+
+    quality = {
+        "input_rows": int(len(work)),
+        "role_counts": {
+            str(key): int(value)
+            for key, value in work["_role"].value_counts().items()
+        },
+        "name_tokens_blocked_from_development": int(len(blocked_names)),
+        "name_tokens_released": int(released_count),
+        "customer_rows_repaired": int(user_repaired),
+        "customer_rows_blanked": int(user_blanked),
+        "assistant_rows_repaired": int(assistant_repaired),
+        "assistant_rows_blanked": int(assistant_blanked),
+        "customer_rows_after_cleaning": int(len(user)),
+        "assistant_rows_after_cleaning": int(len(assistant)),
+        "distinct_customer_problems": int(user["text"].nunique()),
+    }
+
+    log(json.dumps(quality, indent=2))
+    return user, assistant, quality
+
+
+# ---------------------------------------------------------------------------
+# Supervised broad intent
+# ---------------------------------------------------------------------------
+
+def build_text_vectorizer(
+    config: RunConfig,
+    min_word_df: int,
+    min_char_df: int,
+) -> FeatureUnion:
+    return FeatureUnion([
+        (
+            "word",
+            TfidfVectorizer(
+                analyzer="word",
+                lowercase=True,
+                strip_accents="unicode",
+                stop_words="english",
+                ngram_range=(1, 2),
+                min_df=min_word_df,
+                max_df=0.95,
+                max_features=config.word_max_features,
+                sublinear_tf=True,
+                norm="l2",
+            ),
+        ),
+        (
+            "char",
+            TfidfVectorizer(
+                analyzer="char_wb",
+                lowercase=True,
+                strip_accents="unicode",
+                ngram_range=(3, 5),
+                min_df=min_char_df,
+                max_features=config.char_max_features,
+                sublinear_tf=True,
+                norm="l2",
+            ),
+        ),
+    ])
+
+
+def fit_classifier_vectorizer(
+    texts: Sequence[str],
+    config: RunConfig,
+) -> Tuple[FeatureUnion, Any]:
+    min_word_df = 2 if len(texts) >= 50 else 1
+    min_char_df = 3 if len(texts) >= 100 else 1
+
+    vectorizer = build_text_vectorizer(
+        config,
+        min_word_df=min_word_df,
+        min_char_df=min_char_df,
+    )
+    matrix = vectorizer.fit_transform(list(texts))
+    return vectorizer, matrix
+
+
+def new_classifier(
+    seed: int,
+) -> LogisticRegression:
+    return LogisticRegression(
+        max_iter=4000,
+        class_weight="balanced",
+        solver="liblinear",
+        random_state=seed,
+    )
+
+
+def choose_cv_splits(
+    labels: np.ndarray,
+    groups: np.ndarray,
+    requested: int,
+) -> int:
+    table = pd.DataFrame({
+        "label": labels,
+        "group": groups,
+    }).drop_duplicates()
+
+    if table["label"].nunique() < 2:
+        return 0
+
+    minimum_groups = int(
+        table.groupby("label")["group"].nunique().min()
+    )
+    return max(
+        0,
+        min(
+            requested,
+            minimum_groups,
+            int(table["group"].nunique()),
+        ),
+    )
+
+
+def evaluate_broad_intent(
+    user: pd.DataFrame,
+    schema: Dict[str, Optional[str]],
+    config: RunConfig,
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    log("\n[4/10] Broad-intent supervised ML")
+
+    frame = user.copy()
+    frame["predicted_intent"] = ""
+    frame["prediction_score"] = np.nan
+    frame["prediction_source"] = "not_scored"
+
+    label_col, _ = resolve_label_and_group(schema)
+    if not label_col:
+        return frame, {
+            "status": "skipped",
+            "reason": "no_existing_label_column",
+        }
+
+    labels = frame[label_col].fillna("").astype(str).str.strip()
+
+    development_mask = frame["data_split"].eq("development") & labels.ne("")
+    test_mask = frame["data_split"].eq("locked_test") & labels.ne("")
+
+    if development_mask.sum() < 30 or test_mask.sum() < 5:
+        return frame, {
+            "status": "skipped",
+            "reason": "insufficient_development_or_test_rows",
+        }
+
+    development_label_table = pd.DataFrame({
+        "text": frame.loc[development_mask, "text"].astype(str),
+        "label": labels.loc[development_mask],
+    })
+    labels_per_text = development_label_table.groupby("text")["label"].nunique()
+    conflicting_texts = set(
+        labels_per_text[labels_per_text.gt(1)].index.tolist()
+    )
+
+    eligible_development = (
+        development_mask
+        & ~frame["text"].isin(conflicting_texts)
+    )
+
+    dev_pool = (
+        frame.loc[eligible_development]
+        .drop_duplicates("text")
+        .index
+        .to_numpy()
+    )
+
+    if len(dev_pool) < 30:
+        return frame, {
+            "status": "skipped",
+            "reason": "insufficient_consistent_unique_development_examples",
+        }
+
+    dev_texts = frame.loc[dev_pool, "text"].astype(str).to_numpy()
+    dev_labels_raw = labels.loc[dev_pool].to_numpy()
+
+    encoder = LabelEncoder()
+    dev_y = encoder.fit_transform(dev_labels_raw)
+    dev_groups = (
+        frame.loc[dev_pool, "group_key"]
+        .astype(str)
+        .to_numpy(dtype=object)
+    )
+
+    n_splits = choose_cv_splits(
+        dev_y,
+        dev_groups,
+        config.cv_splits,
+    )
+    if n_splits < 2:
+        return frame, {
+            "status": "skipped",
+            "reason": "insufficient_independent_groups_for_cv",
+        }
+
+    if StratifiedGroupKFold is not None:
+        splitter = StratifiedGroupKFold(
+            n_splits=n_splits,
+            shuffle=True,
+            random_state=config.seed,
+        )
+    else:
+        splitter = GroupKFold(n_splits=n_splits)
+
+    oof_pred = np.full(len(dev_pool), -1, dtype=int)
+    oof_score = np.full(len(dev_pool), np.nan, dtype=float)
+    fold_metrics: List[Dict[str, Any]] = []
+
+    for fold, (train_pos, validation_pos) in enumerate(
+        splitter.split(dev_texts, dev_y, dev_groups),
+        start=1,
+    ):
+        if len(np.unique(dev_y[train_pos])) != len(encoder.classes_):
+            continue
+
+        vectorizer, x_train = fit_classifier_vectorizer(
+            dev_texts[train_pos],
+            config,
+        )
+        x_validation = vectorizer.transform(
+            dev_texts[validation_pos]
+        )
+
+        classifier = new_classifier(config.seed)
+        classifier.fit(x_train, dev_y[train_pos])
+
+        prediction = classifier.predict(x_validation)
+        probability = classifier.predict_proba(x_validation)
+
+        oof_pred[validation_pos] = prediction
+        oof_score[validation_pos] = probability.max(axis=1)
+
+        fold_metrics.append({
+            "fold": int(fold),
+            "train_rows": int(len(train_pos)),
+            "validation_rows": int(len(validation_pos)),
+            "balanced_accuracy": float(
+                balanced_accuracy_score(dev_y[validation_pos], prediction)
+            ),
+            "macro_f1": float(
+                f1_score(
+                    dev_y[validation_pos],
+                    prediction,
+                    average="macro",
+                    zero_division=0,
+                )
+            ),
+        })
+
+    scored = oof_pred >= 0
+    cv_summary = None
+
+    if scored.any():
+        cv_summary = {
+            "splits": int(n_splits),
+            "evaluated_unique_development_problems": int(scored.sum()),
+            "balanced_accuracy": float(
+                balanced_accuracy_score(
+                    dev_y[scored],
+                    oof_pred[scored],
+                )
+            ),
+            "macro_f1": float(
+                f1_score(
+                    dev_y[scored],
+                    oof_pred[scored],
+                    average="macro",
+                    zero_division=0,
+                )
+            ),
+            "fold_metrics": fold_metrics,
+        }
+
+        oof_lookup = {
+            str(dev_texts[position]): (
+                str(encoder.inverse_transform([oof_pred[position]])[0]),
+                float(oof_score[position]),
+            )
+            for position in np.flatnonzero(scored)
+        }
+
+        for index in frame.index[frame["data_split"].eq("development")]:
+            item = oof_lookup.get(str(frame.at[index, "text"]))
+            if item is not None:
+                frame.at[index, "predicted_intent"] = item[0]
+                frame.at[index, "prediction_score"] = item[1]
+                frame.at[index, "prediction_source"] = "development_oof"
+
+    # Everything below is frozen on development before test text is transformed.
+    final_vectorizer, x_development = fit_classifier_vectorizer(
+        dev_texts,
+        config,
+    )
+    final_classifier = new_classifier(config.seed)
+    final_classifier.fit(x_development, dev_y)
+
+    development_text_set = set(dev_texts.tolist())
+    test_pool = (
+        frame.loc[test_mask]
+        .drop_duplicates("text")
+        .index
+        .to_numpy()
+    )
+
+    duplicate_test_mask = np.asarray([
+        str(frame.at[index, "text"]) in development_text_set
+        for index in test_pool
+    ])
+    clean_test_pool = test_pool[~duplicate_test_mask]
+
+    if len(clean_test_pool) == 0:
+        return frame, {
+            "status": "skipped",
+            "reason": "all_locked_test_texts_duplicate_development_texts",
+            "cross_validation": cv_summary,
+        }
+
+    test_labels_raw = labels.loc[clean_test_pool].to_numpy()
+    unseen_test_classes = sorted(
+        set(test_labels_raw) - set(encoder.classes_)
+    )
+    if unseen_test_classes:
+        return frame, {
+            "status": "skipped",
+            "reason": "locked_test_contains_class_absent_from_development",
+            "unseen_test_classes": unseen_test_classes,
+            "cross_validation": cv_summary,
+        }
+
+    test_y = encoder.transform(test_labels_raw)
+    test_texts = frame.loc[clean_test_pool, "text"].astype(str).to_numpy()
+
+    x_test = final_vectorizer.transform(test_texts)
+    test_prediction = final_classifier.predict(x_test)
+    test_probability = final_classifier.predict_proba(x_test)
+
+    test_metrics = {
+        "accuracy": float(accuracy_score(test_y, test_prediction)),
+        "balanced_accuracy": float(
+            balanced_accuracy_score(test_y, test_prediction)
+        ),
+        "macro_f1": float(
+            f1_score(
+                test_y,
+                test_prediction,
+                average="macro",
+                zero_division=0,
+            )
+        ),
+        "weighted_f1": float(
+            f1_score(
+                test_y,
+                test_prediction,
+                average="weighted",
+                zero_division=0,
+            )
+        ),
+    }
+
+    label_ids = np.arange(len(encoder.classes_))
+    report = classification_report(
+        test_y,
+        test_prediction,
+        labels=label_ids,
+        target_names=encoder.classes_,
+        output_dict=True,
+        zero_division=0,
+    )
+    matrix = confusion_matrix(
+        test_y,
+        test_prediction,
+        labels=label_ids,
+    )
+
+    test_lookup = {
+        str(text): (
+            str(encoder.inverse_transform([prediction])[0]),
+            float(score),
+        )
+        for text, prediction, score in zip(
+            test_texts,
+            test_prediction,
+            test_probability.max(axis=1),
+        )
+    }
+
+    for index in frame.index[frame["data_split"].eq("locked_test")]:
+        text = str(frame.at[index, "text"])
+        item = test_lookup.get(text)
+
+        if item is not None:
+            frame.at[index, "predicted_intent"] = item[0]
+            frame.at[index, "prediction_score"] = item[1]
+            frame.at[index, "prediction_source"] = "locked_test"
+        elif text in development_text_set:
+            x_row = final_vectorizer.transform([text])
+            row_probability = final_classifier.predict_proba(x_row)
+            row_prediction = row_probability.argmax(axis=1)
+            frame.at[index, "predicted_intent"] = str(
+                encoder.inverse_transform(row_prediction)[0]
+            )
+            frame.at[index, "prediction_score"] = float(row_probability.max())
+            frame.at[index, "prediction_source"] = (
+                "locked_test_duplicate_seen_in_development"
+            )
+
+    remaining = frame.index[
+        frame["prediction_source"].eq("not_scored")
+    ]
+
+    if len(remaining):
+        remaining_texts = frame.loc[remaining, "text"].astype(str).tolist()
+        x_remaining = final_vectorizer.transform(remaining_texts)
+        remaining_probability = final_classifier.predict_proba(x_remaining)
+        remaining_prediction = remaining_probability.argmax(axis=1)
+
+        frame.loc[remaining, "predicted_intent"] = encoder.inverse_transform(
+            remaining_prediction
+        )
+        frame.loc[remaining, "prediction_score"] = remaining_probability.max(axis=1)
+        frame.loc[remaining, "prediction_source"] = "development_model_inference"
+
+    metrics = {
+        "status": "completed",
+        "label_column": label_col,
+        "classes": encoder.classes_.tolist(),
+        "feature_representation": (
+            "word and character TF-IDF; every CV fold fits its own vocabulary"
+        ),
+        "classifier": "class-balanced Logistic Regression",
+        "development_protocol": {
+            "development_target_pct": 80.0,
+            "cv_splits": int(n_splits),
+            "approximate_train_pct_per_fold_of_total": 64.0,
+            "approximate_validation_pct_per_fold_of_total": 16.0,
+        },
+        "locked_test_protocol": {
+            "target_pct": 20.0,
+            "fit_on_test": False,
+            "test_used_during_cv": False,
+            "test_used_for_feature_fitting": False,
+            "exact_duplicate_test_texts_excluded_from_metrics": int(
+                duplicate_test_mask.sum()
+            ),
+        },
+        "conflicting_development_texts_excluded": int(
+            len(conflicting_texts)
+        ),
+        "cross_validation": cv_summary,
+        "locked_test": {
+            "evaluated_unique_problems": int(len(clean_test_pool)),
+            "metrics": test_metrics,
+            "classification_report": report,
+            "confusion_matrix": {
+                "labels": encoder.classes_.tolist(),
+                "matrix": matrix.tolist(),
+            },
+        },
+        "prediction_score_note": (
+            "The score is the maximum Logistic Regression class probability; "
+            "it is not treated as a calibrated confidence."
+        ),
+    }
+
+    log("  locked test: " + json.dumps(test_metrics))
+    return frame, metrics
+
+
+# ---------------------------------------------------------------------------
+# Latent representation and clustering
+# ---------------------------------------------------------------------------
+
+def fit_latent_representation(
+    development_texts: Sequence[str],
+    config: RunConfig,
+    max_components: Optional[int] = None,
+) -> Tuple[LatentRepresentation, np.ndarray]:
+    min_word_df = 2 if len(development_texts) >= 50 else 1
+    min_char_df = 3 if len(development_texts) >= 100 else 1
+
+    vectorizer = build_text_vectorizer(
+        config,
+        min_word_df=min_word_df,
+        min_char_df=min_char_df,
+    )
+    sparse = vectorizer.fit_transform(list(development_texts))
+
+    requested = (
+        config.topic_svd_components
+        if max_components is None
+        else max_components
+    )
+    components = min(
+        sparse.shape[0] - 1,
+        sparse.shape[1] - 1,
+        requested,
+    )
+
+    if components < 2:
+        raise RuntimeError(
+            "Not enough development samples/features for TruncatedSVD."
+        )
+
+    svd = TruncatedSVD(
+        n_components=int(components),
+        random_state=config.seed,
+    )
+    dense = svd.fit_transform(sparse)
+
+    normalizer = Normalizer(copy=False)
+    dense = normalizer.fit_transform(dense)
+
+    representation = LatentRepresentation(
+        vectorizer=vectorizer,
+        svd=svd,
+        normalizer=normalizer,
+    )
+    return representation, np.asarray(dense, dtype=np.float32)
+
+
+def derive_cluster_parameters(
+    n_samples: int,
+    requested_min_cluster_size: int,
+    requested_neighbors: int,
+) -> Tuple[int, int, int]:
+    if requested_min_cluster_size <= 0:
+        min_cluster_size = max(
+            12,
+            int(round(math.sqrt(max(n_samples, 1)))),
+        )
+    else:
+        min_cluster_size = requested_min_cluster_size
+
+    min_cluster_size = min(
+        min_cluster_size,
+        max(2, n_samples // 3),
+    )
+
+    if requested_neighbors <= 0:
+        neighbors = min(
+            30,
+            max(
+                10,
+                int(round(math.sqrt(max(n_samples, 1)) / 2)),
+            ),
+        )
+    else:
+        neighbors = requested_neighbors
+
+    neighbors = min(
+        neighbors,
+        max(2, n_samples - 1),
+    )
+    min_samples = max(5, min_cluster_size // 4)
+
+    return int(min_cluster_size), int(neighbors), int(min_samples)
+
+
+def cluster_centroids(
+    vectors: np.ndarray,
+    labels: np.ndarray,
+) -> Dict[int, np.ndarray]:
+    centroids: Dict[int, np.ndarray] = {}
+
+    for label in sorted(set(labels.tolist())):
+        label = int(label)
+        if label == -1:
+            continue
+        member = vectors[labels == label]
+        if len(member) == 0:
+            continue
+        centroid = member.mean(axis=0)
+        norm = float(np.linalg.norm(centroid))
+        if norm > 0.0:
+            centroid = centroid / norm
+        centroids[label] = np.asarray(centroid, dtype=np.float32)
+
+    return centroids
+
+
+def fit_kmeans_by_silhouette(
+    vectors: np.ndarray,
+    seed: int,
+    max_k: int,
+    min_cluster_size: int,
+) -> Tuple[KMeans, np.ndarray, np.ndarray, float]:
+    n_samples = len(vectors)
+    upper = min(
+        max_k,
+        max(2, n_samples // max(min_cluster_size, 1)),
+        max(2, int(round(math.sqrt(n_samples)))),
+    )
+
+    best_score = -1.0
+    best_model: Optional[KMeans] = None
+    best_labels: Optional[np.ndarray] = None
+
+    for k in range(2, upper + 1):
+        model = KMeans(
+            n_clusters=k,
+            random_state=seed,
+            n_init=10,
+        )
+        labels = model.fit_predict(vectors)
+
+        if len(set(labels.tolist())) < 2:
+            continue
+
+        score = float(
+            silhouette_score(
+                vectors,
+                labels,
+                metric="cosine",
+                sample_size=min(3000, n_samples),
+                random_state=seed,
+            )
+        )
+
+        if score > best_score:
+            best_score = score
+            best_model = model
+            best_labels = labels.astype(int)
+
+    if best_model is None or best_labels is None:
+        raise RuntimeError("Unable to derive a stable KMeans clustering.")
+
+    distances = best_model.transform(vectors).min(axis=1)
+    strengths = 1.0 / (1.0 + distances)
+
+    return (
+        best_model,
+        best_labels,
+        strengths.astype(float),
+        best_score,
+    )
+
+
+def fit_cluster_model(
+    vectors: np.ndarray,
+    seed: int,
+    requested_min_cluster_size: int,
+    requested_neighbors: int,
+    max_k: int,
+) -> Tuple[ClusterModel, np.ndarray, np.ndarray]:
+    n_samples = len(vectors)
+    if n_samples < 4:
+        raise RuntimeError("Too few samples for clustering.")
+
+    min_size, neighbors, min_samples = derive_cluster_parameters(
+        n_samples,
+        requested_min_cluster_size,
+        requested_neighbors,
+    )
+
+    try:
+        from umap import UMAP
+        from hdbscan import HDBSCAN
+
+        reducer = UMAP(
+            n_neighbors=neighbors,
+            n_components=5,
+            min_dist=0.0,
+            metric="cosine",
+            random_state=seed,
+            low_memory=True,
+        )
+        reduced = reducer.fit_transform(vectors)
+
+        clusterer = HDBSCAN(
+            min_cluster_size=min_size,
+            min_samples=min_samples,
+            metric="euclidean",
+            cluster_selection_method="eom",
+            prediction_data=True,
+        )
+        labels = clusterer.fit_predict(reduced).astype(int)
+        strengths = np.asarray(clusterer.probabilities_, dtype=float)
+
+        non_outlier = labels != -1
+        discovered = sorted(set(labels[non_outlier].tolist()))
+
+        # If HDBSCAN finds fewer than two useful clusters, use the deterministic
+        # local fallback rather than returning a meaningless partition.
+        if len(discovered) >= 2:
+            sil = None
+            if non_outlier.sum() >= 3:
+                try:
+                    sil = float(
+                        silhouette_score(
+                            vectors[non_outlier],
+                            labels[non_outlier],
+                            metric="cosine",
+                            sample_size=min(3000, int(non_outlier.sum())),
+                            random_state=seed,
+                        )
+                    )
+                except ValueError:
+                    sil = None
+
+            model = ClusterModel(
+                method="umap_hdbscan",
+                reducer=reducer,
+                clusterer=clusterer,
+                centroids=cluster_centroids(vectors, labels),
+                silhouette=sil,
+                parameters={
+                    "min_cluster_size": min_size,
+                    "min_samples": min_samples,
+                    "umap_neighbors": neighbors,
+                },
+            )
+            return model, labels, strengths
+
+        log("  HDBSCAN returned <2 usable clusters; using KMeans fallback")
+
+    except ImportError:
+        log("  UMAP/HDBSCAN unavailable; using local KMeans fallback")
+
+    kmeans, labels, strengths, sil = fit_kmeans_by_silhouette(
+        vectors,
+        seed=seed,
+        max_k=max_k,
+        min_cluster_size=min_size,
+    )
+
+    model = ClusterModel(
+        method="kmeans_fallback",
+        reducer=None,
+        clusterer=kmeans,
+        centroids=cluster_centroids(vectors, labels),
+        silhouette=float(sil),
+        parameters={
+            "selected_k": int(kmeans.n_clusters),
+            "min_cluster_size_reference": min_size,
+        },
+    )
+    return model, labels, strengths
+
+
+def predict_clusters(
+    model: ClusterModel,
+    vectors: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray]:
+    if len(vectors) == 0:
+        return (
+            np.asarray([], dtype=int),
+            np.asarray([], dtype=float),
+        )
+
+    if model.method == "umap_hdbscan":
+        try:
+            from hdbscan.prediction import approximate_predict
+
+            reduced = model.reducer.transform(vectors)
+            labels, strengths = approximate_predict(
+                model.clusterer,
+                reduced,
+            )
+            return labels.astype(int), strengths.astype(float)
+        except Exception:
+            pass
+
+    if model.method == "kmeans_fallback":
+        labels = model.clusterer.predict(vectors).astype(int)
+        distances = model.clusterer.transform(vectors).min(axis=1)
+        strengths = 1.0 / (1.0 + distances)
+        return labels, strengths.astype(float)
+
+    # Last-resort nearest-development-centroid assignment. This never refits.
+    if not model.centroids:
+        return (
+            np.full(len(vectors), -1, dtype=int),
+            np.zeros(len(vectors), dtype=float),
+        )
+
+    cluster_ids = sorted(model.centroids)
+    centroid_matrix = np.vstack([model.centroids[item] for item in cluster_ids])
+    similarity = vectors @ centroid_matrix.T
+    best = similarity.argmax(axis=1)
+    labels = np.asarray([cluster_ids[position] for position in best], dtype=int)
+    strengths = np.clip(
+        (similarity[np.arange(len(vectors)), best] + 1.0) / 2.0,
+        0.0,
+        1.0,
+    )
+    return labels, strengths.astype(float)
+
+
+def describe_clusters_ctfidf(
+    documents: Sequence[str],
+    assignments: np.ndarray,
+    top_terms: int = 12,
+) -> Dict[int, Dict[str, Any]]:
+    """
+    Class-based TF-IDF representation of already discovered clusters.
+    """
+    cluster_ids = sorted(
+        int(cluster_id)
+        for cluster_id in set(assignments.tolist())
+        if int(cluster_id) != -1
+    )
+    if not cluster_ids:
+        return {}
+
+    grouped_documents = [
+        " ".join(
+            document
+            for document, assignment in zip(documents, assignments)
+            if int(assignment) == cluster_id
+        )
+        for cluster_id in cluster_ids
+    ]
+
+    vectorizer = CountVectorizer(
+        lowercase=True,
+        strip_accents="unicode",
+        stop_words="english",
+        ngram_range=(1, 2),
+        min_df=1,
+        max_features=30000,
+    )
+    counts = vectorizer.fit_transform(grouped_documents).astype(np.float64)
+    terms = np.asarray(vectorizer.get_feature_names_out())
+
+    words_per_cluster = np.asarray(counts.sum(axis=1)).ravel()
+    words_per_cluster[words_per_cluster == 0] = 1.0
+
+    term_frequency = counts.multiply(
+        1.0 / words_per_cluster[:, None]
+    )
+    global_term_frequency = np.asarray(
+        counts.sum(axis=0)
+    ).ravel()
+
+    average_words = float(np.mean(words_per_cluster))
+    inverse_frequency = np.log(
+        1.0
+        + average_words
+        / np.maximum(global_term_frequency, 1.0)
+    )
+
+    ctfidf = term_frequency.multiply(
+        inverse_frequency
+    ).toarray()
+
+    output: Dict[int, Dict[str, Any]] = {}
+
+    for row, cluster_id in enumerate(cluster_ids):
+        ranked = np.argsort(ctfidf[row])[::-1]
+        selected = [
+            index
+            for index in ranked
+            if ctfidf[row, index] > 0
+        ][:top_terms]
+
+        keywords = [
+            {
+                "term": str(terms[index]),
+                "weight": round(float(ctfidf[row, index]), 6),
+            }
+            for index in selected
+        ]
+        descriptor = " | ".join(
+            item["term"] for item in keywords[:5]
+        )
+
+        output[cluster_id] = {
+            "descriptor": descriptor or f"cluster_{cluster_id}",
+            "keywords": keywords,
+        }
+
+    return output
+
+
+# ---------------------------------------------------------------------------
+# Detailed intent discovery
+# ---------------------------------------------------------------------------
+
+def discover_detailed_intents(
+    user: pd.DataFrame,
+    config: RunConfig,
+) -> Tuple[
+    pd.DataFrame,
+    Dict[str, Any],
+    Optional[LatentRepresentation],
+]:
+    log("\n[5/10] Detailed-intent discovery")
+
+    frame = user.copy()
+    frame["topic_id"] = -1
+    frame["topic_membership_score"] = np.nan
+    frame["detailed_intent"] = "unassigned"
+
+    development = frame[frame["data_split"].eq("development")]
+    unique_development = (
+        development[["text"]]
+        .drop_duplicates("text")
+        .reset_index(drop=True)
+    )
+
+    if len(unique_development) < 30:
+        return frame, {
+            "status": "skipped",
+            "reason": "too_few_distinct_development_statements",
+            "distinct_development_statements": int(len(unique_development)),
+        }, None
+
+    representation, development_vectors = fit_latent_representation(
+        unique_development["text"].tolist(),
+        config,
+    )
+
+    cluster_model, assignments, strengths = fit_cluster_model(
+        development_vectors,
+        seed=config.seed,
+        requested_min_cluster_size=config.topic_min_cluster_size,
+        requested_neighbors=config.topic_umap_neighbors,
+        max_k=config.topic_max_k,
+    )
+
+    descriptions = describe_clusters_ctfidf(
+        unique_development["text"].tolist(),
+        assignments,
+    )
+
+    development_lookup = {
+        str(text): (
+            int(cluster_id),
+            float(score),
+        )
+        for text, cluster_id, score in zip(
+            unique_development["text"],
+            assignments,
+            strengths,
+        )
+    }
+
+    for index in frame.index:
+        item = development_lookup.get(str(frame.at[index, "text"]))
+        if item is not None:
+            frame.at[index, "topic_id"] = item[0]
+            frame.at[index, "topic_membership_score"] = item[1]
+
+    unseen = frame.index[
+        ~frame["text"].isin(development_lookup.keys())
+    ]
+
+    if len(unseen):
+        unseen_texts = frame.loc[unseen, "text"].astype(str).tolist()
+        unseen_vectors = representation.transform(unseen_texts)
+        predicted, predicted_strength = predict_clusters(
+            cluster_model,
+            unseen_vectors,
+        )
+        frame.loc[unseen, "topic_id"] = predicted
+        frame.loc[unseen, "topic_membership_score"] = predicted_strength
+
+    def topic_name(topic_id: Any) -> str:
+        try:
+            topic = int(topic_id)
+        except (TypeError, ValueError):
+            return "unassigned"
+
+        if topic == -1:
+            return "unassigned"
+
+        return descriptions.get(
+            topic,
+            {},
+        ).get(
+            "descriptor",
+            f"topic_{topic}",
+        )
+
+    frame["detailed_intent"] = frame["topic_id"].map(topic_name)
+
+    sizes = pd.Series(assignments).value_counts().sort_index()
+    discovered = sorted(
+        int(item)
+        for item in set(assignments.tolist())
+        if int(item) != -1
+    )
+
+    metrics = {
+        "status": "completed",
+        "fit_partition": "development_only",
+        "method": cluster_model.method,
+        "representation": "word + character TF-IDF -> TruncatedSVD/LSA",
+        "cluster_description": "class-based TF-IDF",
+        "distinct_development_statements": int(len(unique_development)),
+        "topics_found": int(len(discovered)),
+        "development_unassigned": int((assignments == -1).sum()),
+        "development_unassigned_pct": pct(
+            int((assignments == -1).sum()),
+            len(assignments),
+        ),
+        "silhouette_cosine_non_outliers": cluster_model.silhouette,
+        "parameters": {
+            "svd_components": int(representation.svd.n_components),
+            **cluster_model.parameters,
+        },
+        "topics": [
+            {
+                "topic_id": int(topic_id),
+                "count": int(sizes.get(topic_id, 0)),
+                "descriptor": (
+                    "unassigned"
+                    if int(topic_id) == -1
+                    else descriptions.get(
+                        int(topic_id),
+                        {},
+                    ).get(
+                        "descriptor",
+                        f"topic_{topic_id}",
+                    )
+                ),
+                "keywords": (
+                    []
+                    if int(topic_id) == -1
+                    else descriptions.get(
+                        int(topic_id),
+                        {},
+                    ).get("keywords", [])
+                ),
+            }
+            for topic_id in sorted(set(assignments.tolist()))
+        ],
+    }
+
+    log(
+        f"  method={cluster_model.method} "
+        f"topics={metrics['topics_found']} "
+        f"unassigned={metrics['development_unassigned']} "
+        f"silhouette={cluster_model.silhouette}"
+    )
+
+    return frame, metrics, representation
+
+
+# ---------------------------------------------------------------------------
+# Unsupervised entity/context candidate discovery
+# ---------------------------------------------------------------------------
+
+def discover_entity_candidates(
+    user: pd.DataFrame,
+    representation: Optional[LatentRepresentation],
+    config: RunConfig,
+) -> Tuple[
+    List[Dict[str, List[Dict[str, Any]]]],
+    Dict[str, Any],
+    pd.DataFrame,
+]:
+    """
+    Discover entity/context candidates without predefined semantic axes.
+
+    Development-only n-grams are embedded in the development latent space and
+    clustered into corpus-derived concept groups. The test partition is only
+    transformed through the frozen development vocabulary/model.
+    """
+    log("\n[6/10] Unsupervised entity/context candidate discovery")
+
+    outputs: List[Dict[str, List[Dict[str, Any]]]] = [
+        {} for _ in range(len(user))
+    ]
+
+    development_texts = (
+        user.loc[user["data_split"].eq("development"), "text"]
+        .drop_duplicates()
+        .astype(str)
+        .tolist()
+    )
+
+    if len(development_texts) < 30:
+        return outputs, {
+            "status": "skipped",
+            "reason": "too_few_development_texts",
+        }, pd.DataFrame()
+
+    if representation is None:
+        representation, _ = fit_latent_representation(
+            development_texts,
+            config,
+        )
+
+    min_df = 2 if len(development_texts) >= 50 else 1
+    candidate_vectorizer = TfidfVectorizer(
+        lowercase=True,
+        strip_accents="unicode",
+        stop_words="english",
+        ngram_range=(1, 3),
+        min_df=min_df,
+        max_df=0.90,
+        max_features=config.entity_max_features,
+        sublinear_tf=True,
+        norm="l2",
+        token_pattern=r"(?u)\b[a-zA-Z][a-zA-Z0-9'\-]+\b",
+    )
+
+    development_matrix = candidate_vectorizer.fit_transform(
+        development_texts
+    )
+    vocabulary = np.asarray(
+        candidate_vectorizer.get_feature_names_out()
+    )
+
+    if len(vocabulary) < 20:
+        return outputs, {
+            "status": "skipped",
+            "reason": "candidate_vocabulary_too_small",
+        }, pd.DataFrame()
+
+    phrase_vectors = representation.transform(
+        vocabulary.tolist()
+    )
+    vector_norm = np.linalg.norm(phrase_vectors, axis=1)
+    covered = vector_norm > 1e-8
+
+    if int(covered.sum()) < 20:
+        return outputs, {
+            "status": "skipped",
+            "reason": "too_few_phrases_in_latent_space",
+        }, pd.DataFrame()
+
+    covered_feature_ids = np.flatnonzero(covered)
+    covered_vectors = phrase_vectors[covered]
+
+    cluster_model, covered_labels, covered_strengths = fit_cluster_model(
+        covered_vectors,
+        seed=config.seed,
+        requested_min_cluster_size=config.entity_min_cluster_size,
+        requested_neighbors=config.topic_umap_neighbors,
+        max_k=config.entity_max_k,
+    )
+
+    feature_cluster = np.full(len(vocabulary), -1, dtype=int)
+    feature_strength = np.zeros(len(vocabulary), dtype=float)
+    feature_cluster[covered_feature_ids] = covered_labels
+    feature_strength[covered_feature_ids] = covered_strengths
+
+    document_frequency = np.asarray(
+        (development_matrix > 0).sum(axis=0)
+    ).ravel()
+
+    cluster_catalog: List[Dict[str, Any]] = []
+    cluster_descriptor: Dict[int, str] = {}
+    cluster_ids = sorted(
+        int(item)
+        for item in set(covered_labels.tolist())
+        if int(item) != -1
+    )
+
+    for cluster_id in cluster_ids:
+        feature_ids = np.flatnonzero(feature_cluster == cluster_id)
+        if len(feature_ids) == 0:
+            continue
+
+        centroid = cluster_model.centroids.get(cluster_id)
+        if centroid is None:
+            centrality = np.ones(len(feature_ids), dtype=float)
+        else:
+            centrality = np.clip(
+                phrase_vectors[feature_ids] @ centroid,
+                -1.0,
+                1.0,
+            )
+
+        importance = (
+            np.log1p(document_frequency[feature_ids])
+            * (centrality + 1.0)
+            * (feature_strength[feature_ids] + 1e-6)
+        )
+
+        ranked_local = np.argsort(importance)[::-1]
+        top_ids = feature_ids[ranked_local[:12]]
+        top_phrases = [
+            {
+                "phrase": str(vocabulary[feature_id]),
+                "development_document_frequency": int(
+                    document_frequency[feature_id]
+                ),
+                "cluster_membership_score": round(
+                    float(feature_strength[feature_id]),
+                    4,
+                ),
+            }
+            for feature_id in top_ids
+        ]
+
+        descriptor = " | ".join(
+            item["phrase"] for item in top_phrases[:5]
+        )
+        cluster_descriptor[cluster_id] = (
+            descriptor or f"concept_cluster_{cluster_id}"
+        )
+
+        cluster_catalog.append({
+            "cluster_id": int(cluster_id),
+            "descriptor": cluster_descriptor[cluster_id],
+            "candidate_phrase_count": int(len(feature_ids)),
+            "top_phrases": top_phrases,
+        })
+
+    all_matrix = candidate_vectorizer.transform(
+        user["text"].astype(str).tolist()
+    )
+
+    message_cluster_counts: Dict[int, int] = defaultdict(int)
+
+    for row_index in range(all_matrix.shape[0]):
+        start = all_matrix.indptr[row_index]
+        end = all_matrix.indptr[row_index + 1]
+        feature_ids = all_matrix.indices[start:end]
+        weights = all_matrix.data[start:end]
+
+        if len(feature_ids) == 0:
+            continue
+
+        order = np.argsort(weights)[::-1]
+        grouped: Dict[str, List[Dict[str, Any]]] = {}
+
+        for local_position in order:
+            feature_id = int(feature_ids[local_position])
+            cluster_id = int(feature_cluster[feature_id])
+
+            if cluster_id == -1:
+                continue
+
+            key = f"concept_cluster_{cluster_id:03d}"
+            grouped.setdefault(key, []).append({
+                "value": str(vocabulary[feature_id]),
+                "tfidf_weight": round(float(weights[local_position]), 4),
+                "cluster_membership_score": round(
+                    float(feature_strength[feature_id]),
+                    4,
+                ),
+                "cluster_descriptor": cluster_descriptor.get(
+                    cluster_id,
+                    key,
+                ),
+            })
+
+        trimmed: Dict[str, List[Dict[str, Any]]] = {}
+
+        ranked_clusters = sorted(
+            grouped.items(),
+            key=lambda item: max(
+                value["tfidf_weight"] for value in item[1]
+            ),
+            reverse=True,
+        )
+
+        for key, values in ranked_clusters[:config.entity_top_phrases]:
+            values.sort(
+                key=lambda item: (
+                    -item["tfidf_weight"],
+                    -item["cluster_membership_score"],
+                    item["value"],
+                )
+            )
+            trimmed[key] = values[
+                : config.entity_max_values_per_cluster
+            ]
+
+            try:
+                cluster_id = int(key.rsplit("_", 1)[-1])
+                message_cluster_counts[cluster_id] += 1
+            except ValueError:
+                pass
+
+        outputs[row_index] = trimmed
+
+    cluster_table = pd.DataFrame([
+        {
+            "cluster_id": item["cluster_id"],
+            "descriptor": item["descriptor"],
+            "candidate_phrase_count": item["candidate_phrase_count"],
+            "messages_with_cluster": int(
+                message_cluster_counts.get(item["cluster_id"], 0)
+            ),
+            "message_coverage_pct": pct(
+                int(message_cluster_counts.get(item["cluster_id"], 0)),
+                len(user),
+            ),
+        }
+        for item in cluster_catalog
+    ])
+
+    summary = {
+        "status": "completed",
+        "fit_partition": "development_only",
+        "method": (
+            "development n-gram mining -> development LSA vectors -> "
+            f"{cluster_model.method}"
+        ),
+        "named_business_axes_used": False,
+        "candidate_vocabulary_size": int(len(vocabulary)),
+        "phrases_with_latent_vector": int(covered.sum()),
+        "candidate_clusters_found": int(len(cluster_ids)),
+        "candidate_phrase_outliers": int((covered_labels == -1).sum()),
+        "silhouette_cosine_non_outliers": cluster_model.silhouette,
+        "parameters": cluster_model.parameters,
+        "clusters": cluster_catalog,
+        "interpretation": (
+            "Clusters are corpus-derived entity/context candidates. They are "
+            "not assigned service/device/symptom labels without supervision."
+        ),
+    }
+
+    log(
+        f"  method={cluster_model.method} "
+        f"clusters={len(cluster_ids)} "
+        f"phrase_outliers={int((covered_labels == -1).sum())}"
+    )
+
+    return outputs, summary, cluster_table
+
+
+# ---------------------------------------------------------------------------
+# Assistant finding discovery
+# ---------------------------------------------------------------------------
+
+def section_role(header: str) -> str:
+    value = re.sub(r"\s+", " ", header.strip().lower())
+
+    if value.startswith("root cause") or value in {"probable cause", "likely cause"}:
+        return "root_cause"
+    if (
+        value.startswith("recommendation")
+        or value in {"remediation", "resolution"}
+        or value.startswith("next step")
+    ):
+        return "remediation"
+    if value.startswith("diagnostic"):
+        return "diagnostic_check"
+    if value.startswith("limitation"):
+        return "limitation"
+    return "unclassified"
+
+
+def split_sentences(text: str) -> List[str]:
+    return [
+        piece.strip()
+        for piece in SENTENCE_RE.split(str(text))
+        if len(piece.strip()) >= 12
+    ]
+
+
+def extract_assistant_units(
+    text: str,
+    max_sentences: int,
+) -> List[Tuple[str, str]]:
+    """
+    Split an assistant response into sentence units.
+
+    Explicit section headings are preserved as structural roles. Text without a
+    recognized heading stays unclassified instead of being forced into an RCA
+    or remediation class.
+    """
+    matches = list(SECTION_MARKER_RE.finditer(text))
+    units: List[Tuple[str, str]] = []
+
+    if not matches:
+        for sentence in split_sentences(text)[:max_sentences]:
+            units.append((sentence, "unclassified"))
+        return units
+
+    prefix = text[:matches[0].start()].strip()
+    for sentence in split_sentences(prefix):
+        units.append((sentence, "unclassified"))
+
+    for position, match in enumerate(matches):
+        start = match.end()
+        end = (
+            matches[position + 1].start()
+            if position + 1 < len(matches)
+            else len(text)
+        )
+
+        role = section_role(match.group("header"))
+        segment = text[start:end].strip()
+
+        for sentence in split_sentences(segment):
+            units.append((sentence, role))
+
+    return units[:max_sentences]
+
+
+def build_link_key(
+    row: pd.Series,
+    schema: Dict[str, Optional[str]],
+) -> str:
+    conversation_col = schema.get("conversation")
+    case_col = schema.get("case")
+
+    if conversation_col:
+        value = str(row.get(conversation_col, "")).strip()
+        if value:
+            return f"conversation::{value}"
+
+    if case_col:
+        value = str(row.get(case_col, "")).strip()
+        if value:
+            return f"case::{value}"
+
+    return ""
+
+
+def assistant_units_table(
+    assistant: pd.DataFrame,
+    schema: Dict[str, Optional[str]],
+    config: RunConfig,
+) -> pd.DataFrame:
+    rows: List[Dict[str, Any]] = []
+
+    case_col = schema.get("case")
+    conversation_col = schema.get("conversation")
+
+    for assistant_row in range(len(assistant)):
+        source = assistant.iloc[assistant_row]
+        units = extract_assistant_units(
+            str(source["text"]),
+            config.max_sentences_per_message,
+        )
+
+        for sentence_index, (sentence, structural_role) in enumerate(units):
+            rows.append({
+                "assistant_row": int(assistant_row),
+                "sentence_index": int(sentence_index),
+                "case": (
+                    str(source.get(case_col, ""))
+                    if case_col
+                    else ""
+                ),
+                "conversation_id": (
+                    str(source.get(conversation_col, ""))
+                    if conversation_col
+                    else ""
+                ),
+                "link_key": build_link_key(source, schema),
+                "group_key": str(source.get("group_key", "")),
+                "data_split": str(source.get("data_split", "unlabelled")),
+                "structural_role": structural_role,
+                "sentence": sentence,
+            })
+
+    return pd.DataFrame(rows)
+
+
+def discover_assistant_findings(
+    assistant: pd.DataFrame,
+    schema: Dict[str, Optional[str]],
+    config: RunConfig,
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    log("\n[7/10] Assistant finding discovery")
+
+    if config.skip_assistant:
+        return pd.DataFrame(), {
+            "status": "skipped",
+            "reason": "disabled_by_flag",
+        }
+
+    if assistant.empty:
+        return pd.DataFrame(), {
+            "status": "skipped",
+            "reason": "no_assistant_turns",
+        }
+
+    units = assistant_units_table(
+        assistant,
+        schema,
+        config,
+    )
+
+    if units.empty:
+        return units, {
+            "status": "skipped",
+            "reason": "no_assistant_sentence_units",
+        }
+
+    units["finding_cluster_id"] = -1
+    units["finding_cluster_score"] = np.nan
+    units["finding_descriptor"] = "unassigned"
+
+    development = units[units["data_split"].eq("development")]
+    unique_development = (
+        development[["sentence"]]
+        .drop_duplicates("sentence")
+        .reset_index(drop=True)
+    )
+
+    if len(unique_development) < 30:
+        summary = {
+            "status": "partial",
+            "reason": "too_few_distinct_development_assistant_sentences_for_clustering",
+            "assistant_messages": int(len(assistant)),
+            "sentence_units": int(len(units)),
+            "structural_role_counts": {
+                str(key): int(value)
+                for key, value in units["structural_role"].value_counts().items()
+            },
+        }
+        return units, summary
+
+    representation, development_vectors = fit_latent_representation(
+        unique_development["sentence"].tolist(),
+        config,
+        max_components=config.assistant_svd_components,
+    )
+
+    cluster_model, assignments, strengths = fit_cluster_model(
+        development_vectors,
+        seed=config.seed,
+        requested_min_cluster_size=config.assistant_min_cluster_size,
+        requested_neighbors=config.topic_umap_neighbors,
+        max_k=config.assistant_max_k,
+    )
+
+    descriptions = describe_clusters_ctfidf(
+        unique_development["sentence"].tolist(),
+        assignments,
+    )
+
+    development_lookup = {
+        str(sentence): (
+            int(cluster_id),
+            float(score),
+        )
+        for sentence, cluster_id, score in zip(
+            unique_development["sentence"],
+            assignments,
+            strengths,
+        )
+    }
+
+    for index in units.index:
+        item = development_lookup.get(str(units.at[index, "sentence"]))
+        if item is not None:
+            units.at[index, "finding_cluster_id"] = item[0]
+            units.at[index, "finding_cluster_score"] = item[1]
+
+    unseen = units.index[
+        ~units["sentence"].isin(development_lookup.keys())
+    ]
+
+    if len(unseen):
+        unseen_vectors = representation.transform(
+            units.loc[unseen, "sentence"].astype(str).tolist()
+        )
+        predicted, predicted_strength = predict_clusters(
+            cluster_model,
+            unseen_vectors,
+        )
+        units.loc[unseen, "finding_cluster_id"] = predicted
+        units.loc[unseen, "finding_cluster_score"] = predicted_strength
+
+    def descriptor(cluster_id: Any) -> str:
+        try:
+            cluster = int(cluster_id)
+        except (TypeError, ValueError):
+            return "unassigned"
+        if cluster == -1:
+            return "unassigned"
+        return descriptions.get(
+            cluster,
+            {},
+        ).get(
+            "descriptor",
+            f"assistant_cluster_{cluster}",
+        )
+
+    units["finding_descriptor"] = units["finding_cluster_id"].map(descriptor)
+
+    development_assignments = np.asarray(assignments, dtype=int)
+    sizes = pd.Series(development_assignments).value_counts().sort_index()
+    clusters = sorted(
+        int(item)
+        for item in set(development_assignments.tolist())
+        if int(item) != -1
+    )
+
+    summary = {
+        "status": "completed",
+        "fit_partition": "development_only",
+        "method": (
+            "assistant sentence units -> word + character TF-IDF -> "
+            f"TruncatedSVD/LSA -> {cluster_model.method}"
+        ),
+        "assistant_messages": int(len(assistant)),
+        "sentence_units": int(len(units)),
+        "development_unique_sentences": int(len(unique_development)),
+        "finding_clusters_found": int(len(clusters)),
+        "development_unassigned_sentences": int(
+            (development_assignments == -1).sum()
+        ),
+        "silhouette_cosine_non_outliers": cluster_model.silhouette,
+        "structural_role_counts": {
+            str(key): int(value)
+            for key, value in units["structural_role"].value_counts().items()
+        },
+        "structural_role_note": (
+            "root_cause/remediation/diagnostic/limitation labels are assigned "
+            "only when explicit section headings are present."
+        ),
+        "clusters": [
+            {
+                "cluster_id": int(cluster_id),
+                "count": int(sizes.get(cluster_id, 0)),
+                "descriptor": (
+                    "unassigned"
+                    if int(cluster_id) == -1
+                    else descriptions.get(
+                        int(cluster_id),
+                        {},
+                    ).get(
+                        "descriptor",
+                        f"assistant_cluster_{cluster_id}",
+                    )
+                ),
+                "keywords": (
+                    []
+                    if int(cluster_id) == -1
+                    else descriptions.get(
+                        int(cluster_id),
+                        {},
+                    ).get("keywords", [])
+                ),
+            }
+            for cluster_id in sorted(set(development_assignments.tolist()))
+        ],
+    }
+
+    log(
+        f"  method={cluster_model.method} "
+        f"clusters={len(clusters)} "
+        f"sentences={len(units):,}"
+    )
+
+    return units, summary
+
+
+# ---------------------------------------------------------------------------
+# Topic-label alignment
+# ---------------------------------------------------------------------------
+
+def topic_label_alignment(
+    user: pd.DataFrame,
+    schema: Dict[str, Optional[str]],
+) -> Dict[str, Any]:
+    label_col, _ = resolve_label_and_group(schema)
+
+    if not label_col or "topic_id" not in user.columns:
+        return {"status": "skipped"}
+
+    mask = (
+        user["data_split"].eq("development")
+        & user[label_col].fillna("").astype(str).str.strip().ne("")
+        & user["topic_id"].ne(-1)
+    )
+
+    if mask.sum() < 20:
+        return {
+            "status": "skipped",
+            "reason": "insufficient_development_overlap",
+        }
+
+    labels = user.loc[mask, label_col].astype(str)
+    topics = user.loc[mask, "topic_id"].astype(int)
+
+    return {
+        "status": "completed",
+        "partition": "development_only",
+        "compared_rows": int(mask.sum()),
+        "normalized_mutual_information": float(
+            normalized_mutual_info_score(labels, topics)
+        ),
+        "adjusted_rand_index": float(
+            adjusted_rand_score(labels, topics)
+        ),
+        "note": (
+            "These measure structural alignment between discovered topics and "
+            "existing labels; they are not classification accuracy."
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Charts and tables
+# ---------------------------------------------------------------------------
+
+def horizontal_bar(
+    labels: Sequence[Any],
+    values: Sequence[float],
+    xlabel: str,
+    title: str,
+    path: Path,
+) -> None:
+    if not len(labels):
+        return
+
+    figure, axis = plt.subplots(
+        figsize=(8, max(2.0, 0.32 * len(labels) + 1))
+    )
+    positions = np.arange(len(labels))
+
+    axis.barh(positions, values, height=0.7)
+    axis.set_yticks(positions)
+    axis.set_yticklabels([str(item)[:64] for item in labels])
+    axis.invert_yaxis()
+    axis.set_xlabel(xlabel)
+    axis.set_title(title, loc="left", fontweight="bold")
+
+    for position, value in enumerate(values):
+        axis.text(
+            value,
+            position,
+            f" {value:,.4g}",
+            va="center",
+            fontsize=8,
+        )
+
+    figure.tight_layout()
+    figure.savefig(path, bbox_inches="tight", dpi=130)
+    plt.close(figure)
+
+
+def save_charts(
+    outdir: Path,
+    split_metrics: Dict[str, Any],
+    classifier_metrics: Dict[str, Any],
+    topic_metrics: Dict[str, Any],
+    entity_cluster_table: pd.DataFrame,
+    assistant_frame: pd.DataFrame,
+) -> None:
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    split_rows = split_metrics.get("customer_supervised_rows", {})
+    if split_rows:
+        horizontal_bar(
+            ["development", "locked_test"],
+            [
+                float(split_rows.get("development", 0)),
+                float(split_rows.get("locked_test", 0)),
+            ],
+            "labelled customer rows",
+            "Development / locked-test split",
+            outdir / "split_distribution.png",
+        )
+
+    topics = topic_metrics.get("topics") or []
+    topics = [
+        item
+        for item in topics
+        if int(item.get("topic_id", -1)) != -1
+    ]
+    topics = sorted(
+        topics,
+        key=lambda item: -int(item.get("count", 0)),
+    )[:25]
+
+    if topics:
+        horizontal_bar(
+            [item.get("descriptor", "") for item in topics],
+            [float(item.get("count", 0)) for item in topics],
+            "distinct development statements",
+            "Largest detailed-intent clusters",
+            outdir / "topic_sizes.png",
+        )
+
+    matrix_block = (
+        classifier_metrics.get("locked_test", {}).get("confusion_matrix")
+        if classifier_metrics.get("status") == "completed"
+        else None
+    )
+
+    if matrix_block and matrix_block.get("matrix"):
+        matrix = np.asarray(matrix_block["matrix"], dtype=float)
+        names = list(matrix_block["labels"])
+        normalised = matrix / np.clip(
+            matrix.sum(axis=1, keepdims=True),
+            1,
+            None,
+        )
+
+        figure, axis = plt.subplots(
+            figsize=(
+                1.4 * len(names) + 2.5,
+                1.2 * len(names) + 2,
+            )
+        )
+
+        image = axis.imshow(
+            normalised,
+            vmin=0,
+            vmax=1,
+            aspect="auto",
+        )
+        axis.set_xticks(range(len(names)))
+        axis.set_xticklabels(names, rotation=30, ha="right")
+        axis.set_yticks(range(len(names)))
+        axis.set_yticklabels(names)
+        axis.set_xlabel("predicted")
+        axis.set_ylabel("actual")
+        axis.grid(False)
+        axis.set_title("Locked test confusion", loc="left", fontweight="bold")
+
+        for row in range(len(names)):
+            for column in range(len(names)):
+                axis.text(
+                    column,
+                    row,
+                    f"{normalised[row, column]:.2f}",
+                    ha="center",
+                    va="center",
+                    fontsize=9,
+                )
+
+        figure.colorbar(image, ax=axis, fraction=0.04, pad=0.03)
+        figure.tight_layout()
+        figure.savefig(
+            outdir / "confusion_matrix.png",
+            bbox_inches="tight",
+            dpi=130,
+        )
+        plt.close(figure)
+
+    if isinstance(entity_cluster_table, pd.DataFrame) and not entity_cluster_table.empty:
+        top = (
+            entity_cluster_table
+            .sort_values("messages_with_cluster", ascending=False)
+            .head(25)
+        )
+        horizontal_bar(
+            top["descriptor"].tolist(),
+            top["messages_with_cluster"].astype(float).tolist(),
+            "customer messages",
+            "Largest entity/context candidate clusters",
+            outdir / "entity_cluster_sizes.png",
+        )
+
+    if isinstance(assistant_frame, pd.DataFrame) and not assistant_frame.empty:
+        counts = (
+            assistant_frame[
+                assistant_frame["finding_cluster_id"].ne(-1)
+            ]["finding_descriptor"]
+            .value_counts()
+            .head(25)
+        )
+        if len(counts):
+            horizontal_bar(
+                counts.index.tolist(),
+                counts.astype(float).tolist(),
+                "assistant sentence units",
+                "Largest assistant finding clusters",
+                outdir / "assistant_cluster_sizes.png",
+            )
+
+
+def write_csv(
+    path: Path,
+    frame: pd.DataFrame,
+    columns: Optional[Sequence[str]] = None,
+) -> None:
+    if frame.empty and columns:
+        pd.DataFrame(columns=list(columns)).to_csv(path, index=False)
+    else:
+        frame.to_csv(path, index=False)
+
+
+def write_tables(
+    outdir: Path,
+    user: pd.DataFrame,
+    entity_candidates: Sequence[Dict[str, List[Dict[str, Any]]]],
+    entity_cluster_table: pd.DataFrame,
+    assistant_frame: pd.DataFrame,
+    topic_metrics: Dict[str, Any],
+    split_metrics: Dict[str, Any],
+) -> None:
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    customer_columns = [
+        column
+        for column in [
+            "text",
+            "data_split",
+            "group_key",
+            "topic_id",
+            "detailed_intent",
+            "topic_membership_score",
+            "predicted_intent",
+            "prediction_score",
+            "prediction_source",
+        ]
+        if column in user.columns
+    ]
+    user[customer_columns].to_csv(
+        outdir / "customer_turns.csv",
+        index=False,
+    )
+
+    entity_rows: List[Dict[str, Any]] = []
+    for row_index, found in enumerate(entity_candidates):
+        for cluster_key, values in (found or {}).items():
+            for item in values:
+                entity_rows.append({
+                    "row": int(row_index),
+                    "concept_cluster": cluster_key,
+                    **item,
+                })
+
+    write_csv(
+        outdir / "entity_candidates.csv",
+        pd.DataFrame(entity_rows),
+        columns=[
+            "row",
+            "concept_cluster",
+            "value",
+            "tfidf_weight",
+            "cluster_membership_score",
+            "cluster_descriptor",
+        ],
+    )
+
+    write_csv(
+        outdir / "entity_clusters.csv",
+        entity_cluster_table,
+        columns=[
+            "cluster_id",
+            "descriptor",
+            "candidate_phrase_count",
+            "messages_with_cluster",
+            "message_coverage_pct",
+        ],
+    )
+
+    topic_rows = [
+        {
+            "topic_id": item.get("topic_id"),
+            "count": item.get("count"),
+            "descriptor": item.get("descriptor"),
+        }
+        for item in (topic_metrics.get("topics") or [])
+    ]
+    write_csv(
+        outdir / "topics.csv",
+        pd.DataFrame(topic_rows),
+        columns=["topic_id", "count", "descriptor"],
+    )
+
+    split_rows = split_metrics.get("customer_supervised_rows", {})
+    split_table = pd.DataFrame([
+        {
+            "split": key,
+            "rows": int(value),
+        }
+        for key, value in split_rows.items()
+    ])
+    write_csv(
+        outdir / "split_summary.csv",
+        split_table,
+        columns=["split", "rows"],
+    )
+
+    assistant_columns = [
+        "assistant_row",
+        "sentence_index",
+        "case",
+        "conversation_id",
+        "link_key",
+        "group_key",
+        "data_split",
+        "structural_role",
+        "sentence",
+        "finding_cluster_id",
+        "finding_cluster_score",
+        "finding_descriptor",
+    ]
+    write_csv(
+        outdir / "assistant_findings.csv",
+        assistant_frame,
+        columns=assistant_columns,
+    )
+
+    role_files = {
+        "root_cause": "rca.csv",
+        "remediation": "remediation.csv",
+        "diagnostic_check": "diagnostics.csv",
+        "limitation": "limitations.csv",
+    }
+
+    for role, filename in role_files.items():
+        if assistant_frame.empty:
+            subset = pd.DataFrame(columns=assistant_columns)
+        else:
+            subset = assistant_frame[
+                assistant_frame["structural_role"].eq(role)
+            ]
+        write_csv(
+            outdir / filename,
+            subset,
+            columns=assistant_columns,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Dictionary
+# ---------------------------------------------------------------------------
+
+def assistant_findings_index(
+    assistant_frame: pd.DataFrame,
+) -> Dict[str, List[Dict[str, Any]]]:
+    index: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+
+    if assistant_frame.empty:
+        return index
+
+    for item in assistant_frame.itertuples(index=False):
+        key = str(getattr(item, "link_key", "") or "")
+        if not key:
+            continue
+
+        index[key].append({
+            "structural_role": str(
+                getattr(item, "structural_role", "unclassified")
+            ),
+            "sentence": str(getattr(item, "sentence", "")),
+            "finding_cluster_id": int(
+                getattr(item, "finding_cluster_id", -1)
+            ),
+            "finding_cluster_score": to_plain(
+                getattr(item, "finding_cluster_score", None)
+            ),
+            "finding_descriptor": str(
+                getattr(item, "finding_descriptor", "unassigned")
+            ),
+        })
+
+    return index
+
+
+def build_dictionary(
+    config: RunConfig,
+    df: pd.DataFrame,
+    schema: Dict[str, Optional[str]],
+    profile: List[Dict[str, Any]],
+    quality: Dict[str, Any],
+    split_metrics: Dict[str, Any],
+    classifier_metrics: Dict[str, Any],
+    topic_metrics: Dict[str, Any],
+    entity_summary: Dict[str, Any],
+    assistant_summary: Dict[str, Any],
+    assistant_frame: pd.DataFrame,
+    alignment: Dict[str, Any],
+    user: pd.DataFrame,
+    entity_candidates: Sequence[
+        Dict[str, List[Dict[str, Any]]]
+    ],
+) -> Dict[str, Any]:
+    log("\n[9/10] Assembling final dictionary")
+
+    label_col, _ = resolve_label_and_group(schema)
+    case_col = schema.get("case")
+    conversation_col = schema.get("conversation")
+    turn_col = schema.get("turn")
+
+    findings = assistant_findings_index(assistant_frame)
+    records: Dict[str, Dict[str, Any]] = {}
+
+    for number, (_, row) in enumerate(
+        user.iterrows(),
+        start=1,
+    ):
+        record_id = f"record_{number:06d}"
+        link_key = build_link_key(row, schema)
+        linked_findings = findings.get(link_key, [])
+
+        records[record_id] = {
+            "record_id": record_id,
+            "case": (
+                str(row.get(case_col, ""))
+                if case_col
+                else ""
+            ),
+            "conversation_id": (
+                str(row.get(conversation_col, ""))
+                if conversation_col
+                else ""
+            ),
+            "turn_index": (
+                str(row.get(turn_col, ""))
+                if turn_col
+                else ""
+            ),
+            "data_split": str(
+                row.get("data_split", "unlabelled")
+            ),
+            "customer_problem": str(row["text"]),
+            "broad_intent": {
+                "existing_label": (
+                    str(row.get(label_col, ""))
+                    if label_col
+                    else ""
+                ),
+                "predicted_label": str(
+                    row.get("predicted_intent", "")
+                ),
+                "prediction_score": to_plain(
+                    row.get("prediction_score")
+                ),
+                "prediction_source": str(
+                    row.get("prediction_source", "")
+                ),
+            },
+            "detailed_intent": {
+                "topic_id": to_plain(
+                    row.get("topic_id", -1)
+                ),
+                "topic_descriptor": str(
+                    row.get("detailed_intent", "unassigned")
+                ),
+                "topic_membership_score": to_plain(
+                    row.get("topic_membership_score")
+                ),
+            },
+            "entity_context_candidates": to_plain(
+                entity_candidates[number - 1]
+            ),
+            "assistant_findings": to_plain(linked_findings),
+            "root_cause": to_plain([
+                item
+                for item in linked_findings
+                if item["structural_role"] == "root_cause"
+            ]),
+            "remediation": to_plain([
+                item
+                for item in linked_findings
+                if item["structural_role"] == "remediation"
+            ]),
+            "diagnostic_checks": to_plain([
+                item
+                for item in linked_findings
+                if item["structural_role"] == "diagnostic_check"
+            ]),
+            "limitations": to_plain([
+                item
+                for item in linked_findings
+                if item["structural_role"] == "limitation"
+            ]),
+        }
+
+    return to_plain({
+        "run": {
+            "analysis_name": "NORA offline ML/NLP intent analysis v2",
+            "input_file": Path(config.input_path).name,
+            "config": asdict(config),
+        },
+        "schema": schema,
+        "dataset": {
+            "input_rows": int(len(df)),
+            "column_profile": profile,
+            "data_quality": quality,
+        },
+        "split": split_metrics,
+        "analysis": {
+            "broad_intent_supervised_ml": classifier_metrics,
+            "detailed_intent_discovery": topic_metrics,
+            "entity_context_candidate_discovery": entity_summary,
+            "assistant_finding_discovery": assistant_summary,
+            "topic_vs_existing_label": alignment,
+        },
+        "records": records,
+    })
+
+
+# ---------------------------------------------------------------------------
+# CLI and entry point
+# ---------------------------------------------------------------------------
+
+def parse_args(
+    argv: Optional[Sequence[str]] = None,
+) -> Tuple[RunConfig, Path]:
+    parser = argparse.ArgumentParser(
+        description="NORA offline ML/NLP intent analysis"
+    )
+
+    parser.add_argument("--input", required=True, dest="input_path")
+    parser.add_argument("--output-json", default="nora_dictionary.json")
+    parser.add_argument("--outdir", default="nora_out")
+    parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
+    parser.add_argument("--sample", type=int, default=0, dest="sample_rows")
+    parser.add_argument("--test-size", type=float, default=0.20)
+    parser.add_argument("--cv-splits", type=int, default=5)
+
+    parser.add_argument("--word-max-features", type=int, default=30000)
+    parser.add_argument("--char-max-features", type=int, default=30000)
+
+    parser.add_argument("--topic-svd-components", type=int, default=128)
+    parser.add_argument(
+        "--topic-min-cluster-size",
+        type=int,
+        default=0,
+        help="0 = derive from development corpus size",
+    )
+    parser.add_argument(
+        "--topic-umap-neighbors",
+        type=int,
+        default=0,
+        help="0 = derive from development corpus size",
+    )
+    parser.add_argument("--topic-max-k", type=int, default=30)
+
+    parser.add_argument("--entity-max-features", type=int, default=12000)
+    parser.add_argument("--entity-top-phrases", type=int, default=12)
+    parser.add_argument(
+        "--entity-max-values-per-cluster",
+        type=int,
+        default=3,
+    )
+    parser.add_argument(
+        "--entity-min-cluster-size",
+        type=int,
+        default=0,
+    )
+    parser.add_argument("--entity-max-k", type=int, default=30)
+
+    parser.add_argument("--assistant-svd-components", type=int, default=96)
+    parser.add_argument(
+        "--assistant-min-cluster-size",
+        type=int,
+        default=0,
+    )
+    parser.add_argument("--assistant-max-k", type=int, default=30)
+    parser.add_argument(
+        "--max-sentences-per-message",
+        type=int,
+        default=40,
+    )
+    parser.add_argument("--skip-assistant", action="store_true")
+
+    args = parser.parse_args(argv)
+
+    if not 0.05 <= args.test_size <= 0.50:
+        parser.error("--test-size must be between 0.05 and 0.50")
+    if args.cv_splits < 2:
+        parser.error("--cv-splits must be at least 2")
+    if args.word_max_features < 100:
+        parser.error("--word-max-features must be at least 100")
+    if args.char_max_features < 100:
+        parser.error("--char-max-features must be at least 100")
+    if args.topic_svd_components < 2:
+        parser.error("--topic-svd-components must be at least 2")
+    if args.entity_max_features < 100:
+        parser.error("--entity-max-features must be at least 100")
+    if args.entity_top_phrases < 1:
+        parser.error("--entity-top-phrases must be at least 1")
+    if args.entity_max_values_per_cluster < 1:
+        parser.error("--entity-max-values-per-cluster must be at least 1")
+    if args.max_sentences_per_message < 1:
+        parser.error("--max-sentences-per-message must be at least 1")
+
+    fields = dict(vars(args))
+    outdir = Path(fields.pop("outdir"))
+
+    return RunConfig(**fields), outdir
+
+
+def main(
+    argv: Optional[Sequence[str]] = None,
+) -> int:
+    warnings.filterwarnings("once")
+
+    config, outdir = parse_args(argv)
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    output_path = Path(config.output_json)
+    if not output_path.is_absolute() and output_path.parent == Path("."):
+        output_path = outdir / output_path.name
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    log("=" * 80)
+    log("NORA OFFLINE ML/NLP INTENT ANALYSIS v2")
+    log("=" * 80)
+    log(f"input  : {Path(config.input_path).resolve()}")
+    log(f"output : {output_path.resolve()}")
+    log(f"review : {outdir.resolve()}")
+
+    df, schema = load_input(config)
+    profile = profile_columns(df, schema)
+
+    work = prepare_raw_frame(df, schema)
+    work, split_metrics = create_locked_split(
+        work,
+        schema,
+        config,
+    )
+
+    user, assistant, quality = build_corpora(
+        work,
+        schema,
+    )
+
+    user, classifier_metrics = evaluate_broad_intent(
+        user,
+        schema,
+        config,
+    )
+
+    user, topic_metrics, representation = discover_detailed_intents(
+        user,
+        config,
+    )
+
+    entity_candidates, entity_summary, entity_cluster_table = (
+        discover_entity_candidates(
+            user,
+            representation,
+            config,
+        )
+    )
+
+    assistant_frame, assistant_summary = discover_assistant_findings(
+        assistant,
+        schema,
+        config,
+    )
+
+    alignment = topic_label_alignment(
+        user,
+        schema,
+    )
+
+    save_charts(
+        outdir,
+        split_metrics,
+        classifier_metrics,
+        topic_metrics,
+        entity_cluster_table,
+        assistant_frame,
+    )
+
+    write_tables(
+        outdir,
+        user,
+        entity_candidates,
+        entity_cluster_table,
+        assistant_frame,
+        topic_metrics,
+        split_metrics,
+    )
+
+    payload = build_dictionary(
+        config=config,
+        df=df,
+        schema=schema,
+        profile=profile,
+        quality=quality,
+        split_metrics=split_metrics,
+        classifier_metrics=classifier_metrics,
+        topic_metrics=topic_metrics,
+        entity_summary=entity_summary,
+        assistant_summary=assistant_summary,
+        assistant_frame=assistant_frame,
+        alignment=alignment,
+        user=user,
+        entity_candidates=entity_candidates,
+    )
+
+    with output_path.open(
+        "w",
+        encoding="utf-8",
+    ) as handle:
+        json.dump(
+            payload,
+            handle,
+            indent=2,
+            ensure_ascii=False,
+        )
+
+    log("\n[10/10] COMPLETE")
+    log(f"  dictionary : {output_path.resolve()}")
+    log(f"  review dir : {outdir.resolve()}")
+    log(f"  records    : {len(payload['records']):,}")
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

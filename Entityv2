@@ -1,0 +1,577 @@
+# nora_entity_v2.py
+# Entity vocabulary discovery and column inventory over the NORA turn-level export.
+# Run cell by cell in the VS Code Interactive Window.
+#
+# Fixes over v1:
+#   - surrogates were stripped after lowercasing, so masked tokens leaked into the
+#     vocabulary as "name" plus a hex tail. Stripped before lowering now.
+#   - the name blocker matched surnames that are also ordinary words (bill, long,
+#     price), which suppressed real axis coverage. A harvested token is now only
+#     treated as a name when most of its corpus occurrences sit inside a name field.
+#   - actor patterns are proper word-boundary regexes rather than literals with
+#     trailing spaces.
+
+# %%
+import os
+import re
+import json
+import hmac
+import hashlib
+import secrets
+from collections import Counter
+
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+INPUT = "intent_labels_all_flattened.csv"
+OUTDIR = "entity_out"
+SALT_FILE = "nora_salt.txt"
+SEED = 42
+
+os.makedirs(OUTDIR, exist_ok=True)
+plt.rcParams.update({"figure.dpi": 110, "savefig.dpi": 130, "font.size": 9,
+                     "axes.spines.top": False, "axes.spines.right": False,
+                     "axes.grid": True, "grid.alpha": .25, "axes.axisbelow": True,
+                     "figure.facecolor": "white"})
+
+# Candidate axes under review. These are a hypothesis to be tested, not a lookup
+# table the analysis depends on - cell 5 measures how much of it the corpus
+# supports, cell 6 finds which terms never occur, cell 7 mines what it misses.
+SEEDS = {
+    "service": ["voice", "call", "calls", "sms", "text message", "text messages",
+                "mms", "rcs", "roaming", "hotspot", "data", "mobile data",
+                "internet", "home internet", "broadband", "voicemail", "wifi",
+                "wi-fi", "wifi calling", "line", "tethering"],
+    "network_tech": ["4g", "5g", "lte", "volte", "vowifi", "wifi calling",
+                     "wi-fi calling", "3g", "nr", "5gsa", "5g sa", "band",
+                     "n41", "n71", "apn"],
+    "device": ["iphone", "samsung", "galaxy", "pixel", "android", "ipad",
+               "inseego", "cradlepoint", "craddlepoint", "franklin", "moto",
+               "motorola", "oneplus", "watch", "tablet", "laptop", "sim",
+               "esim", "embedded sim", "router", "gateway", "modem"],
+    "device_class": ["phone", "router", "gateway", "modem", "watch", "tablet",
+                     "hotspot", "sim", "laptop", "mesh", "extender"],
+    "location": ["indoor", "indoors", "outdoor", "outdoors", "overseas",
+                 "abroad", "international", "home", "office", "building",
+                 "basement", "site", "address", "area"],
+    "time": ["since morning", "yesterday", "today", "last night", "three days",
+             "few days", "a week", "last week", "intermittently", "constantly",
+             "always", "randomly", "since", "for hours", "past month"],
+    "symptom": ["not working", "no service", "no signal", "dropping", "drops",
+                "dropped", "slow", "unavailable", "rejected", "failed",
+                "failing", "offline", "down", "outage", "buffering", "lag",
+                "cannot connect", "can't connect", "unable to", "no connection",
+                "no data", "poor", "weak", "freezing", "disconnect"],
+    "action": ["activate", "activation", "unlock", "swap", "dispute", "check",
+               "cancel", "suspend", "restore", "port", "transfer", "upgrade",
+               "downgrade", "add", "remove", "change", "order", "replace"],
+    "troubleshooting": ["restart", "reboot", "reset", "factory reset",
+                        "apn modification", "power cycle", "toggle",
+                        "airplane mode", "refresh", "reprovision", "reseat",
+                        "update software", "network reset"],
+    "scope": ["one device", "single device", "multiple phones", "multiple devices",
+              "all lines", "everyone", "whole office", "entire", "several",
+              "both", "all users", "one line"],
+    "impact": ["work affected", "cannot work", "business impact", "emergency",
+               "911", "unable to work", "losing business", "critical",
+               "escalate", "urgent"],
+    "billing": ["bill", "billing", "charge", "charged", "charges", "invoice",
+                "payment", "refund", "credit", "overcharge", "plan cost",
+                "rate plan", "autopay"],
+}
+
+ACTOR_PATTERNS = {
+    "actor_customer": r"\b(?:customer|customers|cust|cx|client|subscriber|end user)\b",
+    "actor_agent":    r"\b(?:rep|reps|care|agent|advisor|tech support|i|we)\b",
+    "actor_network":  r"\b(?:network|tower|site|cell site|node|carrier)\b",
+}
+
+# %%
+# --- 1. load and profile ------------------------------------------------------
+df = pd.read_csv(INPUT, dtype=str, keep_default_na=False,
+                 na_values=["", "NA", "NaN", "null", "None", "nan"],
+                 low_memory=False)
+print(df.shape)
+
+
+def find_col(cols, patterns, exclude=()):
+    for pat in patterns:
+        for c in cols:
+            n = re.sub(r"[^a-z0-9]+", "_", str(c).lower())
+            if any(re.search(e, n) for e in exclude):
+                continue
+            if re.search(pat, n):
+                return c
+    return None
+
+
+COL = {
+    "case":  find_col(df.columns, [r"^source_row$", r"source.*row", r"^row_?id$"]),
+    "turn":  find_col(df.columns, [r"message_index", r"turn.*index", r"^index$"]),
+    "text":  find_col(df.columns, [r"data_content$", r"content$", r"^text$"]),
+    "role":  find_col(df.columns, [r"^message_type$", r"message_type$", r"^role$"]),
+    "label": find_col(df.columns, [r"data_label$", r"(^|_)label$"], exclude=[r"predict"]),
+    "conv_label": find_col(df.columns, [r"classification.*intent", r"case.*intent"]),
+}
+print(COL)
+
+if not COL["text"]:
+    raise SystemExit("no message content column found")
+
+prof = []
+for c in df.columns:
+    s = df[c].dropna().astype(str)
+    s = s[s.str.strip() != ""]
+    prof.append({
+        "column": c,
+        "fill_pct": round(100 * len(s) / len(df), 2),
+        "distinct": s.nunique(),
+        "median_len": int(s.str.len().median()) if len(s) else 0,
+        "max_len": int(s.str.len().max()) if len(s) else 0,
+    })
+prof = pd.DataFrame(prof)
+prof.to_csv(f"{OUTDIR}/01_column_profile.csv", index=False)
+print(prof.to_string(index=False))
+
+# %%
+# --- 2. partition user / assistant -------------------------------------------
+df["role"] = (df[COL["role"]].fillna("unknown").astype(str).str.strip().str.lower()
+              if COL["role"] else "unknown")
+df["raw"] = (df[COL["text"]].fillna("").astype(str)
+             .str.replace(r"\\r", " ", regex=True)
+             .str.replace(r"\\n", "\n", regex=True))
+
+print(df["role"].value_counts().to_string())
+
+user = df[df["role"] == "user"].copy()
+asst = df[df["role"] == "assistant"].copy()
+
+split = pd.DataFrame([
+    {"partition": "user", "messages": len(user),
+     "median_chars": int(user["raw"].str.len().median()),
+     "p95_chars": int(user["raw"].str.len().quantile(.95))},
+    {"partition": "assistant", "messages": len(asst),
+     "median_chars": int(asst["raw"].str.len().median()),
+     "p95_chars": int(asst["raw"].str.len().quantile(.95))},
+])
+split.to_csv(f"{OUTDIR}/02_partition_summary.csv", index=False)
+print(split.to_string(index=False))
+
+# %%
+# --- 3. PII removal -----------------------------------------------------------
+# Identifier form fields are dropped, not surrogated - a stable token for a BAN is
+# still a join key back to one person. Names typed into free text are caught by
+# harvesting values from name fields, but a harvested token is only blocked when
+# most of its corpus occurrences sit inside a name field. Without that test the
+# blocker deletes surnames that are also ordinary words and every downstream
+# coverage figure comes out too low.
+
+if os.path.exists(SALT_FILE):
+    SALT = open(SALT_FILE).read().strip().encode()
+else:
+    SALT = secrets.token_hex(32).encode()
+    open(SALT_FILE, "w").write(SALT.decode())
+    print(f"created {SALT_FILE} - keep it out of git and OneDrive")
+
+PII = [
+    ("URL",    re.compile(r"https?://\S+")),
+    ("EMAIL",  re.compile(r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b")),
+    ("IP",     re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")),
+    ("EID",    re.compile(r"\b[0-9a-fA-F]{32}\b")),
+    ("UUID",   re.compile(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+                          r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b")),
+    ("ICCID",  re.compile(r"\b89\d{17,20}\b")),
+    ("IMEI",   re.compile(r"\b\d{14,17}\b")),
+    ("MSISDN", re.compile(r"(?<!\d)(?:\+?\d{1,3}[\s\-.]?)?\(?\d{3}\)?[\s\-.]?"
+                          r"\d{3}[\s\-.]?\d{4}(?!\d)")),
+    ("ACCT",   re.compile(r"(?<!\d)\d{8,}(?!\d)")),
+    ("GEO",    re.compile(r"(?<![\w.])-?\d{1,3}\.\d{4,}(?![\w.])")),
+    ("NUMID",  re.compile(r"(?<!\d)\d{5,7}(?!\d)")),
+]
+ADDRESS = re.compile(
+    r"\b\d{1,6}\s+(?:[A-Za-z0-9.'\-]+\s+){0,4}"
+    r"(?:st|street|rd|road|ave|avenue|blvd|ln|lane|dr|drive|ct|court|way|pl|"
+    r"place|pkwy|hwy|cir|circle|apt|suite|ste|unit)\b\.?", re.I)
+NAME_CUE = re.compile(
+    r"(?i)\b(?:customer\s*name|customername|contact\s*name|account\s*name|"
+    r"caller|cust\s*name|first\s*name|last\s*name|full\s*name)\s*[:\-]\s*"
+    r"(?P<val>[A-Za-z][A-Za-z'\-]{1,20}(?:\s+[A-Za-z][A-Za-z'\-]{1,20}){0,4})")
+FIELD_LINE = re.compile(r"(?m)^[ \t\-\*#>]*(?P<k>[A-Za-z][A-Za-z0-9 _\-/#\.]{1,44}?)"
+                        r"\s*:\s*(?P<v>.*)$")
+
+ID_FIELDS = [
+    ("NAME",  r"(customer|contact|account|subscriber|caller|first|last|full)?_?name"),
+    ("EMAIL", r"e_?mail"),
+    ("PHONE", r"phone|mobile|msisdn|call_?back|callback|number_?with_issue|with_issue"),
+    ("IMEI",  r"imei"),
+    ("ICCID", r"iccid|sim_?serial"),
+    ("EID",   r"^eid$|euicc"),
+    ("BAN",   r"^ban$|billing_?account|account_?number|acct"),
+    ("ADDR",  r"address|street|zip|postal|city|state"),
+    ("ID",    r"^cid$|uuid|guid|ticket|case_?number|order_?number"),
+]
+
+masked_counts = Counter()
+
+
+def norm_key(k):
+    return re.sub(r"[^a-z0-9]+", "_", str(k).strip().lower()).strip("_")
+
+
+def key_kind(k):
+    for kind, pat in ID_FIELDS:
+        if re.search(pat, k):
+            return kind
+    return None
+
+
+def surrogate(kind, val):
+    h = hmac.new(SALT, f"{kind}|{val}".encode("utf-8", "ignore"),
+                 hashlib.sha256).hexdigest()[:10]
+    masked_counts[kind] += 1
+    return f"<{kind}_{h}>"
+
+
+# pass 1 - where do candidate name tokens appear, and how often overall
+name_ctx = Counter()
+general = Counter()
+for t in df["raw"]:
+    if not isinstance(t, str) or not t:
+        continue
+    for m in FIELD_LINE.finditer(t):
+        if key_kind(norm_key(m.group("k"))) == "NAME":
+            for w in re.findall(r"[A-Za-z][A-Za-z'\-]{1,}", m.group("v")):
+                name_ctx[w.lower()] += 1
+    for m in NAME_CUE.finditer(t):
+        for w in re.findall(r"[A-Za-z][A-Za-z'\-]{1,}", m.group("val")):
+            name_ctx[w.lower()] += 1
+    for w in re.findall(r"[A-Za-z][A-Za-z'\-]{2,}", t.lower()):
+        general[w] += 1
+
+# A real customer name occurs almost exclusively in a name field. A surname that
+# doubles as an ordinary word does not. Majority rule, no tuned threshold.
+NAMES = {w for w, c in name_ctx.items()
+         if len(w) >= 3 and c / max(general.get(w, c), 1) >= 0.5}
+dropped = sorted(set(name_ctx) - NAMES)
+
+NAME_RE = (re.compile(r"(?i)\b(?:" +
+                      "|".join(re.escape(w) for w in sorted(NAMES, key=len, reverse=True)) +
+                      r")\b") if NAMES else None)
+print(f"name candidates harvested: {len(name_ctx)}")
+print(f"blocked as names: {len(NAMES)}")
+print(f"released as ordinary vocabulary: {len(dropped)}")
+pd.DataFrame({"token": dropped}).to_csv(f"{OUTDIR}/03_released_tokens.csv", index=False)
+
+
+def scrub(text):
+    if not isinstance(text, str) or not text:
+        return ""
+    s = NAME_CUE.sub(lambda m: m.group(0)[:m.start("val") - m.start(0)] +
+                     surrogate("NAME", m.group("val").lower()), text)
+    s = ADDRESS.sub(lambda m: surrogate("ADDR", m.group(0).lower()), s)
+    for kind, rx in PII:
+        s = rx.sub(lambda m, k=kind: surrogate(k, m.group(0)), s)
+    if NAME_RE:
+        s = NAME_RE.sub(lambda m: surrogate("NAME", m.group(0).lower()), s)
+    return s
+
+
+def strip_fields(text):
+    """Split an intake form; drop identifier fields, keep free text."""
+    fields, spans = {}, []
+    for m in FIELD_LINE.finditer(text):
+        k = norm_key(m.group("k"))
+        if len(k) < 2:
+            continue
+        fields.setdefault(k, m.group("v").strip())
+        spans.append((m.start(), m.end()))
+    if not spans:
+        return scrub(text)
+    rest, prev = [], 0
+    for a, b in spans:
+        rest.append(text[prev:a])
+        prev = b
+    rest.append(text[prev:])
+    keep = [scrub(v) for k, v in fields.items() if key_kind(k) is None and v]
+    for k in fields:
+        if key_kind(k):
+            masked_counts[key_kind(k)] += 1
+    tail = scrub(" ".join(rest))
+    return " ".join([p for p in keep if p] + [tail]).strip()
+
+
+user["clean"] = user["raw"].map(strip_fields)
+asst["clean"] = asst["raw"].map(scrub)
+
+SURR = re.compile(r"<[A-Za-z_]+_[0-9a-fA-F]{6,}>")
+RESIDUE = [
+    ("email", re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")),
+    ("digits5", re.compile(r"(?<!\d)\d{5,}(?!\d)")),
+    ("ipv4", re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")),
+    ("hex32", re.compile(r"\b[0-9a-fA-F]{32}\b")),
+]
+
+for part, frame in (("user", user), ("assistant", asst)):
+    probe = frame["clean"].str.replace(SURR, " ", regex=True)
+    bad = pd.Series(False, index=frame.index)
+    for _, rx in RESIDUE:
+        bad |= probe.str.contains(rx, regex=True)
+    frame.loc[bad, "clean"] = ""
+    print(f"{part}: {int(bad.sum())} messages blanked by residue gate")
+
+# surrogates come out BEFORE lowercasing, or the pattern stops matching and the
+# hash tails survive as vocabulary
+for frame in (user, asst):
+    s = frame["clean"].str.replace(SURR, " ", regex=True)
+    frame["clean"] = (s.str.lower()
+                      .str.replace(r"[^a-z0-9%.\-/' ]+", " ", regex=True)
+                      .str.replace(r"\s+", " ", regex=True).str.strip())
+
+user = user[user["clean"].str.len() >= 3].copy()
+asst = asst[asst["clean"].str.len() >= 3].copy()
+print(f"after cleaning: user {len(user)}  assistant {len(asst)}")
+
+masks = pd.DataFrame(sorted(masked_counts.items()), columns=["entity", "count"])
+masks.to_csv(f"{OUTDIR}/03_masking_summary.csv", index=False)
+print(masks.to_string(index=False))
+
+leak = user["clean"].str.contains(r"\b[0-9a-f]{8,}\b", regex=True).sum()
+print(f"surrogate leak check - messages still holding a hash tail: {int(leak)}")
+
+# %%
+# --- 4. lexical EDA -----------------------------------------------------------
+STOP = set("""a an the and or but if then than of to in on at for with without from by
+is are was were be been being do does did doing have has had having i we you he she it
+they them his her its their our my me us this that these those as so not no nor can
+could will would shall should may might must about into over under again further once
+here there when where why how all any both each few more most other some such only own
+same too very s t just now up down out off""".split())
+HEXISH = re.compile(r"^[0-9a-f]{6,}$")
+
+
+def tokens(s, n=1):
+    w = [x for x in s.split()
+         if x not in STOP and len(x) > 1 and not HEXISH.match(x)]
+    if n == 1:
+        return w
+    return [" ".join(w[i:i + n]) for i in range(len(w) - n + 1)]
+
+
+def term_table(texts, n, top):
+    doc = Counter()
+    for t in texts:
+        for g in set(tokens(t, n)):
+            doc[g] += 1
+    return pd.DataFrame([{"term": k, "n_gram": n, "messages": v,
+                          "pct_of_messages": round(100 * v / max(len(texts), 1), 2)}
+                         for k, v in doc.most_common(top)])
+
+
+terms_user = pd.concat([term_table(user["clean"], 1, 400),
+                        term_table(user["clean"], 2, 400)], ignore_index=True)
+terms_user.to_csv(f"{OUTDIR}/04_terms_user.csv", index=False)
+
+terms_asst = pd.concat([term_table(asst["clean"], 1, 400),
+                        term_table(asst["clean"], 2, 400)], ignore_index=True)
+terms_asst.to_csv(f"{OUTDIR}/04_terms_assistant.csv", index=False)
+
+print(terms_user.head(25).to_string(index=False))
+
+order = user["clean"].sample(frac=1, random_state=SEED).tolist()
+seen, curve = set(), []
+for i, t in enumerate(order, 1):
+    seen.update(tokens(t))
+    if i % 25 == 0:
+        curve.append((i, len(seen)))
+curve = pd.DataFrame(curve, columns=["messages", "distinct_terms"])
+curve.to_csv(f"{OUTDIR}/04_vocab_curve.csv", index=False)
+
+fig, ax = plt.subplots(figsize=(7, 3.4))
+ax.plot(curve["messages"], curve["distinct_terms"], color="#2b6cb0")
+ax.set_xlabel("messages read")
+ax.set_ylabel("distinct terms")
+ax.set_title("Vocabulary saturation", loc="left", fontweight="bold")
+fig.savefig(f"{OUTDIR}/fig_vocab_curve.png", bbox_inches="tight")
+plt.close(fig)
+print(f"vocabulary: {len(seen)} distinct terms")
+
+# %%
+# --- 5. axis coverage ---------------------------------------------------------
+def compile_axis(terms):
+    pats = sorted(terms, key=len, reverse=True)
+    return re.compile(r"(?<!\w)(?:" + "|".join(re.escape(p) for p in pats) + r")(?!\w)")
+
+
+AXIS_RE = {a: compile_axis(v) for a, v in SEEDS.items()}
+ACTOR_RE = {a: re.compile(p) for a, p in ACTOR_PATTERNS.items()}
+
+hits = pd.DataFrame(index=user.index)
+for axis, rx in AXIS_RE.items():
+    hits[axis] = user["clean"].str.contains(rx, regex=True)
+for actor, rx in ACTOR_RE.items():
+    hits[actor] = user["clean"].str.contains(rx, regex=True)
+
+cov = (hits.mean() * 100).round(2).rename_axis("axis").reset_index(
+    name="pct_of_user_messages").sort_values("pct_of_user_messages", ascending=False)
+cov["messages"] = [int(hits[a].sum()) for a in cov["axis"]]
+cov["verdict"] = np.where(cov["pct_of_user_messages"] >= 20, "well supported",
+                   np.where(cov["pct_of_user_messages"] >= 5, "thin", "not supported"))
+cov.to_csv(f"{OUTDIR}/05_axis_coverage.csv", index=False)
+print(cov.to_string(index=False))
+
+fig, ax = plt.subplots(figsize=(8, .32 * len(cov) + 1))
+y = np.arange(len(cov))
+colors = ["#2f855a" if v == "well supported" else "#c05621" if v == "thin"
+          else "#9b2c2c" for v in cov["verdict"]]
+ax.barh(y, cov["pct_of_user_messages"], color=colors, height=.7)
+ax.set_yticks(y)
+ax.set_yticklabels(cov["axis"])
+ax.invert_yaxis()
+ax.set_xlabel("% of user messages containing at least one term")
+ax.set_title("Which entity axes the data supports", loc="left", fontweight="bold")
+for i, v in enumerate(cov["pct_of_user_messages"]):
+    ax.text(v + .3, i, f"{v}%", va="center", fontsize=8, color="#4a5568")
+fig.savefig(f"{OUTDIR}/fig_axis_coverage.png", bbox_inches="tight")
+plt.close(fig)
+
+axis_cols = list(SEEDS.keys())
+per_msg = hits[axis_cols].sum(axis=1)
+depth = (per_msg.value_counts().sort_index()
+         .rename_axis("axes_present").reset_index(name="messages"))
+depth["pct"] = (100 * depth["messages"] / len(user)).round(2)
+depth.to_csv(f"{OUTDIR}/05_axes_per_message.csv", index=False)
+print(depth.to_string(index=False))
+print(f"messages with no axis at all: {int((per_msg == 0).sum())} "
+      f"({100 * (per_msg == 0).mean():.1f}%)")
+
+# %%
+# --- 6. which terms are carrying each axis ------------------------------------
+rows = []
+for axis, terms in SEEDS.items():
+    for t in terms:
+        rx = re.compile(r"(?<!\w)" + re.escape(t) + r"(?!\w)")
+        n = int(user["clean"].str.contains(rx, regex=True).sum())
+        rows.append({"axis": axis, "term": t, "messages": n,
+                     "pct": round(100 * n / len(user), 3)})
+seed_hits = pd.DataFrame(rows).sort_values(["axis", "messages"],
+                                           ascending=[True, False])
+seed_hits.to_csv(f"{OUTDIR}/06_term_hits.csv", index=False)
+
+dead = seed_hits[seed_hits["messages"] == 0]
+print(f"candidate terms with zero corpus support: {len(dead)} of {len(seed_hits)}")
+print(dead.groupby("axis").size().to_string())
+
+# %%
+# --- 7. frequent terms no axis claims -----------------------------------------
+claimed = {t for terms in SEEDS.values() for t in terms}
+unmatched = terms_user[~terms_user["term"].isin(claimed)].copy()
+unmatched = unmatched[unmatched["pct_of_messages"] >= 1].head(80)
+unmatched.to_csv(f"{OUTDIR}/07_unclaimed_terms.csv", index=False)
+print(unmatched.head(40).to_string(index=False))
+
+top = unmatched.head(25)
+fig, ax = plt.subplots(figsize=(8, .3 * len(top) + 1))
+y = np.arange(len(top))
+ax.barh(y, top["pct_of_messages"], color="#6b46c1", height=.7)
+ax.set_yticks(y)
+ax.set_yticklabels(top["term"])
+ax.invert_yaxis()
+ax.set_xlabel("% of user messages")
+ax.set_title("Frequent terms not covered by any candidate axis", loc="left",
+             fontweight="bold")
+fig.savefig(f"{OUTDIR}/fig_unclaimed_terms.png", bbox_inches="tight")
+plt.close(fig)
+
+# %%
+# --- 8. axis co-occurrence ----------------------------------------------------
+present = hits[axis_cols].astype(int)
+co = present.T.dot(present)
+d = np.diag(co).astype(float)
+jac = pd.DataFrame(np.nan_to_num(co / (d[:, None] + d[None, :] - co)),
+                   index=axis_cols, columns=axis_cols)
+jac.to_csv(f"{OUTDIR}/08_axis_cooccurrence.csv")
+
+fig, ax = plt.subplots(figsize=(1 + .55 * len(axis_cols), 1 + .5 * len(axis_cols)))
+im = ax.imshow(jac.values, cmap="YlGnBu", vmin=0, vmax=1)
+ax.set_xticks(range(len(axis_cols)))
+ax.set_xticklabels(axis_cols, rotation=45, ha="right", fontsize=8)
+ax.set_yticks(range(len(axis_cols)))
+ax.set_yticklabels(axis_cols, fontsize=8)
+ax.grid(False)
+ax.set_title("Axis co-occurrence (Jaccard)", loc="left", fontweight="bold")
+for i in range(len(axis_cols)):
+    for j in range(len(axis_cols)):
+        v = jac.values[i, j]
+        ax.text(j, i, f"{v:.2f}", ha="center", va="center", fontsize=7,
+                color="white" if v > .6 else "#2d3748")
+fig.colorbar(im, ax=ax, fraction=.03, pad=.02)
+fig.savefig(f"{OUTDIR}/fig_axis_cooccurrence.png", bbox_inches="tight")
+plt.close(fig)
+
+# %%
+# --- 9. does any axis relate to the existing label ----------------------------
+if COL["label"]:
+    lab = user[COL["label"]].fillna("").astype(str).str.strip()
+    m = lab != ""
+    rows = []
+    for axis in axis_cols + list(ACTOR_PATTERNS):
+        ct = pd.crosstab(hits.loc[m, axis], lab[m])
+        if ct.shape[0] < 2 or ct.shape[1] < 2:
+            continue
+        n = ct.values.sum()
+        exp = np.outer(ct.sum(axis=1), ct.sum(axis=0)) / n
+        chi = float((((ct.values - exp) ** 2) / exp).sum())
+        v = np.sqrt(chi / (n * (min(ct.shape) - 1)))
+        share = ct.div(ct.sum(axis=1), axis=0)
+        rows.append({"axis": axis, "cramers_v": round(v, 4),
+                     "top_class_when_present": share.loc[True].idxmax(),
+                     "share_when_present": round(float(share.loc[True].max()), 3)})
+    assoc = pd.DataFrame(rows).sort_values("cramers_v", ascending=False)
+    assoc.to_csv(f"{OUTDIR}/09_axis_label_association.csv", index=False)
+    print(assoc.to_string(index=False))
+
+    fig, ax = plt.subplots(figsize=(8, .32 * len(assoc) + 1))
+    y = np.arange(len(assoc))
+    ax.barh(y, assoc["cramers_v"], color="#2b6cb0", height=.7)
+    ax.set_yticks(y)
+    ax.set_yticklabels(assoc["axis"])
+    ax.invert_yaxis()
+    ax.set_xlabel("Cramer's V against the existing label")
+    ax.set_title("Which axes carry label signal", loc="left", fontweight="bold")
+    fig.savefig(f"{OUTDIR}/fig_axis_label_association.png", bbox_inches="tight")
+    plt.close(fig)
+
+# %%
+# --- 10. column inventory -----------------------------------------------------
+agg = seed_hits.groupby("axis").agg(
+    terms_tested=("term", "size"),
+    terms_with_support=("messages", lambda s: int((s > 0).sum()))).reset_index()
+
+inv = cov.merge(agg, on="axis", how="left")
+inv["terms_tested"] = inv["terms_tested"].fillna(0).astype(int)
+inv["terms_with_support"] = inv["terms_with_support"].fillna(0).astype(int)
+inv["match_method"] = np.where(inv["axis"].isin(ACTOR_PATTERNS), "pattern", "term list")
+inv = inv.sort_values("pct_of_user_messages", ascending=False)
+inv.to_csv(f"{OUTDIR}/10_column_inventory.csv", index=False)
+print(inv.to_string(index=False))
+
+summary = {
+    "input": INPUT,
+    "rows": int(len(df)),
+    "user_messages": int(len(user)),
+    "assistant_messages": int(len(asst)),
+    "name_candidates": len(name_ctx),
+    "name_tokens_blocked": len(NAMES),
+    "tokens_released": len(dropped),
+    "distinct_terms": len(seen),
+    "axes_tested": len(SEEDS),
+    "axes_well_supported": int((inv["verdict"] == "well supported").sum()),
+    "axes_not_supported": int((inv["verdict"] == "not supported").sum()),
+    "messages_with_no_axis": int((per_msg == 0).sum()),
+}
+json.dump(summary, open(f"{OUTDIR}/run_summary.json", "w"), indent=2)
+print(json.dumps(summary, indent=2))
+print(f"\noutputs in {os.path.abspath(OUTDIR)}")

@@ -1,0 +1,4372 @@
+#!/usr/bin/env python3
+"""
+NORA Phase 2 Version 2
+======================
+Production-oriented offline NLP/ML pipeline for:
+  * corpus-derived noise reduction
+  * near-duplicate/template control
+  * robust latent text representation
+  * UMAP + HDBSCAN model selection and stability analysis
+  * recursive refinement of oversized/heterogeneous clusters
+  * privacy-safe audited outputs
+  * persisted model artifacts and inference on unseen data
+
+Design principles
+-----------------
+1. No manually curated NORA intent/noise keyword lists.
+2. Development/test isolation before every learned transformation.
+3. Noise is learned statistically from development data only.
+4. Learned noise is removed from BOTH word and character model channels,
+   while redacted source text is retained intact for review.
+5. Approximate nearest-neighbour duplicate detection is used at scale.
+6. Cluster selection uses multiple intrinsic/stability criteria rather than
+   a single silhouette score.
+7. Noise-policy choice is development-only and data-driven; no feature branch is privileged by assumption.
+8. Borderline outlier recovery is conservative, cluster-specific, persisted, and identical in train/test/inference.
+9. Interpretability uses phrase-aware NPMI on one fixed redacted development reference corpus.
+10. Structural safety, semantic regression protection, and SME business acceptance are separate decisions.
+11. Raw/unredacted text and raw business identifiers are never exported.
+12. Fitted artifacts are persisted for reproducible inference.
+
+This is an offline architecture. It does not download pretrained models or call
+external APIs/LLMs.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import logging
+import math
+import os
+import platform
+import re
+import secrets
+import sys
+from collections import Counter, defaultdict
+from datetime import datetime, timezone
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+
+import joblib
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from scipy import sparse
+from scipy.spatial.distance import jensenshannon
+from sklearn.cluster import MiniBatchKMeans
+from sklearn.decomposition import TruncatedSVD
+from sklearn.feature_extraction.text import CountVectorizer, TfidfVectorizer
+from sklearn.metrics import adjusted_rand_score, silhouette_score
+from sklearn.mixture import GaussianMixture
+from sklearn.neighbors import NearestNeighbors
+from sklearn.pipeline import FeatureUnion
+from sklearn.preprocessing import Normalizer
+
+
+PIPELINE_NAME = "NORA Phase 2 Version 2"
+PIPELINE_VERSION = "2.5.0"
+ARTIFACT_FORMAT_VERSION = "phase2-bundle-4"
+LOGGER = logging.getLogger("nora_phase2_v2")
+DEFAULT_SEED = 42
+TOKEN_RE = re.compile(r"(?u)\b[a-zA-Z][a-zA-Z0-9'\-]{1,}\b")
+SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?;])\s+|\n+")
+
+# Privacy-only patterns. These are never used as predictive/business features.
+PII_PATTERNS: Sequence[Tuple[str, re.Pattern[str]]] = (
+    ("email", re.compile(r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b")),
+    ("url", re.compile(r"https?://\S+", re.I)),
+    ("ipv4", re.compile(r"\b(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\b")),
+    ("ipv6", re.compile(r"\b(?:[0-9A-Fa-f]{1,4}:){2,7}[0-9A-Fa-f]{1,4}\b")),
+    ("mac", re.compile(r"\b(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}\b")),
+    ("uuid", re.compile(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b")),
+    ("iccid", re.compile(r"\b89\d{17,20}\b")),
+    ("imei", re.compile(r"\b\d{14,17}\b")),
+    ("phone", re.compile(r"(?<!\d)(?:\+?\d{1,3}[\s\-.]?)?\(?\d{3}\)?[\s\-.]?\d{3}[\s\-.]?\d{4}(?!\d)")),
+    ("labeled_coordinate", re.compile(r"\b(?:lat(?:itude)?|lon(?:gitude)?)\s*[:=]?\s*-?\d{1,3}(?:\.\d+)?\b", re.I)),
+    ("long_number", re.compile(r"(?<!\d)\d{7,}(?!\d)")),
+)
+
+
+@dataclass(frozen=True)
+class Config:
+    input_path: str
+    outdir: str
+    report_json: str
+    mode: str = "train"
+    model_dir: Optional[str] = None
+    seed: int = DEFAULT_SEED
+    sample_rows: int = 0
+    test_size: float = 0.20
+    split_trials: int = 64
+    max_word_features: int = 60000
+    max_char_features: int = 90000
+    svd_components: int = 160
+    candidate_noise_features: int = 50000
+    noise_max_ngram: int = 3
+    noise_stability_repeats: int = 4
+    noise_subsample_fraction: float = 0.80
+    noise_consensus_models: int = 3
+    noise_policy: str = "auto"
+    noise_policy_search_trials: int = 8
+    noise_policy_sample_rows: int = 4000
+    model_search_trials: int = 16
+    stability_repeats: int = 4
+    search_sample_rows: int = 8000
+    recursive_max_depth: int = 2
+    representative_examples: int = 5
+    max_cluster_fit_rows: int = 30000
+    assistant_max_units: int = 120000
+    duplicate_projection_components: int = 64
+    duplicate_neighbors: int = 8
+    ann_min_rows: int = 5000
+    transform_batch_size: int = 4096
+    stability_subsample_fraction: float = 0.85
+    reassign_outliers: bool = True
+    coherence_top_terms: int = 10
+    semantic_guard_mode: str = "block"
+    semantic_bootstrap_repeats: int = 64
+    semantic_bootstrap_fraction: float = 0.80
+    semantic_guard_alpha: float = 0.05
+    export_review_text: bool = False
+    pseudonym_key_env: str = "NORA_PSEUDONYM_KEY"
+    include_assistant: bool = True
+    on_regression: str = "revert"
+    persist_models: bool = True
+    merge_clusters: bool = True
+
+
+@dataclass
+class NoiseModel:
+    unigrams: set[str]
+    template_phrases: set[str]
+    descriptor_blocklist: set[str]
+    score_threshold: float
+    selection_method: str = "distribution_derived"
+
+    def model_terms(self) -> set[str]:
+        return set(self.unigrams) | set(self.template_phrases)
+
+
+@dataclass
+class LatentModel:
+    vectorizer: FeatureUnion
+    svd: TruncatedSVD
+    normalizer: Normalizer
+    batch_size: int = 4096
+
+    def transform(self, texts: Sequence[str]) -> np.ndarray:
+        values = list(texts)
+        if not values:
+            return np.empty((0, int(self.svd.n_components)), dtype=np.float32)
+        parts: List[np.ndarray] = []
+        for start in range(0, len(values), max(1, self.batch_size)):
+            batch = values[start:start + max(1, self.batch_size)]
+            x = self.vectorizer.transform(batch)
+            z = self.svd.transform(x)
+            z = self.normalizer.transform(z)
+            parts.append(np.asarray(z, dtype=np.float32))
+        return np.vstack(parts)
+
+
+@dataclass
+class ClusterModel:
+    method: str
+    reducer: Any
+    clusterer: Any
+    parameters: Dict[str, Any]
+    global_stability_ari: Optional[float]
+    assigned_stability_ari: Optional[float]
+    outlier_jaccard: Optional[float]
+    silhouette: Optional[float]
+    density_validity: Optional[float]
+    weighted_persistence: Optional[float]
+    selection_score: Optional[float]
+
+
+@dataclass
+class RefinementRule:
+    parent_cluster: int
+    model: ClusterModel
+    child_id_map: Dict[int, int]
+    depth: int
+
+
+@dataclass
+class OutlierRecoveryModel:
+    """Persisted, cluster-specific recovery boundary for density-model outliers.
+
+    Native cluster strength is never overwritten by cosine similarity. Recovery
+    evidence is carried separately as similarity and margin diagnostics.
+    """
+    cluster_ids: np.ndarray
+    centroids: np.ndarray
+    similarity_floors: Dict[int, float]
+    margin_floors: Dict[int, float]
+    fit_rows: int
+    enabled: bool = True
+
+
+@dataclass
+class CorpusBundle:
+    pipeline_name: str
+    pipeline_version: str
+    corpus_name: str
+    noise_model: NoiseModel
+    noise_policy: str
+    latent_model: LatentModel
+    cluster_model: ClusterModel
+    refinement_rules: List[RefinementRule]
+    merge_map: Dict[int, int]
+    outlier_recovery_model: Optional[OutlierRecoveryModel]
+    descriptions: Dict[int, Dict[str, Any]]
+    model_text_mode: str
+    reference_cluster_distribution: Dict[int, float] = field(default_factory=dict)
+    reference_outlier_rate: float = 0.0
+    reference_strength_quantiles: Dict[str, float] = field(default_factory=dict)
+    reference_recovery_rate: float = 0.0
+    config: Dict[str, Any] = field(default_factory=dict)
+
+    def _prepare_model_text(self, redacted: Sequence[str]) -> List[str]:
+        policy = str(self.noise_policy or self.model_text_mode or "raw").lower()
+        if policy in {"shared_clean", "noise_reduced"}:
+            return [apply_noise_model(x, self.noise_model) for x in redacted]
+        # word_only uses a fitted word vocabulary with learned terms withheld;
+        # raw and word_only therefore both transform the untouched redacted text.
+        return list(redacted)
+
+    def transform_texts_detailed(self, texts: Sequence[str]) -> Dict[str, Any]:
+        redacted = [redact_pii(str(x or "")) for x in texts]
+        model_text = self._prepare_model_text(redacted)
+        vectors = self.latent_model.transform(model_text)
+        labels, strengths, assignment_source, recovery_similarity, recovery_margin = predict_final_partition(
+            self.cluster_model,
+            self.refinement_rules,
+            vectors,
+            self.merge_map,
+            self.outlier_recovery_model,
+        )
+        descriptors = [
+            "unassigned" if int(lab) == -1
+            else self.descriptions.get(int(lab), {}).get("descriptor", f"cluster_{int(lab)}")
+            for lab in labels.tolist()
+        ]
+        return {
+            "redacted": redacted,
+            "model_text": model_text,
+            "labels": labels,
+            "native_strengths": strengths,
+            "descriptors": descriptors,
+            "assignment_source": assignment_source,
+            "recovery_similarity": recovery_similarity,
+            "recovery_margin": recovery_margin,
+        }
+
+    def transform_texts(self, texts: Sequence[str]) -> Tuple[List[str], np.ndarray, np.ndarray, List[str]]:
+        """Backward-compatible four-value inference boundary."""
+        detail = self.transform_texts_detailed(texts)
+        return (
+            detail["redacted"], detail["labels"], detail["native_strengths"], detail["descriptors"]
+        )
+
+
+def cluster_model_to_payload(model: ClusterModel) -> Dict[str, Any]:
+    return {
+        "method": model.method,
+        "reducer": model.reducer,
+        "clusterer": model.clusterer,
+        "parameters": model.parameters,
+        "global_stability_ari": model.global_stability_ari,
+        "assigned_stability_ari": model.assigned_stability_ari,
+        "outlier_jaccard": model.outlier_jaccard,
+        "silhouette": model.silhouette,
+        "density_validity": model.density_validity,
+        "weighted_persistence": model.weighted_persistence,
+        "selection_score": model.selection_score,
+    }
+
+
+def cluster_model_from_payload(payload: Dict[str, Any]) -> ClusterModel:
+    values = dict(payload)
+    values.setdefault("weighted_persistence", None)
+    return ClusterModel(**values)
+
+
+def scrub_persisted_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Persist reproducibility settings without local file-system paths."""
+    blocked = {"input_path", "outdir", "model_dir"}
+    return {k: to_plain(v) for k, v in config.items() if k not in blocked}
+
+
+def outlier_recovery_to_payload(model: Optional[OutlierRecoveryModel]) -> Optional[Dict[str, Any]]:
+    if model is None:
+        return None
+    return {
+        "cluster_ids": np.asarray(model.cluster_ids, dtype=int),
+        "centroids": np.asarray(model.centroids, dtype=np.float32),
+        "similarity_floors": {int(k): float(v) for k, v in model.similarity_floors.items()},
+        "margin_floors": {int(k): float(v) for k, v in model.margin_floors.items()},
+        "fit_rows": int(model.fit_rows),
+        "enabled": bool(model.enabled),
+    }
+
+
+def outlier_recovery_from_payload(payload: Optional[Dict[str, Any]]) -> Optional[OutlierRecoveryModel]:
+    if not payload:
+        return None
+    return OutlierRecoveryModel(
+        cluster_ids=np.asarray(payload.get("cluster_ids", []), dtype=int),
+        centroids=np.asarray(payload.get("centroids", []), dtype=np.float32),
+        similarity_floors={int(k): float(v) for k, v in payload.get("similarity_floors", {}).items()},
+        margin_floors={int(k): float(v) for k, v in payload.get("margin_floors", {}).items()},
+        fit_rows=int(payload.get("fit_rows", 0)),
+        enabled=bool(payload.get("enabled", True)),
+    )
+
+
+def bundle_to_payload(bundle: CorpusBundle) -> Dict[str, Any]:
+    """Persist portable plain containers plus fitted estimators."""
+    return {
+        "format_version": ARTIFACT_FORMAT_VERSION,
+        "pipeline_name": bundle.pipeline_name,
+        "pipeline_version": bundle.pipeline_version,
+        "corpus_name": bundle.corpus_name,
+        "noise_policy": bundle.noise_policy,
+        "model_text_mode": bundle.model_text_mode,
+        "config": scrub_persisted_config(bundle.config),
+        "runtime_versions": package_versions(),
+        "noise_model": {
+            "unigrams": sorted(bundle.noise_model.unigrams),
+            "template_phrases": sorted(bundle.noise_model.template_phrases),
+            "descriptor_blocklist": sorted(bundle.noise_model.descriptor_blocklist),
+            "score_threshold": float(bundle.noise_model.score_threshold),
+            "selection_method": str(bundle.noise_model.selection_method),
+        },
+        "latent_model": {
+            "vectorizer": bundle.latent_model.vectorizer,
+            "svd": bundle.latent_model.svd,
+            "normalizer": bundle.latent_model.normalizer,
+            "batch_size": int(bundle.latent_model.batch_size),
+        },
+        "cluster_model": cluster_model_to_payload(bundle.cluster_model),
+        "refinement_rules": [
+            {
+                "parent_cluster": int(rule.parent_cluster),
+                "model": cluster_model_to_payload(rule.model),
+                "child_id_map": {int(k): int(v) for k, v in rule.child_id_map.items()},
+                "depth": int(rule.depth),
+            }
+            for rule in bundle.refinement_rules
+        ],
+        "merge_map": {int(k): int(v) for k, v in bundle.merge_map.items()},
+        "outlier_recovery_model": outlier_recovery_to_payload(bundle.outlier_recovery_model),
+        "descriptions": {int(k): v for k, v in bundle.descriptions.items()},
+        "reference_cluster_distribution": {
+            int(k): float(v) for k, v in bundle.reference_cluster_distribution.items()
+        },
+        "reference_outlier_rate": float(bundle.reference_outlier_rate),
+        "reference_strength_quantiles": {
+            str(k): float(v) for k, v in bundle.reference_strength_quantiles.items()
+        },
+        "reference_recovery_rate": float(bundle.reference_recovery_rate),
+    }
+
+
+def payload_to_bundle(payload: Dict[str, Any]) -> CorpusBundle:
+    version = payload.get("format_version")
+    if version != ARTIFACT_FORMAT_VERSION:
+        raise RuntimeError(
+            f"Artifact format {version!r} does not match {ARTIFACT_FORMAT_VERSION!r}; retrain before inference."
+        )
+    noise = payload["noise_model"]
+    latent = payload["latent_model"]
+    model_text_mode = str(payload.get("model_text_mode", "raw_redacted"))
+    noise_policy = str(payload.get("noise_policy") or (
+        "shared_clean" if model_text_mode == "noise_reduced" else "raw"
+    ))
+    return CorpusBundle(
+        pipeline_name=str(payload["pipeline_name"]),
+        pipeline_version=str(payload["pipeline_version"]),
+        corpus_name=str(payload["corpus_name"]),
+        noise_model=NoiseModel(
+            unigrams=set(noise["unigrams"]),
+            template_phrases=set(noise["template_phrases"]),
+            descriptor_blocklist=set(noise["descriptor_blocklist"]),
+            score_threshold=float(noise["score_threshold"]),
+            selection_method=str(noise.get("selection_method", "distribution_derived")),
+        ),
+        noise_policy=noise_policy,
+        latent_model=LatentModel(
+            vectorizer=latent["vectorizer"],
+            svd=latent["svd"],
+            normalizer=latent["normalizer"],
+            batch_size=int(latent.get("batch_size", 4096)),
+        ),
+        cluster_model=cluster_model_from_payload(payload["cluster_model"]),
+        refinement_rules=[
+            RefinementRule(
+                parent_cluster=int(rule["parent_cluster"]),
+                model=cluster_model_from_payload(rule["model"]),
+                child_id_map={int(k): int(v) for k, v in rule["child_id_map"].items()},
+                depth=int(rule["depth"]),
+            )
+            for rule in payload.get("refinement_rules", [])
+        ],
+        merge_map={int(k): int(v) for k, v in payload.get("merge_map", {}).items()},
+        outlier_recovery_model=outlier_recovery_from_payload(payload.get("outlier_recovery_model")),
+        descriptions={int(k): v for k, v in payload.get("descriptions", {}).items()},
+        model_text_mode=model_text_mode,
+        reference_cluster_distribution={
+            int(k): float(v) for k, v in payload.get("reference_cluster_distribution", {}).items()
+        },
+        reference_outlier_rate=float(payload.get("reference_outlier_rate", 0.0)),
+        reference_strength_quantiles={
+            str(k): float(v) for k, v in payload.get("reference_strength_quantiles", {}).items()
+        },
+        reference_recovery_rate=float(payload.get("reference_recovery_rate", 0.0)),
+        config=dict(payload.get("config", {})),
+    )
+
+
+def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while True:
+            chunk = handle.read(chunk_size)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def validate_runtime_compatibility(payload: Dict[str, Any]) -> None:
+    """Fail on scikit-learn major/minor drift; warn on other library drift."""
+    trained = payload.get("runtime_versions", {})
+    current = package_versions()
+    trained_sklearn = str(trained.get("scikit_learn", ""))
+    current_sklearn = str(current.get("scikit_learn", ""))
+    if trained_sklearn and current_sklearn:
+        if trained_sklearn.split(".")[:2] != current_sklearn.split(".")[:2]:
+            raise RuntimeError(
+                f"scikit-learn runtime mismatch: trained={trained_sklearn}, current={current_sklearn}. "
+                "Use the training environment or retrain the artifact."
+            )
+
+
+def load_bundle(path: Path, expected_sha256: Optional[str] = None) -> CorpusBundle:
+    if expected_sha256:
+        actual = sha256_file(path)
+        if actual != expected_sha256:
+            raise RuntimeError(f"Artifact checksum mismatch for {path.name}")
+    payload = joblib.load(path)
+    if isinstance(payload, CorpusBundle):
+        # Backward-compatible local artifact only; new artifacts use payload dicts.
+        return payload
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"Unsupported model artifact type: {type(payload)!r}")
+    validate_runtime_compatibility(payload)
+    return payload_to_bundle(payload)
+
+
+# ---------------------------------------------------------------------------
+# Generic utilities
+# ---------------------------------------------------------------------------
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def configure_logging() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+
+def normalise_key(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", str(value).strip().lower()).strip("_")
+
+
+def to_plain(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return {str(k): to_plain(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [to_plain(v) for v in value]
+    if isinstance(value, np.ndarray):
+        return [to_plain(v) for v in value.tolist()]
+    if isinstance(value, np.integer):
+        return int(value)
+    if isinstance(value, np.floating):
+        return None if np.isnan(value) else float(value)
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+    return value
+
+
+def robust_upper_fence(values: Sequence[float], multiplier: float = 1.5) -> float:
+    arr = np.asarray([x for x in values if np.isfinite(x)], dtype=float)
+    if arr.size == 0:
+        return float("inf")
+    q1, q3 = np.quantile(arr, [0.25, 0.75])
+    return float(q3 + multiplier * (q3 - q1))
+
+
+def robust_lower_fence(values: Sequence[float], multiplier: float = 1.5) -> float:
+    arr = np.asarray([x for x in values if np.isfinite(x)], dtype=float)
+    if arr.size == 0:
+        return float("-inf")
+    q1, q3 = np.quantile(arr, [0.25, 0.75])
+    return float(q1 - multiplier * (q3 - q1))
+
+
+def robust_mad(values: Sequence[float]) -> float:
+    arr = np.asarray([x for x in values if np.isfinite(x)], dtype=float)
+    if arr.size == 0:
+        return 1.0
+    med = float(np.median(arr))
+    mad = float(np.median(np.abs(arr - med)))
+    return max(1.4826 * mad, 1e-9)
+
+
+
+def distribution_upper_tail_cutoff(values: Sequence[float], seed: int) -> Tuple[float, str]:
+    """Infer a high-tail boundary without forcing a fixed top-percentile rule.
+
+    A two-component Gaussian mixture is used only when BIC supports it over a
+    one-component model. Otherwise a robust Tukey/MAD tail boundary is used;
+    if no observed value exceeds that boundary, nothing is force-selected.
+    """
+    arr = np.asarray([x for x in values if np.isfinite(x)], dtype=float)
+    if arr.size == 0:
+        return float("inf"), "empty"
+    if arr.size < 20 or float(np.std(arr)) < 1e-8:
+        fence = robust_upper_fence(arr)
+        return float(fence), "robust_upper_fence"
+
+    x = arr.reshape(-1, 1)
+    g1 = GaussianMixture(n_components=1, random_state=seed, covariance_type="full").fit(x)
+    g2 = GaussianMixture(n_components=2, random_state=seed, covariance_type="full").fit(x)
+    if g2.bic(x) < g1.bic(x):
+        means = g2.means_.ravel()
+        high = int(np.argmax(means))
+        low = 1 - high
+        grid = np.linspace(float(arr.min()), float(arr.max()), 4096).reshape(-1, 1)
+        probs = g2.predict_proba(grid)
+        diff = probs[:, high] - probs[:, low]
+        crossings = np.flatnonzero(np.signbit(diff[:-1]) != np.signbit(diff[1:]))
+        if len(crossings):
+            cutoff = float(grid[int(crossings[-1]) + 1, 0])
+        else:
+            cutoff = float((means[high] + means[low]) / 2.0)
+        return cutoff, "gmm_bic_two_component"
+
+    fence = robust_upper_fence(arr)
+    if np.isfinite(fence):
+        return float(fence), "robust_upper_fence"
+    med = float(np.median(arr))
+    return med + 3.0 * robust_mad(arr), "median_plus_3mad"
+
+
+def distribution_lower_tail_cutoff(values: Sequence[float], seed: int) -> Tuple[float, str]:
+    """Mirror of distribution_upper_tail_cutoff for unusually low observations."""
+    arr = np.asarray([x for x in values if np.isfinite(x)], dtype=float)
+    if arr.size == 0:
+        return float("-inf"), "empty"
+    upper, method = distribution_upper_tail_cutoff((-arr).tolist(), seed)
+    if not np.isfinite(upper):
+        return float("-inf"), method
+    return float(-upper), method.replace("upper", "lower")
+
+
+def cluster_distribution(labels: np.ndarray) -> Dict[int, float]:
+    if len(labels) == 0:
+        return {}
+    counts = Counter(int(x) for x in labels.tolist())
+    total = float(len(labels))
+    return {int(k): float(v / total) for k, v in sorted(counts.items())}
+
+
+def strength_quantiles(strengths: np.ndarray) -> Dict[str, float]:
+    arr = np.asarray(strengths, dtype=float)
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return {}
+    return {
+        "p10": float(np.quantile(arr, 0.10)),
+        "p50": float(np.quantile(arr, 0.50)),
+        "p90": float(np.quantile(arr, 0.90)),
+    }
+
+
+def cluster_js_distance(reference: Dict[int, float], observed: Dict[int, float]) -> float:
+    keys = sorted(set(reference) | set(observed))
+    if not keys:
+        return 0.0
+    p = np.asarray([reference.get(k, 0.0) for k in keys], dtype=float)
+    q = np.asarray([observed.get(k, 0.0) for k in keys], dtype=float)
+    if p.sum() <= 0 or q.sum() <= 0:
+        return 1.0
+    p /= p.sum()
+    q /= q.sum()
+    return float(jensenshannon(p, q, base=2.0))
+
+
+def percentile_rank(series: pd.Series, higher_is_better: bool = True) -> pd.Series:
+    values = pd.to_numeric(series, errors="coerce")
+    if values.notna().sum() <= 1:
+        return pd.Series(np.full(len(series), 0.5), index=series.index)
+    return values.rank(pct=True, ascending=higher_is_better).fillna(0.0)
+
+
+def tokenize(text: str) -> List[str]:
+    return [m.group(0).lower() for m in TOKEN_RE.finditer(str(text))]
+
+
+def redact_pii(text: str) -> str:
+    value = str(text or "")
+    for _, pattern in PII_PATTERNS:
+        value = pattern.sub(" [redacted] ", value)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def deterministic_sample(frame: pd.DataFrame, n: int, seed: int) -> pd.DataFrame:
+    if n <= 0 or len(frame) <= n:
+        return frame.copy()
+    return frame.sample(n=n, random_state=seed).sort_index().copy()
+
+
+def pseudonymize(value: Any, key: bytes) -> str:
+    raw = str(value or "").encode("utf-8", errors="ignore")
+    return hashlib.blake2b(raw, key=key, digest_size=12).hexdigest()
+
+
+
+def resolve_pseudonym_key(config: Config) -> Tuple[bytes, str]:
+    """Use a deployment-provided secret when available; otherwise use an ephemeral run key."""
+    raw = os.environ.get(config.pseudonym_key_env, "") if config.pseudonym_key_env else ""
+    if raw:
+        return hashlib.sha256(raw.encode("utf-8")).digest(), f"environment:{config.pseudonym_key_env}"
+    return secrets.token_bytes(32), "ephemeral_per_run"
+
+
+def sanitize_frame_for_export(frame: pd.DataFrame) -> pd.DataFrame:
+    out = frame.copy()
+    # Checking dtypes directly avoids the object/str selection ambiguity that
+    # newer pandas warns about on every single call.
+    for col in [
+        c for c in out.columns
+        if out[c].dtype == object or pd.api.types.is_string_dtype(out[c])
+    ]:
+        out[col] = out[col].map(lambda x: redact_pii(str(x)) if x is not None else x)
+    return out
+
+
+def package_versions() -> Dict[str, str]:
+    result = {
+        "python": platform.python_version(),
+        "numpy": np.__version__,
+        "pandas": pd.__version__,
+    }
+    try:
+        import sklearn
+        result["scikit_learn"] = sklearn.__version__
+    except Exception:
+        pass
+    for name in ("umap", "hdbscan", "pynndescent", "joblib"):
+        try:
+            module = __import__(name)
+            result[name] = str(getattr(module, "__version__", "installed"))
+        except Exception:
+            result[name] = "not_available"
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Schema discovery and split isolation
+# ---------------------------------------------------------------------------
+
+def find_column(columns: Sequence[str], patterns: Sequence[str]) -> Optional[str]:
+    normalized = {c: normalise_key(c) for c in columns}
+    for pattern in patterns:
+        for c, key in normalized.items():
+            if re.search(pattern, key):
+                return c
+    return None
+
+
+def discover_schema(df: pd.DataFrame) -> Dict[str, Optional[str]]:
+    cols = list(df.columns)
+    return {
+        "case": find_column(cols, [r"^source_row$", r"source.*row", r"case.*id", r"ticket.*id"]),
+        "turn": find_column(cols, [r"message_index", r"turn.*index", r"sequence", r"^index$"]),
+        "conversation": find_column(cols, [r"message.*cid", r"^cid$", r"conversation.*id", r"interaction.*id"]),
+        "text": find_column(cols, [r"message.*content", r"^content$", r"^text$", r"message.*text"]),
+        "broad_label": find_column(cols, [r"classification.*intent", r"^intent$", r"broad.*intent"]),
+        "role": find_column(cols, [r"^message_type$", r"message.*type", r"^role$"]),
+    }
+
+
+def infer_role(row: pd.Series, role_col: Optional[str]) -> str:
+    candidates: List[str] = []
+    if role_col and role_col in row.index:
+        candidates.append(str(row.get(role_col, "")))
+    for col in row.index:
+        if "type" in normalise_key(col) or "role" in normalise_key(col):
+            candidates.append(str(row.get(col, "")))
+    joined = " ".join(candidates).lower()
+    if re.search(r"\b(user|customer|human|subscriber)\b", joined):
+        return "user"
+    if re.search(r"\b(assistant|agent|bot|system)\b", joined):
+        return "assistant"
+    return "unknown"
+
+
+
+def group_preserving_sample(frame: pd.DataFrame, target_rows: int, seed: int) -> pd.DataFrame:
+    """Functional-test sampling that never fragments a conversation/group."""
+    if target_rows <= 0 or len(frame) <= target_rows:
+        return frame.copy()
+    stats = frame.groupby("_group", sort=False).size().reset_index(name="rows")
+    rng = np.random.default_rng(seed)
+    order = rng.permutation(len(stats))
+    selected: List[str] = []
+    running = 0
+    for pos in order.tolist():
+        group = str(stats.at[pos, "_group"])
+        size = int(stats.at[pos, "rows"])
+        if not selected or abs(target_rows - (running + size)) <= abs(target_rows - running):
+            selected.append(group)
+            running += size
+        elif running >= target_rows:
+            break
+    if not selected:
+        selected = [str(stats.at[int(order[0]), "_group"])]
+    return frame[frame["_group"].isin(set(selected))].copy().reset_index(drop=True)
+
+
+def load_and_prepare(config: Config) -> Tuple[pd.DataFrame, Dict[str, Optional[str]]]:
+    LOGGER.info("[1/9] Loading data and resolving schema")
+    path = Path(config.input_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Input CSV not found: {path}")
+    df = pd.read_csv(path, low_memory=False)
+    schema = discover_schema(df)
+    if schema["text"] is None:
+        raise ValueError("Unable to discover the message text column.")
+
+    frame = df.copy().reset_index(drop=True)
+    frame["_row_id"] = np.arange(len(frame), dtype=int)
+    frame["_raw_text"] = frame[schema["text"]].fillna("").astype(str)
+    frame["_text"] = frame["_raw_text"].map(redact_pii)
+    frame["_role"] = frame.apply(lambda r: infer_role(r, schema["role"]), axis=1)
+    frame["_case"] = (
+        frame[schema["case"]].fillna("").astype(str)
+        if schema["case"] else "row_" + frame["_row_id"].astype(str)
+    )
+    frame["_conversation"] = (
+        frame[schema["conversation"]].fillna("").astype(str)
+        if schema["conversation"] else frame["_case"]
+    )
+    frame["_group"] = frame["_conversation"].where(frame["_conversation"].str.len() > 0, frame["_case"])
+    frame["_group"] = frame["_group"].where(frame["_group"].str.len() > 0, "row_" + frame["_row_id"].astype(str))
+    if config.sample_rows > 0:
+        frame = group_preserving_sample(frame, config.sample_rows, config.seed)
+        frame["_row_id"] = np.arange(len(frame), dtype=int)
+        LOGGER.info("group-preserving smoke sample rows=%d", len(frame))
+    LOGGER.info(
+        "rows=%d user=%d assistant=%d unknown=%d",
+        len(frame), int((frame["_role"] == "user").sum()),
+        int((frame["_role"] == "assistant").sum()), int((frame["_role"] == "unknown").sum()),
+    )
+    return frame, schema
+
+
+def assign_group_split(frame: pd.DataFrame, config: Config) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """Deterministic group-preserving split targeting rows and role composition.
+
+    No labels or text content influence the partition. Multiple deterministic
+    group permutations are evaluated; the selected split minimizes row-ratio
+    error plus total-variation drift in role composition, while guaranteeing
+    zero group overlap.
+    """
+    LOGGER.info("[2/9] Creating locked group-aware development/test split")
+    out = frame.copy()
+    stats = out.groupby("_group", sort=False).agg(rows=("_row_id", "size")).reset_index()
+    total_rows = len(out)
+    target_rows = int(round(config.test_size * total_rows))
+    roles = sorted(out["_role"].astype(str).unique().tolist())
+    global_role = out["_role"].astype(str).value_counts(normalize=True).reindex(roles, fill_value=0.0)
+
+    best: Optional[Tuple[float, set[str], Dict[str, Any]]] = None
+    for trial in range(max(8, config.split_trials)):
+        rng = np.random.default_rng(config.seed + trial * 104729)
+        order = rng.permutation(len(stats))
+        selected: List[int] = []
+        running = 0
+        for pos in order.tolist():
+            size = int(stats.at[pos, "rows"])
+            candidate_error = abs(target_rows - (running + size))
+            current_error = abs(target_rows - running)
+            if not selected or candidate_error <= current_error:
+                selected.append(pos)
+                running += size
+            elif running >= target_rows:
+                break
+        if not selected:
+            selected = [int(order[0])]
+
+        groups = set(stats.loc[selected, "_group"].astype(str))
+        test_mask = out["_group"].isin(groups)
+        test_rows = int(test_mask.sum())
+        if test_rows == 0 or test_rows == total_rows:
+            continue
+        test_role = (
+            out.loc[test_mask, "_role"].astype(str).value_counts(normalize=True)
+            .reindex(roles, fill_value=0.0)
+        )
+        row_error = abs(test_rows / total_rows - config.test_size)
+        role_tv = 0.5 * float(np.abs(test_role.values - global_role.values).sum())
+        score = row_error + role_tv
+        audit = {
+            "trial": trial,
+            "test_rows": test_rows,
+            "development_rows": total_rows - test_rows,
+            "test_ratio": test_rows / total_rows,
+            "target_test_ratio": config.test_size,
+            "row_ratio_error": row_error,
+            "role_total_variation": role_tv,
+            "global_role_distribution": global_role.to_dict(),
+            "test_role_distribution": test_role.to_dict(),
+        }
+        if best is None or score < best[0]:
+            best = (score, groups, audit)
+
+    if best is None:
+        raise RuntimeError("Unable to construct a valid group-aware split.")
+    _, test_groups, audit = best
+    out["data_split"] = np.where(out["_group"].isin(test_groups), "locked_test", "development")
+    dev_groups = set(out.loc[out["data_split"] == "development", "_group"].astype(str))
+    overlap = dev_groups & test_groups
+    if overlap:
+        raise AssertionError(f"Group leakage detected: {len(overlap)} overlapping groups")
+    if set(out["data_split"].unique()) != {"development", "locked_test"}:
+        raise AssertionError("Split assignment did not produce both development and locked_test partitions")
+
+    # Exact cross-split text overlap is audited, not used to fit or choose models.
+    dev_text = set(out.loc[out["data_split"] == "development", "_text"].astype(str))
+    test_text = set(out.loc[out["data_split"] == "locked_test", "_text"].astype(str))
+    audit["group_overlap_count"] = 0
+    audit["development_groups"] = len(dev_groups)
+    audit["locked_test_groups"] = len(test_groups)
+    audit["cross_split_exact_text_overlap"] = len(dev_text & test_text)
+    LOGGER.info("split audit=%s", audit)
+    return out, audit
+
+# ---------------------------------------------------------------------------
+# Text representation and clustering
+# ---------------------------------------------------------------------------
+
+def adaptive_min_df(n_docs: int) -> int:
+    return max(2, int(round(math.log2(max(n_docs, 4)) / 2.0)))
+
+
+def build_vectorizer(
+    config: Config,
+    n_docs: int,
+    min_df_override: Optional[int] = None,
+    word_vocabulary: Optional[Sequence[str]] = None,
+) -> FeatureUnion:
+    min_df = int(min_df_override) if min_df_override is not None else adaptive_min_df(n_docs)
+    word = TfidfVectorizer(
+        lowercase=True,
+        strip_accents="unicode",
+        ngram_range=(1, 3),
+        min_df=min_df,
+        max_df=1.0,
+        max_features=config.max_word_features,
+        sublinear_tf=True,
+        norm="l2",
+        token_pattern=r"(?u)\b[a-zA-Z][a-zA-Z0-9'\-]{1,}\b",
+        stop_words=None,
+        vocabulary=list(word_vocabulary) if word_vocabulary is not None else None,
+    )
+    char = TfidfVectorizer(
+        analyzer="char_wb",
+        lowercase=True,
+        strip_accents="unicode",
+        ngram_range=(3, 5),
+        min_df=min_df,
+        max_features=config.max_char_features,
+        sublinear_tf=True,
+        norm="l2",
+    )
+    return FeatureUnion([("word", word), ("char", char)])
+
+
+def suppressed_word_vocabulary(
+    texts: Sequence[str], config: Config, noise_model: NoiseModel
+) -> Optional[List[str]]:
+    """Build the word vocabulary with development-learned noise terms withheld.
+
+    This is used only by the `word_only` ablation policy.  The character branch
+    still sees the untouched redacted text under that policy.  `shared_clean`
+    instead feeds the same cleaned model text to both branches.
+    """
+    values = list(texts)
+    probe = build_vectorizer(config, len(values))
+    try:
+        probe.fit(values)
+    except ValueError:
+        probe = build_vectorizer(config, len(values), min_df_override=1)
+        probe.fit(values)
+    blocked = set(noise_model.descriptor_blocklist) | noise_model.model_terms()
+    vocab = [
+        term for term in dict(probe.transformer_list)["word"].get_feature_names_out().tolist()
+        if term not in blocked
+    ]
+    if len(vocab) < 10:
+        LOGGER.warning(
+            "word_only noise suppression would leave only %d word features; using the full word vocabulary",
+            len(vocab),
+        )
+        return None
+    return vocab
+
+
+def prepare_model_texts(
+    texts: Sequence[str], noise_model: NoiseModel, policy: str
+) -> List[str]:
+    policy = str(policy).lower()
+    values = [str(x) for x in texts]
+    if policy == "shared_clean":
+        return [apply_noise_model(x, noise_model) for x in values]
+    if policy in {"word_only", "raw"}:
+        return values
+    raise ValueError(f"Unsupported noise policy: {policy}")
+
+
+def fit_latent(
+    texts: Sequence[str],
+    config: Config,
+    noise_model: Optional[NoiseModel] = None,
+    noise_policy: str = "raw",
+) -> Tuple[LatentModel, np.ndarray]:
+    """Fit TF-IDF -> SVD/LSA for a specific development-selected noise policy."""
+    values = list(texts)
+    policy = str(noise_policy).lower()
+    word_vocabulary = None
+    if noise_model is not None and policy == "word_only":
+        word_vocabulary = suppressed_word_vocabulary(values, config, noise_model)
+    vectorizer = build_vectorizer(
+        config, len(values), word_vocabulary=word_vocabulary
+    )
+    try:
+        x = vectorizer.fit_transform(values)
+    except ValueError as exc:
+        if "no terms remain" not in str(exc).lower() and "empty vocabulary" not in str(exc).lower():
+            raise
+        LOGGER.warning(
+            "Adaptive min_df removed all features for n_docs=%d; retrying with min_df=1.",
+            len(values),
+        )
+        vectorizer = build_vectorizer(
+            config, len(values), min_df_override=1, word_vocabulary=word_vocabulary
+        )
+        x = vectorizer.fit_transform(values)
+    n_components = min(config.svd_components, x.shape[0] - 1, x.shape[1] - 1)
+    if n_components < 2:
+        raise RuntimeError("Insufficient samples/features for SVD.")
+    svd = TruncatedSVD(n_components=n_components, random_state=config.seed)
+    z = svd.fit_transform(x)
+    normalizer = Normalizer(copy=False)
+    z = normalizer.fit_transform(z)
+    model = LatentModel(vectorizer, svd, normalizer, batch_size=config.transform_batch_size)
+    return model, np.asarray(z, dtype=np.float32)
+
+
+def derive_search_grid(n: int, trials: int) -> List[Dict[str, Any]]:
+    """Build a corpus-size-derived UMAP/HDBSCAN search surface.
+
+    The grid explores neighborhood scale, embedding dimensionality, minimum
+    distance, HDBSCAN minimum cluster support, density conservativeness, and
+    EOM/leaf extraction. Values are derived from sample size rather than from
+    a telecom-specific intent count.
+    """
+    if n < 8:
+        return []
+    logn = max(3.0, math.log2(n))
+    sqrtn = math.sqrt(n)
+    neighbor_candidates = sorted(set(
+        min(n - 1, max(5, int(round(x))))
+        for x in (logn, 2.0 * logn, math.sqrt(logn * sqrtn), sqrtn)
+    ))
+    component_candidates = sorted(set(
+        max(2, min(int(round(x)), max(2, int(round(logn * 1.5)))))
+        for x in (5.0, logn, 1.5 * logn)
+    ))
+    cluster_candidates = sorted(set(
+        max(5, min(int(round(x)), max(5, n // 3)))
+        for x in (1.5 * logn, 0.35 * sqrtn, 0.60 * sqrtn, sqrtn, 1.40 * sqrtn)
+    ))
+
+    combos: List[Dict[str, Any]] = []
+    for nn in neighbor_candidates:
+        min_dist_candidates = sorted(set((0.0, min(0.10, 1.0 / math.sqrt(max(nn, 1))))))
+        for n_components in component_candidates:
+            for min_dist in min_dist_candidates:
+                for mcs in cluster_candidates:
+                    min_samples_candidates = sorted(set(
+                        max(2, min(mcs, int(round(x))))
+                        for x in (math.log2(max(n, 4)), math.sqrt(max(mcs, 2)), mcs / 3.0)
+                    ))
+                    for min_samples in min_samples_candidates:
+                        for method in ("eom", "leaf"):
+                            combos.append({
+                                "n_neighbors": int(nn),
+                                "n_components": int(n_components),
+                                "min_dist": float(min_dist),
+                                "min_cluster_size": int(mcs),
+                                "min_samples": int(min_samples),
+                                "cluster_selection_method": method,
+                            })
+    if len(combos) <= trials:
+        return combos
+    # Deterministic stratified thinning across the ordered parameter surface.
+    positions = np.linspace(0, len(combos) - 1, trials).round().astype(int)
+    return [combos[i] for i in sorted(set(positions.tolist()))]
+
+def cluster_size_entropy(labels: np.ndarray) -> float:
+    valid = labels[labels != -1]
+    if len(valid) == 0:
+        return 0.0
+    counts = np.asarray(list(Counter(valid.tolist()).values()), dtype=float)
+    p = counts / counts.sum()
+    entropy = -np.sum(p * np.log(p + 1e-12))
+    max_entropy = math.log(max(len(counts), 2))
+    return float(entropy / max_entropy) if max_entropy > 0 else 0.0
+
+
+def safe_silhouette(vectors: np.ndarray, labels: np.ndarray, seed: int) -> Optional[float]:
+    mask = labels != -1
+    unique = set(labels[mask].tolist())
+    if mask.sum() < 3 or len(unique) < 2:
+        return None
+    try:
+        return float(silhouette_score(
+            vectors[mask], labels[mask], metric="cosine",
+            sample_size=min(5000, int(mask.sum())), random_state=seed,
+        ))
+    except Exception:
+        return None
+
+
+def safe_density_validity(reduced: np.ndarray, labels: np.ndarray, seed: int) -> Optional[float]:
+    mask = labels != -1
+    if mask.sum() < 10 or len(set(labels[mask].tolist())) < 2:
+        return None
+    idx = np.flatnonzero(mask)
+    if len(idx) > 4000:
+        rng = np.random.default_rng(seed)
+        idx = np.sort(rng.choice(idx, size=4000, replace=False))
+    try:
+        from hdbscan.validity import validity_index
+        return float(validity_index(reduced[idx], labels[idx], metric="euclidean"))
+    except Exception:
+        return None
+
+
+def weighted_cluster_persistence(clusterer: Any, labels: np.ndarray) -> Optional[float]:
+    try:
+        persistence = np.asarray(clusterer.cluster_persistence_, dtype=float)
+    except Exception:
+        return None
+    if persistence.size == 0:
+        return None
+    counts = Counter(int(x) for x in labels.tolist() if int(x) != -1)
+    weights = np.asarray([counts.get(i, 0) for i in range(len(persistence))], dtype=float)
+    if weights.sum() <= 0:
+        return float(np.mean(persistence))
+    return float(np.average(persistence, weights=weights))
+
+
+def evaluate_cluster_candidate(
+    vectors: np.ndarray,
+    labels: np.ndarray,
+    seed: int,
+    reduced: Optional[np.ndarray] = None,
+    clusterer: Any = None,
+) -> Dict[str, float]:
+    sil = safe_silhouette(vectors, labels, seed)
+    noise_rate = float(np.mean(labels == -1))
+    balance = cluster_size_entropy(labels)
+    valid = labels[labels != -1]
+    n_clusters = len(set(valid.tolist()))
+    largest_share = 1.0
+    if len(valid):
+        largest_share = max(Counter(valid.tolist()).values()) / len(valid)
+    density_validity = safe_density_validity(reduced, labels, seed) if reduced is not None else None
+    persistence = weighted_cluster_persistence(clusterer, labels) if clusterer is not None else None
+    return {
+        "silhouette": float(sil) if sil is not None else float("nan"),
+        "density_validity": float(density_validity) if density_validity is not None else float("nan"),
+        "weighted_persistence": float(persistence) if persistence is not None else float("nan"),
+        "noise_rate": noise_rate,
+        "balance_entropy": balance,
+        "n_clusters": float(n_clusters),
+        "largest_cluster_share": float(largest_share),
+    }
+
+
+def fit_umap_hdbscan_once(
+    vectors: np.ndarray, params: Dict[str, Any], seed: int
+) -> Tuple[Any, Any, np.ndarray, np.ndarray, np.ndarray]:
+    from umap import UMAP
+    from hdbscan import HDBSCAN
+
+    reducer = UMAP(
+        n_neighbors=int(params["n_neighbors"]),
+        n_components=int(params.get("n_components", 5)),
+        min_dist=float(params.get("min_dist", 0.0)),
+        metric="cosine",
+        random_state=seed,
+        transform_seed=seed,
+        low_memory=True,
+    )
+    reduced = reducer.fit_transform(vectors)
+    clusterer = HDBSCAN(
+        min_cluster_size=int(params["min_cluster_size"]),
+        min_samples=int(params["min_samples"]),
+        metric="euclidean",
+        cluster_selection_method=str(params["cluster_selection_method"]),
+        prediction_data=True,
+        core_dist_n_jobs=-1,
+    )
+    labels = clusterer.fit_predict(reduced).astype(int)
+    strengths = np.asarray(clusterer.probabilities_, dtype=float)
+    return reducer, clusterer, labels, strengths, np.asarray(reduced, dtype=np.float32)
+
+def stability_for_params(
+    vectors: np.ndarray,
+    params: Dict[str, Any],
+    seed: int,
+    repeats: int,
+    subsample_fraction: float = 0.85,
+) -> Dict[str, float]:
+    """Perturbation stability across independently subsampled development data.
+
+    This is stronger than re-running only random UMAP seeds on the exact same
+    rows: each repeat also perturbs the observed sample, and pairwise agreement
+    is evaluated only on rows shared by the two subsamples.
+    """
+    n = len(vectors)
+    if n < 8:
+        return {"global_ari": 0.0, "assigned_ari": 0.0, "outlier_jaccard": 0.0, "mean_overlap": 0.0}
+    frac = float(min(max(subsample_fraction, 0.60), 1.0))
+    sample_n = max(8, min(n, int(round(frac * n))))
+    runs: List[Tuple[np.ndarray, np.ndarray]] = []
+    for i in range(max(2, repeats)):
+        rng = np.random.default_rng(seed + i * 9973)
+        idx = np.arange(n, dtype=int) if sample_n == n else np.sort(rng.choice(n, size=sample_n, replace=False))
+        local_params = dict(params)
+        if sample_n < n:
+            ratio = sample_n / n
+            local_params["min_cluster_size"] = max(
+                5, min(sample_n // 3, int(round(int(params["min_cluster_size"]) * ratio)))
+            )
+            local_params["min_samples"] = max(
+                2, min(local_params["min_cluster_size"], int(round(int(params["min_samples"]) * ratio)))
+            )
+            local_params["n_neighbors"] = min(int(params["n_neighbors"]), sample_n - 1)
+        try:
+            _, _, labels, _, _ = fit_umap_hdbscan_once(vectors[idx], local_params, seed + i * 997)
+            runs.append((idx, labels))
+        except Exception:
+            return {"global_ari": 0.0, "assigned_ari": 0.0, "outlier_jaccard": 0.0, "mean_overlap": 0.0}
+
+    global_aris: List[float] = []
+    assigned_aris: List[float] = []
+    outlier_jaccards: List[float] = []
+    overlaps: List[float] = []
+    for i in range(len(runs)):
+        for j in range(i + 1, len(runs)):
+            idx_a, lab_a = runs[i]
+            idx_b, lab_b = runs[j]
+            common, ia, ib = np.intersect1d(idx_a, idx_b, assume_unique=True, return_indices=True)
+            if len(common) < 3:
+                continue
+            a, b = lab_a[ia], lab_b[ib]
+            overlaps.append(len(common) / max(min(len(idx_a), len(idx_b)), 1))
+            global_aris.append(float(adjusted_rand_score(a, b)))
+            mask = (a != -1) & (b != -1)
+            if mask.sum() >= 3 and len(set(a[mask].tolist())) >= 2 and len(set(b[mask].tolist())) >= 2:
+                assigned_aris.append(float(adjusted_rand_score(a[mask], b[mask])))
+            ao = set(np.flatnonzero(a == -1).tolist())
+            bo = set(np.flatnonzero(b == -1).tolist())
+            union = ao | bo
+            outlier_jaccards.append(1.0 if not union else len(ao & bo) / len(union))
+    return {
+        "global_ari": float(np.mean(global_aris)) if global_aris else 0.0,
+        "assigned_ari": float(np.mean(assigned_aris)) if assigned_aris else 0.0,
+        "outlier_jaccard": float(np.mean(outlier_jaccards)) if outlier_jaccards else 0.0,
+        "mean_overlap": float(np.mean(overlaps)) if overlaps else 0.0,
+    }
+
+def kmeans_distance_thresholds(model: MiniBatchKMeans, vectors: np.ndarray, labels: np.ndarray) -> Dict[int, float]:
+    distances = model.transform(vectors)
+    own = distances[np.arange(len(vectors)), labels]
+    thresholds: Dict[int, float] = {}
+    for cid in sorted(set(labels.tolist())):
+        values = own[labels == cid]
+        threshold = robust_upper_fence(values)
+        if not np.isfinite(threshold):
+            threshold = float(np.max(values)) if len(values) else float("inf")
+        thresholds[int(cid)] = float(threshold)
+    return thresholds
+
+
+def apply_kmeans_outlier_gate(
+    model: MiniBatchKMeans,
+    vectors: np.ndarray,
+    labels: np.ndarray,
+    thresholds: Dict[int, float],
+) -> Tuple[np.ndarray, np.ndarray]:
+    distances = model.transform(vectors)
+    own = distances[np.arange(len(vectors)), labels]
+    out = labels.copy().astype(int)
+    strengths = 1.0 / (1.0 + own)
+    for i, (cid, dist) in enumerate(zip(labels.tolist(), own.tolist())):
+        if dist > thresholds.get(int(cid), float("inf")):
+            out[i] = -1
+            strengths[i] = 0.0
+    return out, strengths.astype(float)
+
+
+def fit_kmeans_fallback(
+    vectors: np.ndarray, seed: int
+) -> Tuple[ClusterModel, np.ndarray, np.ndarray, pd.DataFrame]:
+    n = len(vectors)
+    max_k = max(2, min(int(round(math.sqrt(max(n, 4)))), 40))
+    rows: List[Dict[str, Any]] = []
+    best: Optional[Tuple[float, MiniBatchKMeans, np.ndarray, np.ndarray, Dict[int, float]]] = None
+    for k in range(2, max_k + 1):
+        model = MiniBatchKMeans(
+            n_clusters=k, random_state=seed,
+            batch_size=min(4096, max(256, n)), n_init="auto",
+        )
+        raw_labels = model.fit_predict(vectors).astype(int)
+        thresholds = kmeans_distance_thresholds(model, vectors, raw_labels)
+        labels, strengths = apply_kmeans_outlier_gate(model, vectors, raw_labels, thresholds)
+        metrics = evaluate_cluster_candidate(vectors, labels, seed)
+        if metrics["n_clusters"] < 2 or not np.isfinite(metrics["silhouette"]):
+            continue
+        rows.append({"method": "minibatch_kmeans", "k": k, **metrics})
+    if not rows:
+        raise RuntimeError("Unable to fit fallback clusterer.")
+    table = pd.DataFrame(rows)
+    rank_cols = [
+        percentile_rank(table["silhouette"], True),
+        percentile_rank(table["balance_entropy"], True),
+        percentile_rank(table["largest_cluster_share"], False),
+    ]
+    table["selection_score"] = pd.concat(rank_cols, axis=1).median(axis=1)
+    best_row = table.loc[table["selection_score"].idxmax()]
+    k = int(best_row["k"])
+    model = MiniBatchKMeans(
+        n_clusters=k, random_state=seed,
+        batch_size=min(4096, max(256, n)), n_init="auto",
+    )
+    raw_labels = model.fit_predict(vectors).astype(int)
+    thresholds = kmeans_distance_thresholds(model, vectors, raw_labels)
+    labels, strengths = apply_kmeans_outlier_gate(model, vectors, raw_labels, thresholds)
+    cluster_model = ClusterModel(
+        method="minibatch_kmeans",
+        reducer=None,
+        clusterer=model,
+        parameters={"k": k, "distance_thresholds": thresholds},
+        global_stability_ari=None,
+        assigned_stability_ari=None,
+        outlier_jaccard=None,
+        silhouette=safe_silhouette(vectors, labels, seed),
+        density_validity=None,
+        weighted_persistence=None,
+        selection_score=float(best_row["selection_score"]),
+    )
+    return cluster_model, labels, strengths, table.sort_values("selection_score", ascending=False).reset_index(drop=True)
+
+
+def fit_cluster_search(
+    vectors: np.ndarray, config: Config, seed: Optional[int] = None
+) -> Tuple[ClusterModel, np.ndarray, np.ndarray, pd.DataFrame]:
+    seed = config.seed if seed is None else seed
+    if len(vectors) < 8:
+        return fit_kmeans_fallback(vectors, seed)
+    try:
+        import umap  # noqa: F401
+        import hdbscan  # noqa: F401
+    except ImportError:
+        LOGGER.warning("UMAP/HDBSCAN unavailable; using outlier-aware MiniBatchKMeans fallback.")
+        return fit_kmeans_fallback(vectors, seed)
+
+    if len(vectors) > config.search_sample_rows > 0:
+        rng = np.random.default_rng(seed)
+        search_idx = np.sort(rng.choice(len(vectors), size=config.search_sample_rows, replace=False))
+        search_vectors = vectors[search_idx]
+    else:
+        search_vectors = vectors
+
+    grid = derive_search_grid(len(search_vectors), config.model_search_trials)
+    rows: List[Dict[str, Any]] = []
+    for params in grid:
+        try:
+            _, clusterer, labels, _, reduced = fit_umap_hdbscan_once(search_vectors, params, seed)
+            metrics = evaluate_cluster_candidate(search_vectors, labels, seed, reduced, clusterer)
+            if metrics["n_clusters"] < 2:
+                continue
+            rows.append({**params, **metrics})
+        except Exception as exc:
+            LOGGER.debug("cluster candidate failed %s: %s", params, exc)
+    if not rows:
+        return fit_kmeans_fallback(vectors, seed)
+
+    table = pd.DataFrame(rows)
+    noise_rank = table["noise_rate"].rank(pct=True)
+    table["noise_plausibility"] = 1.0 - 2.0 * np.abs(noise_rank - 0.5)
+    coarse_components = [
+        percentile_rank(table["silhouette"], True),
+        percentile_rank(table["density_validity"], True),
+        percentile_rank(table["weighted_persistence"], True),
+        percentile_rank(table["balance_entropy"], True),
+        percentile_rank(table["largest_cluster_share"], False),
+        table["noise_plausibility"].fillna(0.5),
+    ]
+    table["coarse_score"] = pd.concat(coarse_components, axis=1).median(axis=1)
+
+    top_n = max(2, min(len(table), int(round(math.sqrt(len(table)))) + 1))
+    top_idx = table.nlargest(top_n, "coarse_score").index.tolist()
+    stability_rows: Dict[int, Dict[str, float]] = {}
+    for idx in top_idx:
+        params = {
+            "n_neighbors": int(table.at[idx, "n_neighbors"]),
+            "n_components": int(table.at[idx, "n_components"]),
+            "min_dist": float(table.at[idx, "min_dist"]),
+            "min_cluster_size": int(table.at[idx, "min_cluster_size"]),
+            "min_samples": int(table.at[idx, "min_samples"]),
+            "cluster_selection_method": str(table.at[idx, "cluster_selection_method"]),
+        }
+        stability_rows[int(idx)] = stability_for_params(
+            search_vectors, params, seed, config.stability_repeats,
+            config.stability_subsample_fraction,
+        )
+    for key in ("global_ari", "assigned_ari", "outlier_jaccard", "mean_overlap"):
+        table[key] = [stability_rows.get(int(i), {}).get(key, np.nan) for i in table.index]
+
+    final_components = [
+        percentile_rank(table["silhouette"], True),
+        percentile_rank(table["density_validity"], True),
+        percentile_rank(table["weighted_persistence"], True),
+        percentile_rank(table["balance_entropy"], True),
+        percentile_rank(table["largest_cluster_share"], False),
+        table["noise_plausibility"].fillna(0.5),
+        percentile_rank(table["assigned_ari"], True),
+        percentile_rank(table["outlier_jaccard"], True),
+    ]
+    table["selection_score"] = pd.concat(final_components, axis=1).median(axis=1)
+    best_idx = int(table["selection_score"].idxmax())
+    best = table.loc[best_idx]
+    best_params = {
+        "n_neighbors": int(best["n_neighbors"]),
+        "n_components": int(best["n_components"]),
+        "min_dist": float(best["min_dist"]),
+        "min_cluster_size": int(best["min_cluster_size"]),
+        "min_samples": int(best["min_samples"]),
+        "cluster_selection_method": str(best["cluster_selection_method"]),
+    }
+
+    if len(search_vectors) < len(vectors):
+        # Preserve the selected support *proportion* when refitting on more
+        # development rows. UMAP neighborhood size stays fixed because it
+        # represents local scale rather than a population proportion.
+        support_ratio = best_params["min_cluster_size"] / max(len(search_vectors), 1)
+        best_params["min_cluster_size"] = max(
+            5, min(len(vectors) // 3, int(round(support_ratio * len(vectors))))
+        )
+        conservativeness = float(best["min_samples"]) / max(float(best["min_cluster_size"]), 1.0)
+        best_params["min_samples"] = max(
+            2, min(best_params["min_cluster_size"], int(round(best_params["min_cluster_size"] * conservativeness)))
+        )
+        best_params["n_neighbors"] = min(best_params["n_neighbors"], len(vectors) - 1)
+
+    reducer, clusterer, labels, strengths, reduced = fit_umap_hdbscan_once(vectors, best_params, seed)
+    final_metrics = evaluate_cluster_candidate(vectors, labels, seed, reduced, clusterer)
+
+    # Re-estimate perturbation stability for the *deployed* parameterization.
+    # If the full fit is larger than the bounded stability sample, scale only
+    # support parameters to the evaluation sample while preserving proportions.
+    if len(vectors) > config.search_sample_rows > 0:
+        rng = np.random.default_rng(seed + 7919)
+        stab_idx = np.sort(rng.choice(len(vectors), size=config.search_sample_rows, replace=False))
+        stab_vectors = vectors[stab_idx]
+        stab_params = dict(best_params)
+        ratio = len(stab_vectors) / len(vectors)
+        stab_params["min_cluster_size"] = max(5, int(round(best_params["min_cluster_size"] * ratio)))
+        stab_params["min_samples"] = max(
+            2, min(stab_params["min_cluster_size"], int(round(best_params["min_samples"] * ratio)))
+        )
+        stab_params["n_neighbors"] = min(best_params["n_neighbors"], len(stab_vectors) - 1)
+    else:
+        stab_vectors = vectors
+        stab_params = dict(best_params)
+    stability = stability_for_params(
+        stab_vectors, stab_params, seed + 3571, config.stability_repeats,
+        config.stability_subsample_fraction,
+    )
+    model = ClusterModel(
+        method="umap_hdbscan_search",
+        reducer=reducer,
+        clusterer=clusterer,
+        parameters={**best_params, "search_rows": int(len(search_vectors)), "fit_rows": int(len(vectors))},
+        global_stability_ari=float(stability.get("global_ari", np.nan)),
+        assigned_stability_ari=float(stability.get("assigned_ari", np.nan)),
+        outlier_jaccard=float(stability.get("outlier_jaccard", np.nan)),
+        silhouette=float(final_metrics["silhouette"]) if np.isfinite(final_metrics["silhouette"]) else None,
+        density_validity=float(final_metrics["density_validity"]) if np.isfinite(final_metrics["density_validity"]) else None,
+        weighted_persistence=float(final_metrics["weighted_persistence"]) if np.isfinite(final_metrics["weighted_persistence"]) else None,
+        selection_score=float(best["selection_score"]),
+    )
+    return model, labels, strengths, table.sort_values("selection_score", ascending=False).reset_index(drop=True)
+
+
+def predict_cluster(model: ClusterModel, vectors: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    if len(vectors) == 0:
+        return np.asarray([], dtype=int), np.asarray([], dtype=float)
+    if model.method == "umap_hdbscan_search":
+        try:
+            from hdbscan.prediction import approximate_predict
+            reduced = model.reducer.transform(vectors)
+            labels, strengths = approximate_predict(model.clusterer, reduced)
+            return labels.astype(int), strengths.astype(float)
+        except Exception as exc:
+            LOGGER.warning("HDBSCAN approximate prediction failed: %s", exc)
+            return np.full(len(vectors), -1, dtype=int), np.zeros(len(vectors), dtype=float)
+    if model.method == "minibatch_kmeans":
+        raw = model.clusterer.predict(vectors).astype(int)
+        thresholds = {int(k): float(v) for k, v in model.parameters.get("distance_thresholds", {}).items()}
+        return apply_kmeans_outlier_gate(model.clusterer, vectors, raw, thresholds)
+    return np.full(len(vectors), -1, dtype=int), np.zeros(len(vectors), dtype=float)
+
+# ---------------------------------------------------------------------------
+# Corpus-derived noise learning
+# ---------------------------------------------------------------------------
+
+def term_cluster_entropy(matrix: sparse.csr_matrix, labels: np.ndarray) -> np.ndarray:
+    valid_clusters = sorted(set(int(x) for x in labels.tolist() if int(x) != -1))
+    if len(valid_clusters) < 2:
+        return np.ones(matrix.shape[1], dtype=float)
+    counts = np.zeros((len(valid_clusters), matrix.shape[1]), dtype=np.float64)
+    for row_idx, cluster_id in enumerate(valid_clusters):
+        row_mask = labels == cluster_id
+        if row_mask.any():
+            counts[row_idx] = np.asarray((matrix[row_mask] > 0).sum(axis=0)).ravel()
+    total = counts.sum(axis=0)
+    total[total == 0] = 1.0
+    p = counts / total[None, :]
+    entropy = -np.sum(np.where(p > 0, p * np.log(p + 1e-12), 0.0), axis=0)
+    return entropy / max(math.log(len(valid_clusters)), 1e-12)
+
+
+def build_noise_label_ensemble(
+    vectors: np.ndarray,
+    baseline_model: ClusterModel,
+    baseline_labels: np.ndarray,
+    config: Config,
+) -> Tuple[List[np.ndarray], pd.DataFrame]:
+    """Create several plausible development-only clusterings for noise consensus.
+
+    Noise should not be declared generic because of one provisional partition.
+    Alternative partitions are refit from deterministic development subsamples
+    and projected back to the full development representation.  Locked-test
+    rows never enter this procedure.
+    """
+    labelings: List[np.ndarray] = [np.asarray(baseline_labels, dtype=int)]
+    audit: List[Dict[str, Any]] = [{
+        "consensus_run": 0,
+        "method": "baseline_partition",
+        "rows_fit": int(len(vectors)),
+        "n_clusters": int(len(set(int(x) for x in baseline_labels.tolist() if int(x) != -1))),
+        "noise_rate": float(np.mean(np.asarray(baseline_labels) == -1)),
+        "accepted": True,
+    }]
+    target = max(1, int(config.noise_consensus_models))
+    if target <= 1 or len(vectors) < 8:
+        return labelings, pd.DataFrame(audit)
+
+    sample_cap = config.search_sample_rows if config.search_sample_rows > 0 else len(vectors)
+    sample_n = min(len(vectors), max(8, int(sample_cap)))
+    for run in range(1, target):
+        rng = np.random.default_rng(config.seed + 16127 * run)
+        idx = np.arange(len(vectors), dtype=int) if sample_n == len(vectors) else np.sort(
+            rng.choice(len(vectors), size=sample_n, replace=False)
+        )
+        try:
+            if baseline_model.method == "umap_hdbscan_search":
+                params = {
+                    k: baseline_model.parameters[k]
+                    for k in (
+                        "n_neighbors", "n_components", "min_dist",
+                        "min_cluster_size", "min_samples", "cluster_selection_method",
+                    )
+                    if k in baseline_model.parameters
+                }
+                if sample_n < len(vectors):
+                    ratio = sample_n / len(vectors)
+                    params["min_cluster_size"] = max(
+                        5, min(sample_n // 3, int(round(int(params["min_cluster_size"]) * ratio)))
+                    )
+                    params["min_samples"] = max(
+                        2, min(int(params["min_cluster_size"]), int(round(int(params["min_samples"]) * ratio)))
+                    )
+                    params["n_neighbors"] = min(int(params["n_neighbors"]), sample_n - 1)
+                reducer, clusterer, _, _, _ = fit_umap_hdbscan_once(
+                    vectors[idx], params, config.seed + 3571 * run
+                )
+                from hdbscan.prediction import approximate_predict
+                reduced_all = reducer.transform(vectors)
+                labels, _ = approximate_predict(clusterer, reduced_all)
+                labels = labels.astype(int)
+                method = "subsample_refit_umap_hdbscan"
+            elif baseline_model.method == "minibatch_kmeans":
+                k = int(baseline_model.parameters.get("k", 2))
+                model = MiniBatchKMeans(
+                    n_clusters=k,
+                    random_state=config.seed + 3571 * run,
+                    batch_size=min(4096, max(256, sample_n)),
+                    n_init="auto",
+                )
+                raw_sample = model.fit_predict(vectors[idx]).astype(int)
+                thresholds = kmeans_distance_thresholds(model, vectors[idx], raw_sample)
+                raw_all = model.predict(vectors).astype(int)
+                labels, _ = apply_kmeans_outlier_gate(model, vectors, raw_all, thresholds)
+                method = "subsample_refit_kmeans"
+            else:
+                continue
+            n_clusters = len(set(int(x) for x in labels.tolist() if int(x) != -1))
+            accepted = n_clusters >= 2
+            audit.append({
+                "consensus_run": run,
+                "method": method,
+                "rows_fit": int(sample_n),
+                "n_clusters": int(n_clusters),
+                "noise_rate": float(np.mean(labels == -1)),
+                "accepted": bool(accepted),
+            })
+            if accepted:
+                labelings.append(np.asarray(labels, dtype=int))
+        except Exception as exc:
+            audit.append({
+                "consensus_run": run,
+                "method": baseline_model.method,
+                "rows_fit": int(sample_n),
+                "n_clusters": 0,
+                "noise_rate": np.nan,
+                "accepted": False,
+                "reason": str(exc),
+            })
+    return labelings, pd.DataFrame(audit)
+
+
+def learn_noise_model(
+    texts: Sequence[str], provisional_labelings: Sequence[np.ndarray] | np.ndarray, config: Config
+) -> Tuple[NoiseModel, pd.DataFrame]:
+    min_df = adaptive_min_df(len(texts))
+    vectorizer = CountVectorizer(
+        lowercase=True,
+        strip_accents="unicode",
+        ngram_range=(1, config.noise_max_ngram),
+        min_df=min_df,
+        max_df=1.0,
+        max_features=config.candidate_noise_features,
+        binary=True,
+        token_pattern=r"(?u)\b[a-zA-Z][a-zA-Z0-9'\-]{1,}\b",
+        stop_words=None,
+    )
+    matrix = vectorizer.fit_transform(list(texts)).tocsr()
+    terms = np.asarray(vectorizer.get_feature_names_out())
+    df = np.asarray(matrix.sum(axis=0)).ravel().astype(float)
+    df_ratio = df / max(len(texts), 1)
+
+    if isinstance(provisional_labelings, np.ndarray):
+        labelings = [provisional_labelings]
+    else:
+        labelings = [np.asarray(x, dtype=int) for x in provisional_labelings]
+    valid_labelings = [
+        labels for labels in labelings
+        if len(labels) == len(texts)
+        and len(set(int(x) for x in labels.tolist() if int(x) != -1)) >= 2
+    ]
+    if not valid_labelings:
+        valid_labelings = [np.asarray(labelings[0], dtype=int)]
+
+    entropy_stack = np.vstack([term_cluster_entropy(matrix, labels) for labels in valid_labelings])
+    entropy = np.median(entropy_stack, axis=0)
+
+    # Purpose-driven score: generic terms are frequent across cases and remain
+    # evenly dispersed under several plausible semantic partitions.
+    freq_rank = pd.Series(df_ratio).rank(pct=True).to_numpy(dtype=float)
+    noise_score = np.sqrt(np.clip(freq_rank, 0.0, 1.0) * np.clip(entropy, 0.0, 1.0))
+    threshold, threshold_method = distribution_upper_tail_cutoff(noise_score, config.seed)
+    selected_full = noise_score >= threshold if np.isfinite(threshold) else np.zeros_like(noise_score, dtype=bool)
+
+    selection_count = np.zeros(len(terms), dtype=float)
+    valid_evaluations = 0
+    repeats = max(0, int(config.noise_stability_repeats))
+    frac = float(min(max(config.noise_subsample_fraction, 0.60), 1.0))
+    sample_n = max(20, min(len(texts), int(round(frac * len(texts)))))
+    if repeats >= 1 and len(texts) >= 30:
+        for li, labels in enumerate(valid_labelings):
+            for r in range(repeats):
+                rng = np.random.default_rng(config.seed + 1009 * (r + 1) + 65537 * li)
+                idx = np.arange(len(texts), dtype=int) if sample_n == len(texts) else np.sort(
+                    rng.choice(len(texts), size=sample_n, replace=False)
+                )
+                sub_labels = labels[idx]
+                if len(set(int(x) for x in sub_labels.tolist() if int(x) != -1)) < 2:
+                    continue
+                sub = matrix[idx]
+                sub_df = np.asarray(sub.sum(axis=0)).ravel().astype(float)
+                sub_ratio = sub_df / max(len(idx), 1)
+                sub_entropy = term_cluster_entropy(sub, sub_labels)
+                sub_rank = pd.Series(sub_ratio).rank(pct=True).to_numpy(dtype=float)
+                sub_score = np.sqrt(np.clip(sub_rank, 0.0, 1.0) * np.clip(sub_entropy, 0.0, 1.0))
+                sub_threshold, _ = distribution_upper_tail_cutoff(
+                    sub_score, config.seed + 1009 * (r + 1) + 65537 * li
+                )
+                if np.isfinite(sub_threshold):
+                    selection_count += (sub_score >= sub_threshold).astype(float)
+                    valid_evaluations += 1
+
+    if valid_evaluations:
+        stability_rate = selection_count / valid_evaluations
+        majority_rate = math.ceil(valid_evaluations / 2) / valid_evaluations
+        selected = selected_full & (stability_rate >= majority_rate)
+        selection_method = (
+            f"{threshold_method}+multi_clustering_bootstrap_majority_consensus"
+        )
+    else:
+        stability_rate = selected_full.astype(float)
+        majority_rate = 1.0
+        selected = selected_full
+        selection_method = threshold_method
+
+    orders = np.asarray([str(t).count(" ") + 1 for t in terms], dtype=int)
+    selected_unigrams = set(terms[selected & (orders == 1)].astype(str).tolist())
+    selected_phrases = set(terms[selected & (orders > 1)].astype(str).tolist())
+    safe_templates = {
+        phrase for phrase in selected_phrases
+        if all(token in selected_unigrams for token in phrase.split())
+    }
+    descriptor_blocklist = set(terms[selected].astype(str).tolist())
+    suppression_scope = []
+    for term, order, is_selected in zip(terms.tolist(), orders.tolist(), selected.tolist()):
+        if not is_selected:
+            suppression_scope.append("none")
+        elif order == 1:
+            suppression_scope.append("model_and_descriptor")
+        elif str(term) in safe_templates:
+            suppression_scope.append("model_and_descriptor")
+        else:
+            suppression_scope.append("descriptor_only")
+
+    table = pd.DataFrame({
+        "term": terms,
+        "ngram_order": orders,
+        "development_document_frequency": df.astype(int),
+        "document_frequency_ratio": df_ratio,
+        "median_cluster_entropy": entropy,
+        "consensus_clusterings": len(valid_labelings),
+        "frequency_percentile": freq_rank,
+        "noise_score": noise_score,
+        "noise_threshold": threshold,
+        "noise_threshold_method": threshold_method,
+        "consensus_evaluations": valid_evaluations,
+        "consensus_selection_rate": stability_rate,
+        "consensus_majority_rate": majority_rate,
+        "selected_as_noise": selected,
+        "suppression_scope": suppression_scope,
+    }).sort_values(["selected_as_noise", "noise_score"], ascending=[False, False]).reset_index(drop=True)
+
+    model = NoiseModel(
+        unigrams=selected_unigrams,
+        template_phrases=safe_templates,
+        descriptor_blocklist=descriptor_blocklist,
+        score_threshold=float(threshold),
+        selection_method=selection_method,
+    )
+    return model, table
+
+def apply_noise_model(text: str, model: NoiseModel) -> str:
+    tokens = tokenize(text)
+    if not tokens:
+        return ""
+    drop = np.zeros(len(tokens), dtype=bool)
+    templates = model.template_phrases
+    max_ngram = max([len(x.split()) for x in templates], default=1)
+    for n in range(max_ngram, 1, -1):
+        if len(tokens) < n:
+            continue
+        for i in range(0, len(tokens) - n + 1):
+            if drop[i:i+n].any():
+                continue
+            phrase = " ".join(tokens[i:i+n])
+            if phrase in templates:
+                drop[i:i+n] = True
+    for i, token in enumerate(tokens):
+        # "redacted" is an implementation placeholder created by privacy
+        # preprocessing, not a business-language feature.
+        if not drop[i] and (token == "redacted" or token in model.unigrams):
+            drop[i] = True
+    kept = [token for token, flag in zip(tokens, drop.tolist()) if not flag]
+    # Fail safe: if cleanup removes almost everything, preserve the redacted source.
+    if len(kept) < 2:
+        return " ".join(tokens)
+    return " ".join(kept)
+
+
+def select_noise_policy(
+    texts: Sequence[str], noise_model: NoiseModel, config: Config
+) -> Tuple[str, pd.DataFrame]:
+    """Choose the noise-application policy using development data only.
+
+    The policy question (clean both channels vs suppress only word features vs
+    leave features raw) is treated as a model-selection problem rather than a
+    hard-coded belief.  Search is bounded to a deterministic development sample
+    and uses rank aggregation across structural and interpretability metrics.
+    """
+    requested = str(config.noise_policy).lower()
+    allowed = ("shared_clean", "word_only", "raw")
+    if requested != "auto":
+        if requested not in allowed:
+            raise ValueError(f"Unsupported noise policy: {requested}")
+        return requested, pd.DataFrame([{
+            "policy": requested,
+            "selected": True,
+            "selection_reason": "explicit_configuration",
+        }])
+
+    values = list(texts)
+    if len(values) < 30:
+        return "shared_clean", pd.DataFrame([{
+            "policy": "shared_clean",
+            "selected": True,
+            "selection_reason": "insufficient_rows_for_ablation",
+        }])
+
+    if config.noise_policy_sample_rows > 0 and len(values) > config.noise_policy_sample_rows:
+        rng = np.random.default_rng(config.seed + 2713)
+        idx = np.sort(rng.choice(len(values), size=config.noise_policy_sample_rows, replace=False))
+        sample_raw = [values[i] for i in idx.tolist()]
+    else:
+        sample_raw = values
+
+    local_cfg = Config(**{
+        **asdict(config),
+        "model_search_trials": max(4, min(config.model_search_trials, config.noise_policy_search_trials)),
+        "search_sample_rows": min(len(sample_raw), config.search_sample_rows),
+        "max_cluster_fit_rows": min(len(sample_raw), config.max_cluster_fit_rows),
+        "recursive_max_depth": 0,
+    })
+
+    rows: List[Dict[str, Any]] = []
+    for policy in allowed:
+        try:
+            model_text = prepare_model_texts(sample_raw, noise_model, policy)
+            latent, vectors = fit_latent(
+                model_text,
+                local_cfg,
+                noise_model=noise_model if policy == "word_only" else None,
+                noise_policy=policy,
+            )
+            model, labels, strengths, _ = fit_cluster_search(
+                vectors, local_cfg, seed=config.seed + 101 * (allowed.index(policy) + 1)
+            )
+            descriptions = ctfidf_descriptions(
+                sample_raw,
+                labels,
+                blocked_terms=noise_model.descriptor_blocklist,
+            )
+            metrics = final_partition_metrics(vectors, labels, strengths, config.seed)
+            interp, _ = interpretability_metrics(
+                sample_raw, descriptions, config.coherence_top_terms
+            )
+            rows.append({
+                "policy": policy,
+                "status": "ok",
+                **metrics,
+                **interp,
+                "cluster_method": model.method,
+            })
+        except Exception as exc:
+            rows.append({
+                "policy": policy,
+                "status": "failed",
+                "reason": str(exc),
+            })
+
+    table = pd.DataFrame(rows)
+    ok = table[table["status"].eq("ok")].copy()
+    if ok.empty:
+        LOGGER.warning("All noise-policy ablations failed; using shared_clean fail-safe")
+        table["selected"] = table["policy"].eq("shared_clean")
+        table["selection_reason"] = np.where(table["selected"], "all_ablation_candidates_failed", "")
+        return "shared_clean", table
+
+    valid = (
+        (pd.to_numeric(ok.get("n_clusters"), errors="coerce") >= 2)
+        & (pd.to_numeric(ok.get("assigned_fraction"), errors="coerce") > 0)
+        & (pd.to_numeric(ok.get("largest_cluster_share"), errors="coerce") < 1)
+    )
+    ok["structurally_valid"] = valid
+    candidates = ok[ok["structurally_valid"]].copy()
+    if candidates.empty:
+        candidates = ok.copy()
+
+    rank_parts: List[pd.Series] = []
+    rank_names: List[str] = []
+    for metric in (
+        "npmi_coherence",
+        "descriptor_diversity_composite",
+        "silhouette",
+        "balance_entropy",
+        "assigned_fraction",
+        "centroid_separation",
+    ):
+        if metric in candidates.columns:
+            rank_parts.append(percentile_rank(candidates[metric], True))
+            rank_names.append(metric)
+    if "largest_cluster_share" in candidates.columns:
+        rank_parts.append(percentile_rank(candidates["largest_cluster_share"], False))
+        rank_names.append("largest_cluster_share")
+
+    # A median over a handful of percentile ranks collapses to one value for
+    # every candidate the moment different metrics have different winners: with
+    # three policies each rank is 1/3, 2/3 or 1, and the median sits on 2/3 for
+    # all of them. The choice then falls out of row order instead of evidence.
+    # The mean separates them, and the per-metric ranks are published so the
+    # decision can be read rather than trusted.
+    # The metrics fall into two families, and a flat mean lets whichever family
+    # happens to contain more measures decide the outcome. Structure currently
+    # outnumbers interpretability five to two, so a policy could win on geometry
+    # while producing descriptors nobody can read. Each family is averaged first
+    # and the two family scores are then averaged, which fixes the weighting at
+    # half and half regardless of how many metrics sit on either side.
+    interpretability_metrics_set = {"npmi_coherence", "descriptor_diversity_composite"}
+    if rank_parts:
+        rank_frame = pd.concat(rank_parts, axis=1)
+        rank_frame.columns = rank_names
+        for name in rank_names:
+            candidates[f"rank_{name}"] = rank_frame[name].to_numpy()
+
+        interpretability = [n for n in rank_names if n in interpretability_metrics_set]
+        structure = [n for n in rank_names if n not in interpretability_metrics_set]
+        families = []
+        if interpretability:
+            families.append(rank_frame[interpretability].mean(axis=1))
+            candidates["interpretability_rank"] = families[-1].to_numpy()
+        if structure:
+            families.append(rank_frame[structure].mean(axis=1))
+            candidates["structure_rank"] = families[-1].to_numpy()
+        candidates["policy_selection_score"] = (
+            pd.concat(families, axis=1).mean(axis=1) if families
+            else pd.Series(0.5, index=candidates.index)
+        )
+    else:
+        candidates["policy_selection_score"] = 0.5
+
+    # Where the mean still ties, the order is explicit rather than incidental:
+    # descriptor coherence first because it is what an SME actually reads, then
+    # cohesion, then diversity, then separation.
+    tie_breakers = [
+        column for column in (
+            "npmi_coherence",
+            "mean_cluster_cohesion",
+            "descriptor_diversity_composite",
+            "silhouette",
+        )
+        if column in candidates.columns
+    ]
+    ordered = candidates.sort_values(
+        ["policy_selection_score"] + tie_breakers,
+        ascending=False,
+        kind="mergesort",
+    )
+    best_idx = ordered.index[0]
+    selected = str(candidates.at[best_idx, "policy"])
+    if len(ordered) > 1:
+        runner_up = ordered.index[1]
+        LOGGER.info(
+            "  policy ranking: %s=%.4f then %s=%.4f",
+            candidates.at[best_idx, "policy"],
+            float(candidates.at[best_idx, "policy_selection_score"]),
+            candidates.at[runner_up, "policy"],
+            float(candidates.at[runner_up, "policy_selection_score"]),
+        )
+    merge_columns = [
+        "policy", "structurally_valid", "policy_selection_score",
+        "interpretability_rank", "structure_rank",
+    ] + [f"rank_{name}" for name in rank_names]
+    table = table.merge(
+        candidates[[c for c in merge_columns if c in candidates.columns]],
+        on="policy", how="left",
+    )
+    table["selected"] = table["policy"].eq(selected)
+    table["selection_reason"] = np.where(
+        table["selected"], "development_only_rank_aggregation", ""
+    )
+    LOGGER.info("selected noise policy=%s from development-only ablation", selected)
+    return selected, table
+
+
+# ---------------------------------------------------------------------------
+# Scalable near-duplicate control
+# ---------------------------------------------------------------------------
+
+class UnionFind:
+    def __init__(self, n: int) -> None:
+        self.parent = list(range(n))
+        self.rank = [0] * n
+
+    def find(self, x: int) -> int:
+        while self.parent[x] != x:
+            self.parent[x] = self.parent[self.parent[x]]
+            x = self.parent[x]
+        return x
+
+    def union(self, a: int, b: int) -> None:
+        ra, rb = self.find(a), self.find(b)
+        if ra == rb:
+            return
+        if self.rank[ra] < self.rank[rb]:
+            ra, rb = rb, ra
+        self.parent[rb] = ra
+        if self.rank[ra] == self.rank[rb]:
+            self.rank[ra] += 1
+
+
+def duplicate_feature_space(
+    texts: Sequence[str], config: Config
+) -> Tuple[sparse.csr_matrix, np.ndarray]:
+    """Character TF-IDF for exact verification plus SVD projection for ANN retrieval."""
+    values = list(texts)
+    vec = TfidfVectorizer(
+        analyzer="char_wb",
+        ngram_range=(3, 5),
+        min_df=1,
+        sublinear_tf=True,
+        norm="l2",
+        max_features=min(config.max_char_features, 70000),
+    )
+    x = vec.fit_transform(values).tocsr()
+    n_components = min(config.duplicate_projection_components, x.shape[0] - 1, x.shape[1] - 1)
+    if n_components < 2:
+        return x, x.toarray().astype(np.float32)
+    svd = TruncatedSVD(n_components=n_components, random_state=config.seed)
+    z = svd.fit_transform(x)
+    z = Normalizer(copy=False).fit_transform(z)
+    return x, np.asarray(z, dtype=np.float32)
+
+
+def ann_neighbors(vectors: np.ndarray, k: int, config: Config) -> Tuple[np.ndarray, np.ndarray, str]:
+    n = len(vectors)
+    k = min(max(2, k), n)
+    if n >= config.ann_min_rows:
+        try:
+            from pynndescent import NNDescent
+            index = NNDescent(
+                vectors,
+                metric="cosine",
+                n_neighbors=k,
+                random_state=config.seed,
+                low_memory=True,
+                n_jobs=-1,
+            )
+            try:
+                indices, distances = index.neighbor_graph
+            except Exception:
+                indices, distances = index.query(vectors, k=k)
+            return np.asarray(indices), np.asarray(distances), "pynndescent_candidate_generation"
+        except ImportError as exc:
+            raise RuntimeError(
+                f"pynndescent is required for scalable near-duplicate detection at n={n}; "
+                "it is normally installed with umap-learn."
+            ) from exc
+    nn = NearestNeighbors(n_neighbors=k, metric="cosine", algorithm="brute", n_jobs=-1)
+    nn.fit(vectors)
+    distances, indices = nn.kneighbors(vectors)
+    return indices, distances, "exact_candidate_generation_small_corpus"
+
+
+def exact_sparse_cosine(x: sparse.csr_matrix, i: int, j: int) -> float:
+    # TfidfVectorizer(norm='l2') makes the sparse dot product equal cosine similarity.
+    return float(x.getrow(i).multiply(x.getrow(j)).sum())
+
+
+def _refine_duplicate_components(
+    preliminary_roots: Sequence[int],
+    x: sparse.csr_matrix,
+    projection: np.ndarray,
+    cutoff: float,
+) -> np.ndarray:
+    """Break transitive duplicate chains using medoid-anchored exact similarity.
+
+    Plain connected components can chain A~B and B~C even when A !~ C. Each
+    preliminary component is therefore partitioned into medoid-centred families
+    whose members individually satisfy the exact sparse-cosine cutoff to their
+    representative.
+    """
+    components: Dict[int, List[int]] = defaultdict(list)
+    for idx, root in enumerate(preliminary_roots):
+        components[int(root)].append(idx)
+
+    family_ids = np.full(len(preliminary_roots), -1, dtype=int)
+    next_family = 0
+    for members in components.values():
+        remaining = list(members)
+        while remaining:
+            if len(remaining) == 1 or not np.isfinite(cutoff):
+                anchor = remaining[0]
+            else:
+                block = projection[remaining]
+                centroid = block.mean(axis=0)
+                norm = np.linalg.norm(centroid)
+                if norm > 0:
+                    centroid = centroid / norm
+                anchor = remaining[int(np.argmax(block @ centroid))]
+
+            family = [anchor]
+            for member in remaining:
+                if member == anchor:
+                    continue
+                sim = exact_sparse_cosine(x, anchor, member)
+                if sim >= cutoff or np.isclose(sim, cutoff, rtol=1e-9, atol=1e-12):
+                    family.append(member)
+            for member in family:
+                family_ids[member] = next_family
+            selected = set(family)
+            remaining = [m for m in remaining if m not in selected]
+            next_family += 1
+    return family_ids
+
+
+def detect_duplicate_families(
+    texts: Sequence[str], config: Config
+) -> Tuple[np.ndarray, pd.DataFrame, float, str, np.ndarray]:
+    if len(texts) < 3:
+        fam = np.arange(len(texts), dtype=int)
+        return fam, pd.DataFrame(), float("inf"), "not_required", np.asarray(texts)
+
+    x_sparse, projection = duplicate_feature_space(texts, config)
+    indices, approx_distances, candidate_method = ann_neighbors(
+        projection, config.duplicate_neighbors, config
+    )
+
+    # ANN is candidate generation only. Every candidate edge is re-ranked with
+    # exact cosine similarity in the original normalized character TF-IDF space.
+    exact_by_pair: Dict[Tuple[int, int], float] = {}
+    nearest_exact = np.zeros(len(texts), dtype=float)
+    approx_by_pair: Dict[Tuple[int, int], float] = {}
+    for i in range(len(texts)):
+        for j, approx_dist in zip(indices[i], approx_distances[i]):
+            j = int(j)
+            if j == i:
+                continue
+            a, b = (i, j) if i < j else (j, i)
+            pair = (a, b)
+            if pair not in exact_by_pair:
+                exact_by_pair[pair] = exact_sparse_cosine(x_sparse, a, b)
+                approx_by_pair[pair] = float(1.0 - approx_dist)
+            sim = exact_by_pair[pair]
+            nearest_exact[i] = max(nearest_exact[i], sim)
+            nearest_exact[j] = max(nearest_exact[j], sim)
+
+    cutoff, cutoff_method = distribution_upper_tail_cutoff(nearest_exact, config.seed)
+    if np.isfinite(cutoff):
+        cutoff = float(min(max(cutoff, 0.0), 1.0))
+
+    uf = UnionFind(len(texts))
+    pair_rows: List[Dict[str, Any]] = []
+    for (i, j), exact_sim in exact_by_pair.items():
+        accepted = bool(
+            np.isfinite(cutoff)
+            and (exact_sim >= cutoff or np.isclose(exact_sim, cutoff, rtol=1e-9, atol=1e-12))
+        )
+        if accepted:
+            uf.union(i, j)
+            pair_rows.append({
+                "left_index": i,
+                "right_index": j,
+                "ann_projection_similarity": approx_by_pair[(i, j)],
+                "exact_char_tfidf_similarity": exact_sim,
+                "cutoff": cutoff,
+                "accepted": True,
+            })
+
+    preliminary = [uf.find(i) for i in range(len(texts))]
+    family_ids = _refine_duplicate_components(preliminary, x_sparse, projection, cutoff)
+    for row in pair_rows:
+        row["same_final_family"] = bool(
+            family_ids[int(row["left_index"])] == family_ids[int(row["right_index"])]
+        )
+    method = f"{candidate_method}+exact_sparse_rerank+{cutoff_method}+medoid_chain_guard"
+    return family_ids, pd.DataFrame(pair_rows), cutoff, method, projection
+
+def choose_family_representatives(
+    family_ids: np.ndarray, projection: np.ndarray
+) -> Tuple[np.ndarray, pd.DataFrame]:
+    families: Dict[int, List[int]] = defaultdict(list)
+    for i, fam in enumerate(family_ids.tolist()):
+        families[int(fam)].append(i)
+    reps: List[int] = []
+    rows: List[Dict[str, Any]] = []
+    for fam, members in sorted(families.items()):
+        if len(members) == 1:
+            rep = members[0]
+        else:
+            block = projection[members]
+            centroid = block.mean(axis=0)
+            norm = np.linalg.norm(centroid)
+            if norm > 0:
+                centroid = centroid / norm
+            similarities = block @ centroid
+            rep = members[int(np.argmax(similarities))]
+        reps.append(rep)
+        rows.append({
+            "duplicate_family_id": fam,
+            "family_size": len(members),
+            "representative_index": rep,
+            "member_indices": ";".join(str(i) for i in members),
+        })
+    return np.asarray(reps, dtype=int), pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
+# Cluster refinement, topic descriptions, quality gate
+# ---------------------------------------------------------------------------
+
+def local_cluster_cohesion(vectors: np.ndarray, labels: np.ndarray) -> Dict[int, float]:
+    output: Dict[int, float] = {}
+    for cid in sorted(set(int(x) for x in labels.tolist() if int(x) != -1)):
+        idx = np.flatnonzero(labels == cid)
+        if len(idx) < 3:
+            output[cid] = 1.0
+            continue
+        centroid = vectors[idx].mean(axis=0)
+        norm = np.linalg.norm(centroid)
+        if norm > 0:
+            centroid = centroid / norm
+        output[cid] = float(np.mean(vectors[idx] @ centroid))
+    return output
+
+
+def cohesion_gain_bootstrap(
+    vectors: np.ndarray,
+    parent_idx: np.ndarray,
+    child_labels: np.ndarray,
+    seed: int,
+    repeats: int = 200,
+) -> Tuple[float, float]:
+    block = vectors[parent_idx]
+    parent_centroid = block.mean(axis=0)
+    pnorm = np.linalg.norm(parent_centroid)
+    if pnorm > 0:
+        parent_centroid /= pnorm
+    parent_sim = block @ parent_centroid
+    child_sim = np.zeros(len(block), dtype=float)
+    for cid in sorted(set(int(x) for x in child_labels.tolist() if int(x) != -1)):
+        local = np.flatnonzero(child_labels == cid)
+        centroid = block[local].mean(axis=0)
+        norm = np.linalg.norm(centroid)
+        if norm > 0:
+            centroid /= norm
+        child_sim[local] = block[local] @ centroid
+    assigned = child_labels != -1
+    if assigned.sum() < 3:
+        return 0.0, 0.0
+    delta = child_sim[assigned] - parent_sim[assigned]
+    mean_delta = float(np.mean(delta))
+    rng = np.random.default_rng(seed)
+    samples = []
+    for _ in range(repeats):
+        sample = rng.choice(delta, size=len(delta), replace=True)
+        samples.append(float(np.mean(sample)))
+    lower = float(np.quantile(samples, 0.025))
+    return mean_delta, lower
+
+
+def refine_clusters(
+    vectors: np.ndarray,
+    base_labels: np.ndarray,
+    base_strengths: np.ndarray,
+    config: Config,
+) -> Tuple[np.ndarray, np.ndarray, List[Dict[str, Any]], List[RefinementRule]]:
+    labels = base_labels.copy().astype(int)
+    strengths = base_strengths.copy().astype(float)
+    audit: List[Dict[str, Any]] = []
+    rules: List[RefinementRule] = []
+    next_id = max([x for x in labels.tolist() if x >= 0], default=-1) + 1
+
+    for depth in range(config.recursive_max_depth):
+        valid_ids = sorted(set(int(x) for x in labels.tolist() if int(x) != -1))
+        if len(valid_ids) < 2:
+            break
+        sizes = {cid: int((labels == cid).sum()) for cid in valid_ids}
+        cohesions = local_cluster_cohesion(vectors, labels)
+        size_fence = robust_upper_fence(list(sizes.values()))
+        cohesion_floor = robust_lower_fence(list(cohesions.values()))
+        candidates = [
+            cid for cid in valid_ids
+            if sizes[cid] > size_fence or cohesions[cid] < cohesion_floor
+        ]
+        for cid in valid_ids:
+            audit.append({
+                "depth": depth + 1,
+                "parent_cluster": cid,
+                "parent_size": sizes[cid],
+                "parent_cohesion": cohesions[cid],
+                "size_upper_fence": float(size_fence),
+                "cohesion_lower_fence": float(cohesion_floor),
+                "oversized": bool(sizes[cid] > size_fence),
+                "incoherent": bool(cohesions[cid] < cohesion_floor),
+                "status": "triggered" if cid in candidates else "not_triggered",
+            })
+
+        if not candidates:
+            largest = max(valid_ids, key=lambda c: sizes[c])
+            shares = np.asarray(list(sizes.values()), dtype=float) / max(sum(sizes.values()), 1)
+            share_fence = robust_upper_fence(shares)
+            largest_share = sizes[largest] / max(sum(sizes.values()), 1)
+            if largest_share > share_fence:
+                candidates = [largest]
+                audit.append({
+                    "depth": depth + 1,
+                    "parent_cluster": largest,
+                    "parent_size": sizes[largest],
+                    "parent_share": largest_share,
+                    "share_upper_fence": share_fence,
+                    "status": "triggered",
+                    "reason": "distribution_derived_dominance_trigger",
+                })
+
+        any_split = False
+        for cid in candidates:
+            idx = np.flatnonzero(labels == cid)
+            data_driven_min = max(8, int(round(math.log2(max(len(vectors), 16)))))
+            if len(idx) < data_driven_min:
+                audit.append({
+                    "depth": depth + 1, "parent_cluster": cid,
+                    "parent_size": len(idx), "status": "skipped",
+                    "reason": "insufficient_support_for_local_model",
+                })
+                continue
+            local_vectors = vectors[idx]
+            local_cfg = Config(**{
+                **asdict(config),
+                "model_search_trials": max(8, config.model_search_trials // 2),
+                "stability_repeats": max(2, config.stability_repeats - 1),
+            })
+            try:
+                child_model, child_labels, child_strengths, child_search = fit_cluster_search(
+                    local_vectors, local_cfg, seed=config.seed + depth + cid + 1
+                )
+            except Exception as exc:
+                audit.append({"depth": depth + 1, "parent_cluster": cid, "status": "failed", "reason": str(exc)})
+                continue
+            child_ids = sorted(set(int(x) for x in child_labels.tolist() if int(x) != -1))
+            if len(child_ids) < 2:
+                audit.append({"depth": depth + 1, "parent_cluster": cid, "status": "rejected", "reason": "fewer_than_two_children"})
+                continue
+
+            mean_gain, lower_gain = cohesion_gain_bootstrap(
+                vectors, idx, child_labels, seed=config.seed + depth + cid + 991
+            )
+            child_sil = safe_silhouette(local_vectors, child_labels, config.seed)
+            stability = child_model.assigned_stability_ari
+            stability_values = pd.to_numeric(child_search.get("assigned_ari", pd.Series(dtype=float)), errors="coerce").dropna()
+            stability_floor = float(stability_values.median()) if len(stability_values) else 0.0
+            child_sizes = [int((child_labels == c).sum()) for c in child_ids]
+            child_balance = cluster_size_entropy(child_labels)
+            selection_values = pd.to_numeric(
+                child_search.get("selection_score", pd.Series(dtype=float)), errors="coerce"
+            ).dropna()
+            selection_floor = float(selection_values.median()) if len(selection_values) else float("-inf")
+            density_values = pd.to_numeric(
+                child_search.get("density_validity", pd.Series(dtype=float)), errors="coerce"
+            ).dropna()
+            density_floor = float(density_values.median()) if len(density_values) else float("-inf")
+            density_ok = (
+                child_model.density_validity is None
+                or not np.isfinite(child_model.density_validity)
+                or child_model.density_validity >= density_floor
+            )
+            selection_ok = (
+                child_model.selection_score is None
+                or not np.isfinite(child_model.selection_score)
+                or child_model.selection_score >= selection_floor
+            )
+            accept = (
+                lower_gain > 0.0
+                and child_sil is not None and child_sil > 0.0
+                and (stability is None or not np.isfinite(stability) or stability >= stability_floor)
+                and density_ok
+                and selection_ok
+                and child_balance > 0.0
+            )
+            audit.append({
+                "depth": depth + 1,
+                "parent_cluster": cid,
+                "parent_size": len(idx),
+                "child_clusters": len(child_ids),
+                "cohesion_gain_mean": mean_gain,
+                "cohesion_gain_bootstrap_lower_95": lower_gain,
+                "child_silhouette": child_sil,
+                "child_assigned_stability_ari": stability,
+                "child_stability_reference_median": stability_floor,
+                "child_balance_entropy": child_balance,
+                "child_density_validity": child_model.density_validity,
+                "child_density_reference_median": density_floor,
+                "child_selection_score": child_model.selection_score,
+                "child_selection_reference_median": selection_floor,
+                "largest_child_share": max(child_sizes) / max(sum(child_sizes), 1),
+                "child_method": child_model.method,
+                "status": "accepted" if accept else "rejected",
+            })
+            if not accept:
+                continue
+            mapping = {child: next_id + pos for pos, child in enumerate(child_ids)}
+            next_id += len(child_ids)
+            rules.append(RefinementRule(
+                parent_cluster=int(cid), model=child_model,
+                child_id_map={int(k): int(v) for k, v in mapping.items()}, depth=depth + 1,
+            ))
+            for local_pos, global_pos in enumerate(idx.tolist()):
+                child = int(child_labels[local_pos])
+                if child == -1:
+                    continue
+                labels[global_pos] = mapping[child]
+                strengths[global_pos] = float(child_strengths[local_pos])
+            any_split = True
+        LOGGER.info(
+            "refinement depth %d: %d evaluated, %d triggered, %d accepted",
+            depth + 1, len(valid_ids), len(candidates),
+            sum(1 for row in audit if row.get("depth") == depth + 1 and row.get("status") == "accepted"),
+        )
+        if not any_split:
+            break
+    return labels, strengths, audit, rules
+
+
+def apply_merge_map(labels: np.ndarray, merge_map: Optional[Dict[int, int]] = None) -> np.ndarray:
+    if not merge_map:
+        return np.asarray(labels, dtype=int).copy()
+    return np.asarray([
+        -1 if int(label) == -1 else int(merge_map.get(int(label), int(label)))
+        for label in np.asarray(labels, dtype=int).tolist()
+    ], dtype=int)
+
+
+def statistically_justified_merge(
+    vectors: np.ndarray,
+    labels: np.ndarray,
+    config: Config,
+) -> Tuple[np.ndarray, Dict[int, int], pd.DataFrame]:
+    """Optionally merge only a statistically distinct high-similarity centroid tail.
+
+    No percentile fallback forces a merge.  If a two-component Gaussian mixture
+    is not BIC-supported for between-centroid similarities, the function leaves
+    the partition unchanged.  Candidate groups also use complete-link centroid
+    similarity plus a cohesion non-degradation check, preventing transitive
+    A~B~C chains from collapsing semantically different clusters.
+    """
+    base = np.asarray(labels, dtype=int)
+    audit: List[Dict[str, Any]] = []
+    if not config.merge_clusters:
+        return base.copy(), {}, pd.DataFrame([{"status": "disabled"}])
+    ids = sorted(set(int(x) for x in base.tolist() if int(x) != -1))
+    if len(ids) < 3:
+        return base.copy(), {}, pd.DataFrame([{"status": "not_required", "reason": "fewer_than_three_clusters"}])
+
+    centroids: Dict[int, np.ndarray] = {}
+    cohesion = local_cluster_cohesion(vectors, base)
+    for cid in ids:
+        block = vectors[base == cid]
+        centroid = block.mean(axis=0)
+        norm = float(np.linalg.norm(centroid))
+        centroids[cid] = centroid / norm if norm > 0 else centroid
+
+    pair_values: List[float] = []
+    pair_lookup: Dict[Tuple[int, int], float] = {}
+    for i, left in enumerate(ids):
+        for right in ids[i + 1:]:
+            sim = float(centroids[left] @ centroids[right])
+            pair_values.append(sim)
+            pair_lookup[(left, right)] = sim
+    threshold, method = distribution_upper_tail_cutoff(pair_values, config.seed + 4241)
+    if method != "gmm_bic_two_component" or not np.isfinite(threshold):
+        audit.append({
+            "status": "no_merge",
+            "threshold_method": method,
+            "merge_threshold": threshold,
+            "reason": "no_BIC_supported_high_similarity_component",
+        })
+        return base.copy(), {}, pd.DataFrame(audit)
+
+    groups: List[set[int]] = [{cid} for cid in ids]
+    candidates = sorted(
+        [(sim, left, right) for (left, right), sim in pair_lookup.items() if sim >= threshold],
+        reverse=True,
+    )
+    for sim, left, right in candidates:
+        gi = next((i for i, g in enumerate(groups) if left in g), None)
+        gj = next((i for i, g in enumerate(groups) if right in g), None)
+        if gi is None or gj is None or gi == gj:
+            continue
+        g1, g2 = groups[gi], groups[gj]
+        cross = []
+        for a in g1:
+            for b in g2:
+                key = (a, b) if a < b else (b, a)
+                cross.append(pair_lookup[key])
+        complete_link_ok = bool(cross) and min(cross) >= threshold
+        merged_members = g1 | g2
+        idx = np.flatnonzero(np.isin(base, list(merged_members)))
+        merged_centroid = vectors[idx].mean(axis=0)
+        norm = float(np.linalg.norm(merged_centroid))
+        if norm > 0:
+            merged_centroid = merged_centroid / norm
+        merged_cohesion = float(np.mean(vectors[idx] @ merged_centroid)) if len(idx) else float("nan")
+        constituent_floor = min(cohesion.get(cid, -1.0) for cid in merged_members)
+        cohesion_ok = np.isfinite(merged_cohesion) and merged_cohesion >= constituent_floor
+        accepted = complete_link_ok and cohesion_ok
+        audit.append({
+            "status": "accepted" if accepted else "rejected",
+            "left_group": ";".join(str(x) for x in sorted(g1)),
+            "right_group": ";".join(str(x) for x in sorted(g2)),
+            "candidate_centroid_cosine": sim,
+            "minimum_cross_centroid_cosine": min(cross) if cross else np.nan,
+            "merge_threshold": threshold,
+            "threshold_method": method,
+            "merged_cohesion": merged_cohesion,
+            "constituent_cohesion_floor": constituent_floor,
+            "complete_link_ok": complete_link_ok,
+            "cohesion_non_degradation_ok": cohesion_ok,
+        })
+        if accepted:
+            new_group = merged_members
+            for index in sorted((gi, gj), reverse=True):
+                groups.pop(index)
+            groups.append(new_group)
+
+    merge_map: Dict[int, int] = {}
+    for group in groups:
+        canonical = min(group)
+        for cid in group:
+            if cid != canonical:
+                merge_map[int(cid)] = int(canonical)
+    merged = apply_merge_map(base, merge_map)
+    return merged, merge_map, pd.DataFrame(audit)
+
+
+def predict_with_refinements(
+    base_model: ClusterModel,
+    rules: Sequence[RefinementRule],
+    vectors: np.ndarray,
+    merge_map: Optional[Dict[int, int]] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    labels, strengths = predict_cluster(base_model, vectors)
+    labels = labels.astype(int)
+    strengths = strengths.astype(float)
+    for rule in rules:
+        idx = np.flatnonzero(labels == int(rule.parent_cluster))
+        if len(idx) == 0:
+            continue
+        child_labels, child_strengths = predict_cluster(rule.model, vectors[idx])
+        for local_pos, global_pos in enumerate(idx.tolist()):
+            mapped = rule.child_id_map.get(int(child_labels[local_pos]))
+            if mapped is not None:
+                labels[global_pos] = int(mapped)
+                strengths[global_pos] = float(child_strengths[local_pos])
+    labels = apply_merge_map(labels, merge_map)
+    return labels, strengths
+
+def fit_outlier_recovery_model(
+    vectors: np.ndarray,
+    labels: np.ndarray,
+    config: Config,
+) -> Tuple[Optional[OutlierRecoveryModel], pd.DataFrame]:
+    """Learn conservative cluster-specific recovery boundaries from assigned development rows."""
+    labels = np.asarray(labels, dtype=int)
+    ids = sorted(set(int(x) for x in labels.tolist() if int(x) != -1))
+    if not config.reassign_outliers:
+        return None, pd.DataFrame([{"status": "disabled"}])
+    if len(ids) < 2:
+        return None, pd.DataFrame([{"status": "not_available", "reason": "fewer_than_two_clusters"}])
+
+    centroids: List[np.ndarray] = []
+    for cid in ids:
+        block = vectors[labels == cid]
+        centroid = block.mean(axis=0)
+        norm = float(np.linalg.norm(centroid))
+        centroids.append(centroid / norm if norm > 0 else centroid)
+    matrix = np.vstack(centroids).astype(np.float32)
+    similarities = np.asarray(vectors @ matrix.T, dtype=float)
+
+    similarity_floors: Dict[int, float] = {}
+    margin_floors: Dict[int, float] = {}
+    audit: List[Dict[str, Any]] = []
+    for col, cid in enumerate(ids):
+        idx = np.flatnonzero(labels == cid)
+        own = similarities[idx, col]
+        other = np.delete(similarities[idx], col, axis=1)
+        second = np.max(other, axis=1) if other.shape[1] else np.full(len(idx), -1.0)
+        margin = own - second
+        sim_floor, sim_method = distribution_lower_tail_cutoff(
+            own.tolist(), config.seed + 4001 + int(cid)
+        )
+        margin_floor, margin_method = distribution_lower_tail_cutoff(
+            margin.tolist(), config.seed + 7001 + int(cid)
+        )
+        sim_floor = float(np.clip(sim_floor, -1.0, 1.0)) if np.isfinite(sim_floor) else float("inf")
+        margin_floor = float(np.clip(margin_floor, -2.0, 2.0)) if np.isfinite(margin_floor) else float("inf")
+        similarity_floors[int(cid)] = sim_floor
+        margin_floors[int(cid)] = margin_floor
+        audit.append({
+            "cluster_id": int(cid),
+            "assigned_members": int(len(idx)),
+            "similarity_floor": sim_floor,
+            "similarity_floor_method": sim_method,
+            "margin_floor": margin_floor,
+            "margin_floor_method": margin_method,
+            "member_similarity_median": float(np.median(own)) if len(own) else np.nan,
+            "member_margin_median": float(np.median(margin)) if len(margin) else np.nan,
+            "status": "fitted",
+        })
+
+    return OutlierRecoveryModel(
+        cluster_ids=np.asarray(ids, dtype=int),
+        centroids=matrix,
+        similarity_floors=similarity_floors,
+        margin_floors=margin_floors,
+        fit_rows=int(np.sum(labels != -1)),
+        enabled=True,
+    ), pd.DataFrame(audit)
+
+
+def apply_outlier_recovery_model(
+    vectors: np.ndarray,
+    labels: np.ndarray,
+    native_strengths: np.ndarray,
+    model: Optional[OutlierRecoveryModel],
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Recover only borderline outliers using persisted cluster-specific evidence.
+
+    `native_strengths` remains the original HDBSCAN/KMeans strength. Recovery
+    similarity and margin are separate fields, so two incomparable confidence
+    concepts are never mixed into one number.
+    """
+    labels = np.asarray(labels, dtype=int).copy()
+    strengths = np.asarray(native_strengths, dtype=float).copy()
+    sources = np.asarray(["native" if int(x) != -1 else "outlier" for x in labels], dtype=object)
+    recovery_similarity = np.full(len(labels), np.nan, dtype=float)
+    recovery_margin = np.full(len(labels), np.nan, dtype=float)
+
+    if model is None or not model.enabled or len(model.cluster_ids) < 2:
+        return labels, strengths, sources, recovery_similarity, recovery_margin
+    outliers = np.flatnonzero(labels == -1)
+    if len(outliers) == 0:
+        return labels, strengths, sources, recovery_similarity, recovery_margin
+
+    similarity = np.asarray(vectors[outliers] @ model.centroids.T, dtype=float)
+    order = np.argsort(similarity, axis=1)
+    best_pos = order[:, -1]
+    second_pos = order[:, -2]
+    best_score = similarity[np.arange(len(outliers)), best_pos]
+    second_score = similarity[np.arange(len(outliers)), second_pos]
+    margin = best_score - second_score
+
+    for local, row in enumerate(outliers.tolist()):
+        cid = int(model.cluster_ids[int(best_pos[local])])
+        sim_floor = float(model.similarity_floors.get(cid, float("inf")))
+        margin_floor = float(model.margin_floors.get(cid, float("inf")))
+        recovery_similarity[row] = float(best_score[local])
+        recovery_margin[row] = float(margin[local])
+        if best_score[local] >= sim_floor and margin[local] >= margin_floor:
+            labels[row] = cid
+            sources[row] = "recovered_outlier"
+            # Native strength intentionally remains unchanged (typically zero).
+
+    return labels, strengths, sources, recovery_similarity, recovery_margin
+
+
+def predict_final_partition(
+    base_model: ClusterModel,
+    rules: Sequence[RefinementRule],
+    vectors: np.ndarray,
+    merge_map: Optional[Dict[int, int]] = None,
+    outlier_recovery_model: Optional[OutlierRecoveryModel] = None,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    labels, strengths = predict_with_refinements(base_model, rules, vectors, merge_map)
+    return apply_outlier_recovery_model(
+        vectors, labels, strengths, outlier_recovery_model
+    )
+
+
+def diverse_top_terms(terms: np.ndarray, scores: np.ndarray, top_n: int) -> List[int]:
+    ranked = [int(i) for i in np.argsort(scores)[::-1] if scores[int(i)] > 0]
+    chosen: List[int] = []
+    while ranked and len(chosen) < top_n:
+        best_idx = None
+        best_value = float("-inf")
+        for idx in ranked[: min(200, len(ranked))]:
+            tokens = set(str(terms[idx]).split())
+            overlap = 0.0
+            if chosen:
+                overlap = max(
+                    len(tokens & set(str(terms[c]).split())) / max(len(tokens | set(str(terms[c]).split())), 1)
+                    for c in chosen
+                )
+            value = float(scores[idx]) * (1.0 - overlap)
+            if value > best_value:
+                best_value = value
+                best_idx = idx
+        if best_idx is None:
+            break
+        chosen.append(best_idx)
+        ranked.remove(best_idx)
+    return chosen
+
+
+def ctfidf_descriptions(
+    texts: Sequence[str],
+    labels: np.ndarray,
+    top_n: int = 12,
+    blocked_terms: Optional[set[str]] = None,
+) -> Dict[int, Dict[str, Any]]:
+    ids = sorted(set(int(x) for x in labels.tolist() if int(x) != -1))
+    if not ids:
+        return {}
+    grouped = [" ".join(str(text) for text, label in zip(texts, labels) if int(label) == cid) for cid in ids]
+    vectorizer = CountVectorizer(
+        lowercase=True, strip_accents="unicode", ngram_range=(1, 3),
+        min_df=1, max_features=50000,
+        token_pattern=r"(?u)\b[a-zA-Z][a-zA-Z0-9'\-]{1,}\b", stop_words=None,
+    )
+    counts = vectorizer.fit_transform(grouped).astype(np.float64)
+    terms = np.asarray(vectorizer.get_feature_names_out())
+    blocked = blocked_terms or set()
+
+    # Class-based TF-IDF with frequent-term dampening inspired by modern
+    # topic-representation practice: L1 normalize, then sqrt TF to reduce
+    # repeated boilerplate dominance, and weight by inverse class frequency.
+    row_sum = np.asarray(counts.sum(axis=1)).ravel()
+    row_sum[row_sum == 0] = 1.0
+    tf = counts.multiply(1.0 / row_sum[:, None])
+    tf.data = np.sqrt(tf.data)
+    class_df = np.asarray((counts > 0).sum(axis=0)).ravel()
+    idf = np.log((1.0 + len(ids)) / (1.0 + class_df)) + 1.0
+    scores = tf.multiply(idf).toarray()
+
+    out: Dict[int, Dict[str, Any]] = {}
+    for row, cid in enumerate(ids):
+        eligible = np.asarray([
+            (str(term) not in blocked) and scores[row, j] > 0
+            for j, term in enumerate(terms)
+        ], dtype=bool)
+        local_scores = scores[row].copy()
+        local_scores[~eligible] = 0.0
+        chosen = diverse_top_terms(terms, local_scores, top_n)
+        keywords = [{"term": str(terms[j]), "weight": float(local_scores[j])} for j in chosen]
+        out[cid] = {
+            "descriptor": " | ".join(x["term"] for x in keywords[:5]) or f"cluster_{cid}",
+            "keywords": keywords,
+        }
+    return out
+
+
+def descriptor_term_map(
+    descriptions: Dict[int, Dict[str, Any]], top_terms: int
+) -> Dict[int, List[str]]:
+    out: Dict[int, List[str]] = {}
+    for cid, payload in descriptions.items():
+        terms: List[str] = []
+        for item in payload.get("keywords", [])[:max(2, int(top_terms))]:
+            normalized = " ".join(tokenize(str(item.get("term", ""))))
+            if normalized and normalized not in terms:
+                terms.append(normalized)
+        out[int(cid)] = terms
+    return out
+
+
+def _reference_term_matrix(
+    reference_texts: Sequence[str], term_maps: Sequence[Dict[int, List[str]]]
+) -> Tuple[sparse.csr_matrix, Dict[str, int]]:
+    vocabulary_terms = sorted({
+        term for mapping in term_maps for terms in mapping.values() for term in terms
+    })
+    if not vocabulary_terms:
+        return sparse.csr_matrix((len(reference_texts), 0), dtype=np.int8), {}
+    vocabulary = {term: idx for idx, term in enumerate(vocabulary_terms)}
+    vectorizer = CountVectorizer(
+        lowercase=True,
+        strip_accents="unicode",
+        ngram_range=(1, 3),
+        binary=True,
+        vocabulary=vocabulary,
+        token_pattern=r"(?u)\b[a-zA-Z][a-zA-Z0-9'\-]{1,}\b",
+    )
+    matrix = vectorizer.transform(list(reference_texts)).tocsr()
+    matrix.data[:] = 1
+    return matrix, vocabulary
+
+
+def _npmi_from_matrix(
+    matrix: sparse.csr_matrix,
+    vocabulary: Dict[str, int],
+    term_map: Dict[int, List[str]],
+    row_indices: Optional[np.ndarray] = None,
+) -> Tuple[float, Dict[int, float]]:
+    view = matrix if row_indices is None else matrix[np.asarray(row_indices, dtype=int)]
+    n_docs = int(view.shape[0])
+    if n_docs <= 0:
+        return float("nan"), {}
+    df = np.asarray(view.sum(axis=0)).ravel().astype(float)
+    per_cluster: Dict[int, float] = {}
+    for cid, terms in term_map.items():
+        cols = [vocabulary[t] for t in terms if t in vocabulary]
+        cols = list(dict.fromkeys(cols))
+        if len(cols) < 2:
+            per_cluster[int(cid)] = float("nan")
+            continue
+        pair_scores: List[float] = []
+        for i in range(len(cols)):
+            for j in range(i + 1, len(cols)):
+                a, b = cols[i], cols[j]
+                p_a = df[a] / n_docs
+                p_b = df[b] / n_docs
+                joint = float(view[:, a].multiply(view[:, b]).sum())
+                p_ab = joint / n_docs
+                if p_a <= 0 or p_b <= 0:
+                    continue
+                if p_ab <= 0:
+                    pair_scores.append(-1.0)
+                    continue
+                if p_ab >= 1.0 - 1e-12:
+                    # Ubiquitous co-occurrence contains no discriminative information.
+                    pair_scores.append(0.0)
+                    continue
+                denom = -math.log(p_ab)
+                if denom <= 1e-12:
+                    continue
+                pair_scores.append(float(math.log(p_ab / (p_a * p_b)) / denom))
+        per_cluster[int(cid)] = float(np.mean(pair_scores)) if pair_scores else float("nan")
+    finite = [v for v in per_cluster.values() if np.isfinite(v)]
+    return (float(np.mean(finite)) if finite else float("nan")), per_cluster
+
+
+def descriptor_diversity_metrics(term_map: Dict[int, List[str]]) -> Dict[str, float]:
+    phrases = [term for terms in term_map.values() for term in terms]
+    phrase_diversity = len(set(phrases)) / len(phrases) if phrases else float("nan")
+    tokens = [token for phrase in phrases for token in tokenize(phrase)]
+    token_diversity = len(set(tokens)) / len(tokens) if tokens else float("nan")
+    cluster_sets = [set(token for phrase in terms for token in tokenize(phrase)) for terms in term_map.values()]
+    jaccards: List[float] = []
+    for i in range(len(cluster_sets)):
+        for j in range(i + 1, len(cluster_sets)):
+            union = cluster_sets[i] | cluster_sets[j]
+            if union:
+                jaccards.append(len(cluster_sets[i] & cluster_sets[j]) / len(union))
+    redundancy = float(np.mean(jaccards)) if jaccards else 0.0
+    components = [x for x in (phrase_diversity, token_diversity, 1.0 - redundancy) if np.isfinite(x)]
+    composite = float(np.median(components)) if components else float("nan")
+    return {
+        "descriptor_phrase_diversity": float(phrase_diversity),
+        "descriptor_token_diversity": float(token_diversity),
+        "descriptor_pairwise_jaccard_redundancy": redundancy,
+        "descriptor_diversity_composite": composite,
+    }
+
+
+def interpretability_metrics(
+    reference_texts: Sequence[str],
+    descriptions: Dict[int, Dict[str, Any]],
+    top_terms: int = 10,
+) -> Tuple[Dict[str, float], Dict[int, float]]:
+    """Phrase-aware NPMI and descriptor diversity on a fixed reference corpus."""
+    term_map = descriptor_term_map(descriptions, top_terms)
+    matrix, vocabulary = _reference_term_matrix(reference_texts, [term_map])
+    coherence, per_cluster = _npmi_from_matrix(matrix, vocabulary, term_map)
+    metrics = {
+        "npmi_coherence": coherence,
+        **descriptor_diversity_metrics(term_map),
+    }
+    return metrics, per_cluster
+
+
+def semantic_regression_guard(
+    reference_texts: Sequence[str],
+    baseline_descriptions: Dict[int, Dict[str, Any]],
+    candidate_descriptions: Dict[int, Dict[str, Any]],
+    config: Config,
+) -> Tuple[bool, pd.DataFrame, Dict[str, Any], Dict[int, float], Dict[int, float]]:
+    """Separate semantic regression protection from structural safety.
+
+    Baseline and candidate descriptors are scored against the exact same
+    privacy-redacted development reference documents.  A paired bootstrap blocks
+    only when the confidence interval supports an NPMI regression; SME business
+    acceptance remains a separate human decision.
+    """
+    baseline_terms = descriptor_term_map(baseline_descriptions, config.coherence_top_terms)
+    candidate_terms = descriptor_term_map(candidate_descriptions, config.coherence_top_terms)
+    matrix, vocabulary = _reference_term_matrix(
+        reference_texts, [baseline_terms, candidate_terms]
+    )
+    baseline_npmi, baseline_per = _npmi_from_matrix(matrix, vocabulary, baseline_terms)
+    candidate_npmi, candidate_per = _npmi_from_matrix(matrix, vocabulary, candidate_terms)
+    baseline_div = descriptor_diversity_metrics(baseline_terms)
+    candidate_div = descriptor_diversity_metrics(candidate_terms)
+
+    repeats = max(0, int(config.semantic_bootstrap_repeats))
+    frac = float(min(max(config.semantic_bootstrap_fraction, 0.50), 1.0))
+    sample_n = max(10, min(matrix.shape[0], int(round(frac * matrix.shape[0])))) if matrix.shape[0] else 0
+    deltas: List[float] = []
+    if repeats > 0 and sample_n > 0 and np.isfinite(baseline_npmi) and np.isfinite(candidate_npmi):
+        rng = np.random.default_rng(config.seed + 9901)
+        for _ in range(repeats):
+            idx = rng.choice(matrix.shape[0], size=sample_n, replace=True)
+            b, _ = _npmi_from_matrix(matrix, vocabulary, baseline_terms, idx)
+            c, _ = _npmi_from_matrix(matrix, vocabulary, candidate_terms, idx)
+            if np.isfinite(b) and np.isfinite(c):
+                deltas.append(float(c - b))
+
+    alpha = float(min(max(config.semantic_guard_alpha, 0.001), 0.25))
+    if deltas:
+        lower = float(np.quantile(deltas, alpha / 2.0))
+        upper = float(np.quantile(deltas, 1.0 - alpha / 2.0))
+        median_delta = float(np.median(deltas))
+    else:
+        lower = upper = median_delta = float("nan")
+
+    mode = str(config.semantic_guard_mode).lower()
+    statistically_supported_regression = bool(np.isfinite(upper) and upper < 0.0)
+    if statistically_supported_regression and mode == "block":
+        status = "BLOCK"
+        deployment_allowed = False
+    elif statistically_supported_regression:
+        status = "WARN"
+        deployment_allowed = True
+    elif np.isfinite(lower) and lower > 0.0:
+        status = "PASS_IMPROVED"
+        deployment_allowed = True
+    elif np.isfinite(candidate_npmi) and np.isfinite(baseline_npmi):
+        status = "PASS_NO_SIGNIFICANT_REGRESSION"
+        deployment_allowed = True
+    else:
+        status = "WARN_METRIC_UNAVAILABLE"
+        deployment_allowed = True
+
+    diversity_regressed = bool(
+        np.isfinite(candidate_div["descriptor_diversity_composite"])
+        and np.isfinite(baseline_div["descriptor_diversity_composite"])
+        and candidate_div["descriptor_diversity_composite"] < baseline_div["descriptor_diversity_composite"]
+    )
+    audit = pd.DataFrame([
+        {
+            "check": "npmi_fixed_reference",
+            "baseline": baseline_npmi,
+            "candidate": candidate_npmi,
+            "delta": candidate_npmi - baseline_npmi if np.isfinite(candidate_npmi) and np.isfinite(baseline_npmi) else np.nan,
+            "bootstrap_delta_median": median_delta,
+            "bootstrap_delta_ci_lower": lower,
+            "bootstrap_delta_ci_upper": upper,
+            "passed": not statistically_supported_regression or mode != "block",
+            "basis": "paired_bootstrap_same_development_reference_corpus",
+        },
+        {
+            "check": "descriptor_diversity_composite",
+            "baseline": baseline_div["descriptor_diversity_composite"],
+            "candidate": candidate_div["descriptor_diversity_composite"],
+            "delta": candidate_div["descriptor_diversity_composite"] - baseline_div["descriptor_diversity_composite"],
+            "bootstrap_delta_median": np.nan,
+            "bootstrap_delta_ci_lower": np.nan,
+            "bootstrap_delta_ci_upper": np.nan,
+            "passed": True,
+            "basis": "audit_and_sme_signal_not_automatic_veto",
+        },
+    ])
+    summary = {
+        "status": status,
+        "deployment_allowed": bool(deployment_allowed),
+        "guard_mode": mode,
+        "baseline_npmi_coherence": baseline_npmi,
+        "candidate_npmi_coherence": candidate_npmi,
+        "bootstrap_delta_median": median_delta,
+        "bootstrap_delta_ci_lower": lower,
+        "bootstrap_delta_ci_upper": upper,
+        "bootstrap_repeats_valid": len(deltas),
+        "alpha": alpha,
+        "statistically_supported_regression": statistically_supported_regression,
+        "baseline_descriptor_diversity": baseline_div,
+        "candidate_descriptor_diversity": candidate_div,
+        "descriptor_diversity_regressed": diversity_regressed,
+        "scope": "semantic_regression_protection_only",
+        "business_semantic_acceptance": "PENDING_SME_REVIEW",
+    }
+    return deployment_allowed, audit, summary, baseline_per, candidate_per
+
+
+def representative_examples(
+    texts: Sequence[str], vectors: np.ndarray, labels: np.ndarray, per_cluster: int
+) -> Dict[int, List[str]]:
+    out: Dict[int, List[str]] = {}
+    for cid in sorted(set(int(x) for x in labels.tolist() if int(x) != -1)):
+        idx = np.flatnonzero(labels == cid)
+        if len(idx) == 0:
+            continue
+        centroid = vectors[idx].mean(axis=0)
+        norm = np.linalg.norm(centroid)
+        if norm > 0:
+            centroid /= norm
+        sims = vectors[idx] @ centroid
+        order = idx[np.argsort(sims)[::-1][:per_cluster]]
+        out[cid] = [redact_pii(str(texts[i])) for i in order.tolist()]
+    return out
+
+
+def cluster_catalog(
+    texts: Sequence[str],
+    vectors: np.ndarray,
+    labels: np.ndarray,
+    strengths: np.ndarray,
+    descriptions: Dict[int, Dict[str, Any]],
+    model: ClusterModel,
+    per_cluster: int,
+    refinement_rules: Optional[Sequence[RefinementRule]] = None,
+    merge_map: Optional[Dict[int, int]] = None,
+    per_cluster_npmi: Optional[Dict[int, float]] = None,
+    assignment_source: Optional[np.ndarray] = None,
+) -> pd.DataFrame:
+    reps = representative_examples(texts, vectors, labels, per_cluster)
+    cohesion = local_cluster_cohesion(vectors, labels)
+    sources = (
+        np.asarray(assignment_source, dtype=object)
+        if assignment_source is not None
+        else np.asarray(["native" if int(x) != -1 else "outlier" for x in labels], dtype=object)
+    )
+    rows: List[Dict[str, Any]] = []
+    n_nonoutlier = max(int((labels != -1).sum()), 1)
+
+    child_ids = {
+        int(child)
+        for rule in (refinement_rules or [])
+        for child in rule.child_id_map.values()
+    }
+    merge_targets = set(int(v) for v in (merge_map or {}).values())
+    persistence_map: Dict[int, float] = {}
+    if model.method == "umap_hdbscan_search":
+        try:
+            p = np.asarray(model.clusterer.cluster_persistence_, dtype=float)
+            persistence_map = {i: float(v) for i, v in enumerate(p.tolist())}
+        except Exception:
+            pass
+
+    for cid in sorted(set(int(x) for x in labels.tolist() if int(x) != -1)):
+        idx = np.flatnonzero(labels == cid)
+        if cid in merge_targets:
+            provenance = "merged_final_cluster"
+        elif cid in child_ids:
+            provenance = "recursive_child"
+        else:
+            provenance = "base_cluster"
+        persistence = persistence_map.get(cid, np.nan) if provenance == "base_cluster" else np.nan
+        native_idx = idx[sources[idx] != "recovered_outlier"]
+        recovered_count = int(np.sum(sources[idx] == "recovered_outlier"))
+        rows.append({
+            "cluster_id": cid,
+            "cluster_provenance": provenance,
+            "count": len(idx),
+            "recovered_outlier_count": recovered_count,
+            "share_of_nonoutliers_pct": 100.0 * len(idx) / n_nonoutlier,
+            "mean_native_membership_strength": float(np.mean(strengths[native_idx])) if len(native_idx) else np.nan,
+            "cohesion_mean_cosine_to_centroid": cohesion.get(cid, np.nan),
+            "hdbscan_cluster_persistence": persistence,
+            "npmi_coherence": (per_cluster_npmi or {}).get(cid, np.nan),
+            "global_stability_ari": model.global_stability_ari,
+            "assigned_stability_ari": model.assigned_stability_ari,
+            "outlier_jaccard": model.outlier_jaccard,
+            "descriptor": descriptions.get(cid, {}).get("descriptor", f"cluster_{cid}"),
+            "top_terms": "; ".join(x["term"] for x in descriptions.get(cid, {}).get("keywords", [])[:12]),
+            "representative_examples": " || ".join(reps.get(cid, [])),
+        })
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows).sort_values("count", ascending=False).reset_index(drop=True)
+
+
+def metric_with_model(metrics: Dict[str, float], model: ClusterModel) -> Dict[str, float]:
+    out = dict(metrics)
+    if not np.isfinite(float(out.get("density_validity", np.nan))) and model.density_validity is not None:
+        out["density_validity"] = float(model.density_validity)
+    if not np.isfinite(float(out.get("weighted_persistence", np.nan))) and model.weighted_persistence is not None:
+        out["weighted_persistence"] = float(model.weighted_persistence)
+    out["global_stability_ari"] = float(model.global_stability_ari) if model.global_stability_ari is not None else float("nan")
+    out["assigned_stability_ari"] = float(model.assigned_stability_ari) if model.assigned_stability_ari is not None else float("nan")
+    out["outlier_jaccard"] = float(model.outlier_jaccard) if model.outlier_jaccard is not None else float("nan")
+    return out
+
+
+def final_partition_metrics(
+    vectors: np.ndarray,
+    labels: np.ndarray,
+    strengths: np.ndarray,
+    seed: int,
+    assignment_source: Optional[np.ndarray] = None,
+) -> Dict[str, float]:
+    labels = np.asarray(labels, dtype=int)
+    strengths = np.asarray(strengths, dtype=float)
+    sources = (
+        np.asarray(assignment_source, dtype=object)
+        if assignment_source is not None
+        else np.asarray(["native" if int(x) != -1 else "outlier" for x in labels], dtype=object)
+    )
+    metrics = evaluate_cluster_candidate(vectors, labels, seed)
+    cohesion = local_cluster_cohesion(vectors, labels)
+    sizes = {cid: int((labels == cid).sum()) for cid in cohesion}
+    assigned = labels != -1
+    native_assigned = assigned & (sources != "recovered_outlier")
+    recovered = sources == "recovered_outlier"
+    if sizes:
+        weighted_cohesion = sum(cohesion[cid] * sizes[cid] for cid in sizes) / max(sum(sizes.values()), 1)
+        median_cohesion = float(np.median(list(cohesion.values())))
+    else:
+        weighted_cohesion = float("nan")
+        median_cohesion = float("nan")
+
+    ids = sorted(sizes)
+    separation = float("nan")
+    if len(ids) >= 2:
+        centroids = []
+        for cid in ids:
+            centroid = vectors[labels == cid].mean(axis=0)
+            norm = float(np.linalg.norm(centroid))
+            centroids.append(centroid / norm if norm > 0 else centroid)
+        matrix = np.vstack(centroids)
+        sims = matrix @ matrix.T
+        np.fill_diagonal(sims, -np.inf)
+        nearest = np.max(sims, axis=1)
+        separation = float(np.mean(1.0 - nearest))
+
+    metrics.update({
+        "assigned_fraction": float(np.mean(assigned)) if len(labels) else 0.0,
+        "recovered_outlier_fraction": float(np.mean(recovered)) if len(labels) else 0.0,
+        "mean_cluster_cohesion": float(weighted_cohesion),
+        "median_cluster_cohesion": float(median_cohesion),
+        "centroid_separation": separation,
+        "mean_native_assigned_strength": (
+            float(np.mean(strengths[native_assigned])) if native_assigned.any() else float("nan")
+        ),
+        # Backward-compatible key; now explicitly means native model strength.
+        "mean_assigned_strength": (
+            float(np.mean(strengths[native_assigned])) if native_assigned.any() else float("nan")
+        ),
+    })
+    return metrics
+
+
+def structural_safety_gate(
+    baseline: Dict[str, float],
+    candidate: Dict[str, float],
+    candidate_search: pd.DataFrame,
+    model: ClusterModel,
+) -> Tuple[bool, pd.DataFrame, Dict[str, Any]]:
+    """Safety gate for structural pathologies only; semantic acceptance stays human.
+
+    Boundaries are inferred from the development model-search distribution via
+    robust fences.  The gate does not nominate a single primary metric and does
+    not impose a fixed outlier-rate multiple.  Passing means "not structurally
+    pathological", not "business-correct".
+    """
+    rows: List[Dict[str, Any]] = []
+    conditions: List[Tuple[str, bool, Any, Any, str]] = []
+
+    n_clusters = float(candidate.get("n_clusters", 0.0))
+    largest = float(candidate.get("largest_cluster_share", 1.0))
+    assigned_fraction = float(candidate.get("assigned_fraction", 0.0))
+    conditions.extend([
+        ("at_least_two_non_noise_clusters", n_clusters >= 2.0, n_clusters, 2.0, "hard_invariant"),
+        ("not_single_cluster_collapse", largest < 1.0, largest, 1.0, "hard_invariant"),
+        ("some_records_assigned", assigned_fraction > 0.0, assigned_fraction, 0.0, "hard_invariant"),
+    ])
+
+    # Data-derived fences from candidate model search.  These are used only when
+    # enough finite observations exist; otherwise the condition is informational.
+    fence_specs = {
+        "silhouette": ("lower", candidate.get("silhouette", np.nan)),
+        "balance_entropy": ("lower", candidate.get("balance_entropy", np.nan)),
+        "largest_cluster_share": ("upper", candidate.get("largest_cluster_share", np.nan)),
+        "noise_rate": ("upper", candidate.get("noise_rate", np.nan)),
+    }
+    for metric, (side, observed) in fence_specs.items():
+        values = pd.to_numeric(candidate_search.get(metric, pd.Series(dtype=float)), errors="coerce").dropna().to_numpy(float)
+        if len(values) < 4 or not np.isfinite(float(observed)):
+            rows.append({
+                "condition": f"search_fence_{metric}", "passed": True,
+                "observed": observed, "boundary": np.nan,
+                "basis": "informational_insufficient_search_distribution",
+            })
+            continue
+        boundary = robust_lower_fence(values) if side == "lower" else robust_upper_fence(values)
+        ok = float(observed) >= boundary if side == "lower" else float(observed) <= boundary
+        conditions.append((f"search_fence_{metric}", bool(ok), float(observed), float(boundary), f"development_search_{side}_fence"))
+
+    stability_values = pd.to_numeric(
+        candidate_search.get("assigned_ari", pd.Series(dtype=float)), errors="coerce"
+    ).dropna().to_numpy(float)
+    observed_stability = model.assigned_stability_ari
+    if observed_stability is not None and np.isfinite(observed_stability) and len(stability_values) >= 4:
+        boundary = robust_lower_fence(stability_values)
+        conditions.append((
+            "deployed_assigned_stability_within_search_distribution",
+            float(observed_stability) >= boundary,
+            float(observed_stability), float(boundary), "development_search_lower_fence",
+        ))
+
+    for name, ok, observed, boundary, basis in conditions:
+        rows.append({
+            "condition": name,
+            "passed": bool(ok),
+            "observed": observed,
+            "boundary": boundary,
+            "basis": basis,
+        })
+
+    failed = [row["condition"] for row in rows if not bool(row["passed"])]
+    passed = len(failed) == 0
+    # Baseline deltas are audit-only and never become a hidden semantic gate.
+    for metric in (
+        "silhouette", "balance_entropy", "largest_cluster_share", "noise_rate",
+        "mean_cluster_cohesion", "centroid_separation",
+    ):
+        b = float(baseline.get(metric, np.nan))
+        c = float(candidate.get(metric, np.nan))
+        if np.isfinite(b) and np.isfinite(c):
+            rows.append({
+                "condition": f"baseline_delta_{metric}",
+                "passed": True,
+                "observed": c - b,
+                "boundary": np.nan,
+                "basis": "audit_only_not_a_deployment_veto",
+            })
+
+    summary = {
+        "passed": passed,
+        "failed_conditions": failed,
+        "gate_scope": "structural_safety_only",
+        "semantic_acceptance": "pending_sme_review",
+        "rule": (
+            "hard anti-collapse invariants plus data-derived development-search fences; "
+            "no single intrinsic metric, fixed silhouette veto, or fixed noise-rate multiple"
+        ),
+    }
+    return passed, pd.DataFrame(rows), summary
+
+
+def multi_metric_quality_gate(
+    baseline: Dict[str, float],
+    candidate: Dict[str, float],
+    baseline_search: pd.DataFrame,
+    candidate_search: pd.DataFrame,
+) -> Tuple[bool, pd.DataFrame, Dict[str, Any]]:
+    """Backward-compatible wrapper; v2.4 uses structural_safety_gate directly."""
+    dummy = ClusterModel(
+        method="compatibility_wrapper", reducer=None, clusterer=None, parameters={},
+        global_stability_ari=None, assigned_stability_ari=None, outlier_jaccard=None,
+        silhouette=None, density_validity=None, weighted_persistence=None, selection_score=None,
+    )
+    return structural_safety_gate(baseline, candidate, candidate_search, dummy)
+
+# ---------------------------------------------------------------------------
+# Core corpus processing
+# ---------------------------------------------------------------------------
+
+def fit_baseline_on_unique(
+    unique_texts: Sequence[str], config: Config
+) -> Tuple[LatentModel, ClusterModel, np.ndarray, np.ndarray, np.ndarray, pd.DataFrame]:
+    values = list(unique_texts)
+    if len(values) > config.max_cluster_fit_rows:
+        rng = np.random.default_rng(config.seed)
+        fit_idx = np.sort(rng.choice(len(values), size=config.max_cluster_fit_rows, replace=False))
+        fit_texts = [values[i] for i in fit_idx.tolist()]
+    else:
+        fit_idx = np.arange(len(values), dtype=int)
+        fit_texts = values
+    latent, fit_vectors = fit_latent(fit_texts, config)
+    cluster_model, fit_labels, fit_strengths, search = fit_cluster_search(fit_vectors, config)
+    if len(fit_idx) == len(values):
+        return latent, cluster_model, fit_vectors, fit_labels, fit_strengths, search
+    all_vectors = latent.transform(values)
+    labels, strengths = predict_cluster(cluster_model, all_vectors)
+    return latent, cluster_model, all_vectors, labels, strengths, search
+
+
+def build_sme_review_template(catalog: pd.DataFrame) -> pd.DataFrame:
+    if catalog.empty:
+        return pd.DataFrame(columns=[
+            "cluster_id", "cluster_provenance", "count", "descriptor", "top_terms",
+            "npmi_coherence", "sme_review_status", "sme_business_label",
+            "sme_is_coherent", "sme_noise_contamination", "sme_notes",
+        ])
+    keep = [
+        c for c in (
+            "cluster_id", "cluster_provenance", "count", "share_of_nonoutliers_pct",
+            "cohesion_mean_cosine_to_centroid", "npmi_coherence", "descriptor", "top_terms",
+            "representative_examples",
+        ) if c in catalog.columns
+    ]
+    review = catalog[keep].copy()
+    review["sme_review_status"] = "PENDING"
+    review["sme_business_label"] = ""
+    review["sme_is_coherent"] = ""
+    review["sme_noise_contamination"] = ""
+    review["sme_notes"] = ""
+    return review
+
+
+def process_corpus(
+    frame: pd.DataFrame,
+    text_col: str,
+    corpus_name: str,
+    config: Config,
+) -> Dict[str, Any]:
+    LOGGER.info("[%s] Phase-2 corpus processing: %s", "3/9" if corpus_name == "customer" else "7/9", corpus_name)
+    data = frame.copy().reset_index(drop=True)
+    data[text_col] = data[text_col].fillna("").astype(str).map(redact_pii)
+    data = data[data[text_col].map(lambda x: len(tokenize(x)) >= 2)].reset_index(drop=True)
+
+    dev = data[data["data_split"].eq("development")].copy().reset_index()
+    if len(dev) < 30:
+        raise RuntimeError(f"Too few development rows for {corpus_name}: {len(dev)}")
+    unique_dev = dev[["index", text_col]].drop_duplicates(text_col).reset_index(drop=True)
+    unique_raw = unique_dev[text_col].astype(str).tolist()
+    if len(unique_raw) < 30:
+        raise RuntimeError(f"{corpus_name}: only {len(unique_raw)} distinct development texts, 30 required")
+
+    # ------------------------------------------------------------------
+    # Immutable development reference baseline.  The same privacy-redacted
+    # corpus is used for every interpretability comparison.
+    # ------------------------------------------------------------------
+    LOGGER.info("%s: fitting raw-text development baseline", corpus_name)
+    baseline_latent, baseline_cluster, baseline_vectors, baseline_labels, baseline_strengths, baseline_search = fit_baseline_on_unique(unique_raw, config)
+    baseline_sources = np.asarray([
+        "native" if int(x) != -1 else "outlier" for x in baseline_labels
+    ], dtype=object)
+    baseline_final_metrics = final_partition_metrics(
+        baseline_vectors, baseline_labels, baseline_strengths, config.seed, baseline_sources
+    )
+    baseline_model_diagnostics = metric_with_model(
+        evaluate_cluster_candidate(baseline_vectors, baseline_labels, config.seed), baseline_cluster
+    )
+    baseline_descriptions = ctfidf_descriptions(unique_raw, baseline_labels)
+    baseline_interp, baseline_per_npmi = interpretability_metrics(
+        unique_raw, baseline_descriptions, config.coherence_top_terms
+    )
+    baseline_final_metrics.update(baseline_interp)
+
+    # ------------------------------------------------------------------
+    # Development-only noise discovery + policy ablation.
+    # ------------------------------------------------------------------
+    LOGGER.info("%s: building multi-clustering development-only noise consensus", corpus_name)
+    noise_labelings, noise_consensus_audit = build_noise_label_ensemble(
+        baseline_vectors, baseline_cluster, baseline_labels, config
+    )
+    noise_model, noise_table = learn_noise_model(unique_raw, noise_labelings, config)
+    selected_noise_policy, noise_policy_ablation = select_noise_policy(
+        unique_raw, noise_model, config
+    )
+    model_unique = prepare_model_texts(unique_raw, noise_model, selected_noise_policy)
+    LOGGER.info(
+        "%s: noise terms=%d templates=%d consensus_clusterings=%d selected_policy=%s",
+        corpus_name,
+        len(noise_model.unigrams),
+        len(noise_model.template_phrases),
+        len(noise_labelings),
+        selected_noise_policy,
+    )
+
+    # ------------------------------------------------------------------
+    # Duplicate-family control is performed in the selected model-text space.
+    # ------------------------------------------------------------------
+    LOGGER.info("%s: detecting scalable near-duplicate families", corpus_name)
+    family_ids, duplicate_pairs, duplicate_cutoff, duplicate_method, duplicate_proj = detect_duplicate_families(model_unique, config)
+    reps, duplicate_families = choose_family_representatives(family_ids, duplicate_proj)
+    fit_texts = [model_unique[i] for i in reps.tolist()]
+    if len(fit_texts) > config.max_cluster_fit_rows:
+        rng = np.random.default_rng(config.seed)
+        chosen = np.sort(rng.choice(len(fit_texts), size=config.max_cluster_fit_rows, replace=False))
+        fit_texts_model = [fit_texts[i] for i in chosen.tolist()]
+        fit_rep_positions = reps[chosen]
+    else:
+        fit_texts_model = fit_texts
+        fit_rep_positions = reps
+
+    LOGGER.info("%s: fitting selected latent space and UMAP/HDBSCAN search", corpus_name)
+    latent, fit_vectors = fit_latent(
+        fit_texts_model,
+        config,
+        noise_model=noise_model if selected_noise_policy == "word_only" else None,
+        noise_policy=selected_noise_policy,
+    )
+    cluster_model, fit_labels, fit_strengths, search_table = fit_cluster_search(fit_vectors, config)
+    refined_labels, refined_strengths, refinement_audit, refinement_rules = refine_clusters(
+        fit_vectors, fit_labels, fit_strengths, config
+    )
+    final_fit_labels, merge_map, merge_audit = statistically_justified_merge(
+        fit_vectors, refined_labels, config
+    )
+
+    rep_pos_to_assignment: Dict[int, Tuple[int, float]] = {}
+    for local_pos, unique_pos in enumerate(fit_rep_positions.tolist()):
+        rep_pos_to_assignment[int(unique_pos)] = (
+            int(final_fit_labels[local_pos]), float(refined_strengths[local_pos])
+        )
+    missing_reps = [int(i) for i in reps.tolist() if int(i) not in rep_pos_to_assignment]
+    if missing_reps:
+        missing_vec = latent.transform([model_unique[i] for i in missing_reps])
+        p_labels, p_strengths = predict_with_refinements(
+            cluster_model, refinement_rules, missing_vec, merge_map
+        )
+        for i, lab, st in zip(missing_reps, p_labels.tolist(), p_strengths.tolist()):
+            rep_pos_to_assignment[i] = (int(lab), float(st))
+
+    rep_by_family = {
+        int(row.duplicate_family_id): int(row.representative_index)
+        for row in duplicate_families.itertuples()
+    }
+    family_to_assignment = {
+        fam: rep_pos_to_assignment.get(rep_idx, (-1, 0.0))
+        for fam, rep_idx in rep_by_family.items()
+    }
+    unique_labels_pre_recovery = np.asarray(
+        [family_to_assignment[int(fam)][0] for fam in family_ids], dtype=int
+    )
+    unique_strengths = np.asarray(
+        [family_to_assignment[int(fam)][1] for fam in family_ids], dtype=float
+    )
+    unique_vectors = latent.transform(model_unique)
+
+    # ------------------------------------------------------------------
+    # Persistable outlier recovery.  Thresholds are cluster-specific and use
+    # both nearest-centroid similarity and best-vs-second-best margin.
+    # ------------------------------------------------------------------
+    outlier_recovery_model, outlier_recovery_thresholds = fit_outlier_recovery_model(
+        unique_vectors, unique_labels_pre_recovery, config
+    )
+    (
+        unique_labels,
+        unique_strengths,
+        unique_sources,
+        unique_recovery_similarity,
+        unique_recovery_margin,
+    ) = apply_outlier_recovery_model(
+        unique_vectors,
+        unique_labels_pre_recovery,
+        unique_strengths,
+        outlier_recovery_model,
+    )
+    outlier_recovery_summary = {
+        "enabled": bool(config.reassign_outliers),
+        "outliers_before": int(np.sum(unique_labels_pre_recovery == -1)),
+        "outliers_reassigned": int(np.sum(unique_sources == "recovered_outlier")),
+        "outliers_after": int(np.sum(unique_labels == -1)),
+        "recovery_model_clusters": int(len(outlier_recovery_model.cluster_ids)) if outlier_recovery_model else 0,
+    }
+
+    # Descriptors always use readable privacy-redacted source language. Noise
+    # terms are blocked at the descriptor layer regardless of selected policy.
+    descriptions = ctfidf_descriptions(
+        unique_raw, unique_labels, blocked_terms=noise_model.descriptor_blocklist
+    )
+    candidate_interp, candidate_per_npmi = interpretability_metrics(
+        unique_raw, descriptions, config.coherence_top_terms
+    )
+    attempted_final_metrics = final_partition_metrics(
+        unique_vectors, unique_labels, unique_strengths, config.seed, unique_sources
+    )
+    attempted_final_metrics.update(candidate_interp)
+    attempted_model_diagnostics = metric_with_model(
+        evaluate_cluster_candidate(unique_vectors, unique_labels_pre_recovery, config.seed), cluster_model
+    )
+
+    catalog = cluster_catalog(
+        unique_raw,
+        unique_vectors,
+        unique_labels,
+        unique_strengths,
+        descriptions,
+        cluster_model,
+        config.representative_examples,
+        refinement_rules=refinement_rules,
+        merge_map=merge_map,
+        per_cluster_npmi=candidate_per_npmi,
+        assignment_source=unique_sources,
+    )
+
+    structural_passed, structural_gate_audit, structural_gate_summary = structural_safety_gate(
+        baseline_final_metrics, attempted_final_metrics, search_table, cluster_model
+    )
+    semantic_allowed, semantic_guard_audit, semantic_guard_summary, _, _ = semantic_regression_guard(
+        unique_raw, baseline_descriptions, descriptions, config
+    )
+    deploy_candidate = bool(structural_passed and semantic_allowed)
+    if not structural_passed:
+        LOGGER.warning(
+            "%s: structural safety gate failed on %s",
+            corpus_name,
+            ", ".join(structural_gate_summary["failed_conditions"]) or "unknown",
+        )
+    if not semantic_allowed:
+        LOGGER.warning(
+            "%s: semantic regression guard blocked candidate; status=%s",
+            corpus_name, semantic_guard_summary["status"],
+        )
+
+    # ------------------------------------------------------------------
+    # Deployment selection. A failed candidate is auditable and can revert to
+    # the untouched development baseline without contaminating the locked test.
+    # ------------------------------------------------------------------
+    deployed_noise_policy = selected_noise_policy
+    deployed_mode = (
+        "noise_reduced" if selected_noise_policy == "shared_clean"
+        else "word_only_feature_suppression" if selected_noise_policy == "word_only"
+        else "raw_redacted"
+    )
+    deployed_final_metrics = dict(attempted_final_metrics)
+    deployed_model_diagnostics = dict(attempted_model_diagnostics)
+    deployed_sources = unique_sources.copy()
+    deployed_recovery_similarity = unique_recovery_similarity.copy()
+    deployed_recovery_margin = unique_recovery_margin.copy()
+    reverted = False
+
+    if not deploy_candidate and config.on_regression == "revert":
+        LOGGER.warning("%s: deployment checks failed; reverting deployed geometry to raw baseline", corpus_name)
+        latent = baseline_latent
+        cluster_model = baseline_cluster
+        refinement_rules = []
+        merge_map = {}
+        outlier_recovery_model = None
+        unique_labels = np.asarray(baseline_labels, dtype=int)
+        unique_strengths = np.asarray(baseline_strengths, dtype=float)
+        unique_vectors = baseline_vectors
+        deployed_sources = baseline_sources
+        deployed_recovery_similarity = np.full(len(unique_labels), np.nan)
+        deployed_recovery_margin = np.full(len(unique_labels), np.nan)
+        descriptions = baseline_descriptions
+        catalog = cluster_catalog(
+            unique_raw,
+            unique_vectors,
+            unique_labels,
+            unique_strengths,
+            descriptions,
+            baseline_cluster,
+            config.representative_examples,
+            refinement_rules=[],
+            merge_map={},
+            per_cluster_npmi=baseline_per_npmi,
+            assignment_source=baseline_sources,
+        )
+        deployed_final_metrics = dict(baseline_final_metrics)
+        deployed_model_diagnostics = dict(baseline_model_diagnostics)
+        deployed_noise_policy = "raw"
+        deployed_mode = "raw_redacted"
+        reverted = True
+
+    exact_map: Dict[str, Tuple[int, float, str, float, float]] = {
+        str(raw): (
+            int(lab), float(st), str(src), float(rs), float(rm)
+        )
+        for raw, lab, st, src, rs, rm in zip(
+            unique_raw,
+            unique_labels.tolist(),
+            unique_strengths.tolist(),
+            deployed_sources.tolist(),
+            deployed_recovery_similarity.tolist(),
+            deployed_recovery_margin.tolist(),
+        )
+    }
+
+    labels_all = np.full(len(data), -1, dtype=int)
+    strengths_all = np.zeros(len(data), dtype=float)
+    assignment_source_all = np.asarray(["outlier"] * len(data), dtype=object)
+    recovery_similarity_all = np.full(len(data), np.nan, dtype=float)
+    recovery_margin_all = np.full(len(data), np.nan, dtype=float)
+    unseen_positions: List[int] = []
+    unseen_model_texts: List[str] = []
+    model_text_all: List[str] = []
+
+    for i, raw in enumerate(data[text_col].astype(str).tolist()):
+        model_text = prepare_model_texts([raw], noise_model, deployed_noise_policy)[0]
+        model_text_all.append(model_text)
+        hit = exact_map.get(raw)
+        if hit is not None and data.at[i, "data_split"] == "development":
+            labels_all[i], strengths_all[i], assignment_source_all[i], recovery_similarity_all[i], recovery_margin_all[i] = hit
+        else:
+            unseen_positions.append(i)
+            unseen_model_texts.append(model_text)
+
+    if unseen_positions:
+        vec = latent.transform(unseen_model_texts)
+        labs, sts, srcs, rec_sims, rec_margins = predict_final_partition(
+            cluster_model,
+            refinement_rules,
+            vec,
+            merge_map,
+            outlier_recovery_model,
+        )
+        for pos, lab, st, src, rec_sim, rec_margin in zip(
+            unseen_positions,
+            labs.tolist(),
+            sts.tolist(),
+            srcs.tolist(),
+            rec_sims.tolist(),
+            rec_margins.tolist(),
+        ):
+            labels_all[pos] = int(lab)
+            strengths_all[pos] = float(st)
+            assignment_source_all[pos] = str(src)
+            recovery_similarity_all[pos] = float(rec_sim)
+            recovery_margin_all[pos] = float(rec_margin)
+
+    data["phase2_model_text"] = model_text_all
+    data["phase2_cluster_id"] = labels_all
+    # This remains native HDBSCAN/KMeans strength. Recovered rows keep their
+    # original native strength and expose recovery evidence separately.
+    data["phase2_cluster_strength"] = strengths_all
+    data["phase2_assignment_source"] = assignment_source_all
+    data["phase2_recovery_similarity"] = recovery_similarity_all
+    data["phase2_recovery_margin"] = recovery_margin_all
+    data["phase2_cluster_descriptor"] = [
+        "unassigned" if int(lab) == -1
+        else descriptions.get(int(lab), {}).get("descriptor", f"cluster_{int(lab)}")
+        for lab in labels_all.tolist()
+    ]
+
+    before_after = pd.DataFrame([
+        {"stage": "raw_text_baseline", **baseline_final_metrics},
+        {"stage": "attempted_phase2_final_partition", **attempted_final_metrics},
+        {"stage": "deployed_final_partition", **deployed_final_metrics},
+    ])
+
+    dev_mask_all = data["data_split"].eq("development").to_numpy()
+    reference_distribution = cluster_distribution(labels_all[dev_mask_all])
+    reference_outlier_rate = float(np.mean(labels_all[dev_mask_all] == -1)) if dev_mask_all.any() else 0.0
+    dev_native_mask = dev_mask_all & (assignment_source_all != "recovered_outlier")
+    reference_strength = strength_quantiles(strengths_all[dev_native_mask]) if dev_native_mask.any() else {}
+    reference_recovery_rate = float(np.mean(assignment_source_all[dev_mask_all] == "recovered_outlier")) if dev_mask_all.any() else 0.0
+
+    bundle = CorpusBundle(
+        pipeline_name=PIPELINE_NAME,
+        pipeline_version=PIPELINE_VERSION,
+        corpus_name=corpus_name,
+        noise_model=noise_model,
+        noise_policy=deployed_noise_policy,
+        latent_model=latent,
+        cluster_model=cluster_model,
+        refinement_rules=refinement_rules,
+        merge_map=merge_map,
+        outlier_recovery_model=outlier_recovery_model,
+        descriptions=descriptions,
+        model_text_mode=deployed_mode,
+        reference_cluster_distribution=reference_distribution,
+        reference_outlier_rate=reference_outlier_rate,
+        reference_strength_quantiles=reference_strength,
+        reference_recovery_rate=reference_recovery_rate,
+        config=asdict(config),
+    )
+    sme_review = build_sme_review_template(catalog)
+
+    summary = {
+        "corpus": corpus_name,
+        "development_rows": int((data["data_split"] == "development").sum()),
+        "locked_test_rows": int((data["data_split"] == "locked_test").sum()),
+        "unique_development_texts": len(unique_raw),
+        "noise_consensus_clusterings": len(noise_labelings),
+        "learned_noise_unigrams": len(noise_model.unigrams),
+        "learned_noise_template_phrases": len(noise_model.template_phrases),
+        "noise_selection_method": noise_model.selection_method,
+        "noise_policy_requested": config.noise_policy,
+        "noise_policy_selected": selected_noise_policy,
+        "noise_policy_deployed": deployed_noise_policy,
+        "model_text_policy": (
+            "auto-selected on development data: shared_clean feeds identical cleaned text to word+char; "
+            "word_only suppresses learned terms only from fitted word vocabulary; raw is the safety baseline"
+        ),
+        "near_duplicate_similarity_cutoff": duplicate_cutoff,
+        "near_duplicate_method": duplicate_method,
+        "near_duplicate_families": int(len(set(family_ids.tolist()))),
+        "duplicate_pairs_detected": int(len(duplicate_pairs)),
+        "cluster_fit_representatives": len(fit_texts_model),
+        "cluster_method": cluster_model.method,
+        "selected_parameters": cluster_model.parameters,
+        "merge_clusters_enabled": bool(config.merge_clusters),
+        "persisted_merge_mapping_size": len(merge_map),
+        "outlier_recovery": outlier_recovery_summary,
+        "baseline_final_partition_metrics": baseline_final_metrics,
+        "attempted_phase2_final_partition_metrics": attempted_final_metrics,
+        "deployed_final_partition_metrics": deployed_final_metrics,
+        "baseline_base_model_diagnostics": baseline_model_diagnostics,
+        "attempted_base_model_diagnostics": attempted_model_diagnostics,
+        "deployed_base_model_diagnostics": deployed_model_diagnostics,
+        "structural_safety_gate": structural_gate_summary,
+        "semantic_regression_guard": semantic_guard_summary,
+        "business_semantic_acceptance": {
+            "status": "PENDING_SME_REVIEW",
+            "artifact": f"{corpus_name}_sme_review.csv",
+            "note": "Structural safety and semantic regression protection do not certify business intent correctness.",
+        },
+        "recursive_refinements_triggered": int(sum(1 for r in refinement_audit if r.get("status") == "triggered")),
+        "recursive_refinements_accepted": int(sum(1 for r in refinement_audit if r.get("status") == "accepted")),
+        "reverted_to_baseline": reverted,
+        "deployed_model_text_mode": deployed_mode,
+        "reference_development_cluster_distribution": reference_distribution,
+        "reference_development_outlier_rate": reference_outlier_rate,
+        "reference_development_native_strength_quantiles": reference_strength,
+        "reference_development_recovery_rate": reference_recovery_rate,
+        "outlier_definition": "cluster_id=-1 means unresolved after native clustering and conservative persisted recovery.",
+    }
+
+    return {
+        "rows": data,
+        "text_col": text_col,
+        "noise_table": noise_table,
+        "noise_consensus_audit": noise_consensus_audit,
+        "noise_policy_ablation": noise_policy_ablation,
+        "duplicate_pairs": duplicate_pairs,
+        "duplicate_families": duplicate_families,
+        "model_search": search_table,
+        "baseline_model_search": baseline_search,
+        "refinement_audit": pd.DataFrame(refinement_audit),
+        "merge_audit": merge_audit,
+        "outlier_recovery_audit": outlier_recovery_thresholds,
+        "quality_gate_audit": structural_gate_audit,
+        "semantic_guard_audit": semantic_guard_audit,
+        "cluster_catalog": catalog,
+        "sme_review": sme_review,
+        "before_after": before_after,
+        "summary": summary,
+        "bundle": bundle,
+    }
+
+# ---------------------------------------------------------------------------
+# Assistant sentence units
+# ---------------------------------------------------------------------------
+
+def build_assistant_units(frame: pd.DataFrame, config: Config) -> pd.DataFrame:
+    rows: List[Dict[str, Any]] = []
+    assistant = frame[frame["_role"].eq("assistant")].copy()
+    for _, row in assistant.iterrows():
+        parts = [
+            p.strip() for p in SENTENCE_SPLIT_RE.split(str(row["_text"]))
+            if len(tokenize(p)) >= 3
+        ]
+        for sentence_idx, sentence in enumerate(parts):
+            rows.append({
+                "_row_id": int(row["_row_id"]),
+                "_case": str(row["_case"]),
+                "_conversation": str(row["_conversation"]),
+                "_group": str(row["_group"]),
+                "data_split": str(row["data_split"]),
+                "sentence_index": sentence_idx,
+                "assistant_sentence": redact_pii(sentence),
+            })
+    units = pd.DataFrame(rows)
+    if units.empty:
+        return units
+    if config.assistant_max_units > 0 and len(units) > config.assistant_max_units:
+        LOGGER.warning(
+            "assistant sentence units=%d exceed advisory threshold=%d; retaining all rows. "
+            "Training cost remains bounded by max_cluster_fit_rows/search_sample_rows and ANN duplicate search.",
+            len(units), config.assistant_max_units,
+        )
+    return units
+
+
+# ---------------------------------------------------------------------------
+# Outputs, privacy guard, persisted artifacts
+# ---------------------------------------------------------------------------
+
+def save_bar_chart(labels: Sequence[str], values: Sequence[float], title: str, ylabel: str, path: Path) -> None:
+    plt.figure(figsize=(10, 6))
+    plt.bar(list(labels), list(values))
+    plt.title(title)
+    plt.ylabel(ylabel)
+    plt.xticks(rotation=20, ha="right")
+    plt.tight_layout()
+    plt.savefig(path, dpi=160)
+    plt.close()
+
+
+def save_horizontal_cluster_chart(catalog: pd.DataFrame, title: str, path: Path, top_n: int = 25) -> None:
+    if catalog.empty:
+        return
+    view = catalog.head(top_n).iloc[::-1]
+    labels = [f"{int(r.cluster_id)}: {str(r.descriptor)[:55]}" for r in view.itertuples()]
+    plt.figure(figsize=(12, max(6, len(view) * 0.35)))
+    plt.barh(labels, view["count"].values)
+    plt.title(title)
+    plt.xlabel("Records")
+    plt.tight_layout()
+    plt.savefig(path, dpi=160)
+    plt.close()
+
+
+def save_grouped_metric_chart(
+    before_after: pd.DataFrame, metrics: Sequence[str], title: str, path: Path
+) -> None:
+    """Baseline against deployed for the measures a reviewer actually asks about."""
+    if before_after is None or before_after.empty:
+        return
+    available = [m for m in metrics if m in before_after.columns]
+    if not available:
+        return
+    stages = before_after["stage"].astype(str).tolist()
+    positions = np.arange(len(available))
+    width = 0.8 / max(len(stages), 1)
+    plt.figure(figsize=(max(8, 1.8 * len(available)), 5.5))
+    for offset, stage in enumerate(stages):
+        values = [
+            float(before_after.iloc[offset].get(metric, np.nan))
+            for metric in available
+        ]
+        values = [0.0 if not np.isfinite(v) else v for v in values]
+        bars = plt.bar(positions + offset * width, values, width=width, label=stage)
+        for bar, value in zip(bars, values):
+            plt.text(
+                bar.get_x() + bar.get_width() / 2, bar.get_height(),
+                f"{value:.3f}", ha="center", va="bottom", fontsize=7,
+            )
+    plt.xticks(positions + width * (len(stages) - 1) / 2,
+               [m.replace("_", " ") for m in available], rotation=20, ha="right")
+    plt.title(title)
+    plt.legend(fontsize=8, frameon=False)
+    plt.tight_layout()
+    plt.savefig(path, dpi=160)
+    plt.close()
+
+
+def save_policy_ablation_chart(table: pd.DataFrame, path: Path) -> None:
+    """Why one noise policy was chosen over the others, on one page."""
+    if table is None or table.empty or "policy_selection_score" not in table.columns:
+        return
+    view = table.dropna(subset=["policy_selection_score"]).copy()
+    if view.empty:
+        return
+    view = view.sort_values("policy_selection_score")
+    columns = [c for c in ("interpretability_rank", "structure_rank") if c in view.columns]
+    plt.figure(figsize=(10, max(4, 1.4 * len(view))))
+    positions = np.arange(len(view))
+    if columns:
+        height = 0.8 / (len(columns) + 1)
+        for offset, column in enumerate(columns):
+            plt.barh(positions + offset * height, view[column].fillna(0).values,
+                     height=height, label=column.replace("_", " "))
+        plt.barh(positions + len(columns) * height,
+                 view["policy_selection_score"].fillna(0).values,
+                 height=height, label="combined score")
+    else:
+        plt.barh(positions, view["policy_selection_score"].fillna(0).values)
+    labels = [
+        f"{row.policy}{' (selected)' if bool(getattr(row, 'selected', False)) else ''}"
+        for row in view.itertuples()
+    ]
+    plt.yticks(positions + 0.3, labels)
+    plt.xlabel("Percentile rank (higher is better)")
+    plt.title("Noise policy ablation on development data")
+    plt.legend(fontsize=8, frameon=False)
+    plt.tight_layout()
+    plt.savefig(path, dpi=160)
+    plt.close()
+
+
+def save_noise_chart(noise_table: pd.DataFrame, path: Path) -> None:
+    if noise_table.empty:
+        return
+    view = noise_table[noise_table["selected_as_noise"]].head(30).iloc[::-1]
+    if view.empty:
+        return
+    plt.figure(figsize=(12, 9))
+    plt.barh(view["term"], view["noise_score"])
+    plt.title("Top corpus-derived noise terms/phrases")
+    plt.xlabel("Noise score")
+    plt.tight_layout()
+    plt.savefig(path, dpi=160)
+    plt.close()
+
+
+def privacy_safe_rows(
+    result: Dict[str, Any], pseudonym_key: bytes, include_review_text: bool
+) -> pd.DataFrame:
+    data = result["rows"]
+    safe = pd.DataFrame({
+        "row_id": data.get("_row_id", pd.Series(np.arange(len(data)))).astype(int),
+        "case_ref": data.get("_case", pd.Series([""] * len(data))).map(lambda x: pseudonymize(x, pseudonym_key)),
+        "conversation_ref": data.get("_conversation", pd.Series([""] * len(data))).map(lambda x: pseudonymize(x, pseudonym_key)),
+        "group_ref": data.get("_group", pd.Series([""] * len(data))).map(lambda x: pseudonymize(x, pseudonym_key)),
+        "data_split": data["data_split"].astype(str),
+        "phase2_cluster_id": data["phase2_cluster_id"].astype(int),
+        "phase2_cluster_strength": data["phase2_cluster_strength"].astype(float),
+        "phase2_assignment_source": data.get("phase2_assignment_source", pd.Series(["native"] * len(data))).astype(str),
+        "phase2_recovery_similarity": pd.to_numeric(data.get("phase2_recovery_similarity", pd.Series([np.nan] * len(data))), errors="coerce"),
+        "phase2_recovery_margin": pd.to_numeric(data.get("phase2_recovery_margin", pd.Series([np.nan] * len(data))), errors="coerce"),
+        "phase2_cluster_descriptor": data["phase2_cluster_descriptor"].astype(str).map(redact_pii),
+    })
+    if include_review_text:
+        text_col = result["text_col"]
+        safe["redacted_text"] = data[text_col].astype(str).map(redact_pii)
+    if "sentence_index" in data.columns:
+        safe["sentence_index"] = data["sentence_index"].values
+    return safe
+
+
+def residual_pii_counts(
+    frame: pd.DataFrame, text_columns: Optional[Sequence[str]] = None
+) -> Dict[str, int]:
+    """Scan only human-language text fields for residual regex-detectable PII."""
+    counts = {name: 0 for name, _ in PII_PATTERNS}
+    columns = list(text_columns or [])
+    if not columns:
+        columns = [c for c in frame.columns if c in {"redacted_text", "representative_examples", "descriptor", "top_terms"}]
+    for col in columns:
+        if col not in frame.columns:
+            continue
+        for value in frame[col].fillna("").astype(str):
+            for name, pattern in PII_PATTERNS:
+                if pattern.search(value):
+                    counts[name] += 1
+    return counts
+
+
+def persist_result(
+    result: Dict[str, Any],
+    prefix: str,
+    outdir: Path,
+    pseudonym_key: bytes,
+    persist_models: bool,
+    export_review_text: bool,
+) -> Dict[str, Any]:
+    safe_rows = privacy_safe_rows(result, pseudonym_key, export_review_text)
+    pii_columns = ["phase2_cluster_descriptor"] + (["redacted_text"] if export_review_text else [])
+    pii_scan = residual_pii_counts(safe_rows, pii_columns)
+    if any(v > 0 for v in pii_scan.values()):
+        raise RuntimeError(f"Privacy guard blocked {prefix} row export; residual pattern counts={pii_scan}")
+    safe_rows.to_csv(outdir / f"{prefix}_phase2_rows.csv", index=False)
+
+    artifact_files: Dict[str, str] = {}
+    for key, suffix in [
+        ("noise_table", "noise_terms"),
+        ("noise_consensus_audit", "noise_consensus_audit"),
+        ("noise_policy_ablation", "noise_policy_ablation"),
+        ("duplicate_pairs", "duplicate_pairs"),
+        ("duplicate_families", "duplicate_families"),
+        ("model_search", "cluster_model_search"),
+        ("baseline_model_search", "baseline_model_search"),
+        ("refinement_audit", "refinement_audit"),
+        ("merge_audit", "merge_audit"),
+        ("outlier_recovery_audit", "outlier_recovery_audit"),
+        ("quality_gate_audit", "structural_safety_gate_audit"),
+        ("semantic_guard_audit", "semantic_regression_guard_audit"),
+        ("cluster_catalog", "cluster_catalog"),
+        ("sme_review", "sme_review"),
+        ("before_after", "before_after_metrics"),
+    ]:
+        export_frame = result[key].copy()
+        if not export_review_text and "representative_examples" in export_frame.columns:
+            export_frame = export_frame.drop(columns=["representative_examples"])
+        export_frame = sanitize_frame_for_export(export_frame)
+        human_cols = [c for c in ("representative_examples", "descriptor", "top_terms", "sme_business_label", "sme_notes") if c in export_frame.columns]
+        audit_scan = residual_pii_counts(export_frame, human_cols)
+        if any(v > 0 for v in audit_scan.values()):
+            raise RuntimeError(
+                f"Privacy guard blocked {prefix}_{suffix}.csv; residual pattern counts={audit_scan}"
+            )
+        path = outdir / f"{prefix}_{suffix}.csv"
+        export_frame.to_csv(path, index=False)
+        artifact_files[path.name] = sha256_file(path)
+
+    save_horizontal_cluster_chart(
+        result["cluster_catalog"], f"NORA Phase 2 refined {prefix} clusters",
+        outdir / f"{prefix}_phase2_cluster_sizes.png",
+    )
+    save_noise_chart(result["noise_table"], outdir / f"{prefix}_learned_noise.png")
+    save_policy_ablation_chart(
+        result.get("noise_policy_ablation"), outdir / f"{prefix}_noise_policy_ablation.png"
+    )
+    save_grouped_metric_chart(
+        result["before_after"],
+        ["npmi_coherence", "descriptor_diversity_composite", "mean_cluster_cohesion"],
+        f"{prefix.title()} cluster interpretability: baseline vs deployed",
+        outdir / f"{prefix}_before_after_interpretability.png",
+    )
+    save_grouped_metric_chart(
+        result["before_after"],
+        ["noise_rate", "assigned_fraction"],
+        f"{prefix.title()} unassigned records: baseline vs deployed",
+        outdir / f"{prefix}_before_after_coverage.png",
+    )
+    ba = result["before_after"]
+    if not ba.empty:
+        save_bar_chart(
+            ba["stage"].tolist(), ba["silhouette"].fillna(0).tolist(),
+            f"{prefix.title()} final-partition silhouette: baseline vs Phase 2", "Cosine silhouette",
+            outdir / f"{prefix}_before_after_silhouette.png",
+        )
+        save_bar_chart(
+            ba["stage"].tolist(), (100.0 * ba["largest_cluster_share"].fillna(0)).tolist(),
+            f"{prefix.title()} final-partition largest-cluster dominance", "Largest cluster share (%)",
+            outdir / f"{prefix}_before_after_largest_cluster.png",
+        )
+
+    model_info: Dict[str, Any] = {}
+    if persist_models:
+        model_path = outdir / f"{prefix}_model.joblib"
+        joblib.dump(bundle_to_payload(result["bundle"]), model_path, compress=3)
+        model_info = {
+            "model_file": model_path.name,
+            "model_sha256": sha256_file(model_path),
+            "artifact_format": ARTIFACT_FORMAT_VERSION,
+        }
+
+    return {
+        "residual_pii_patterns": pii_scan,
+        "safe_export_rows": len(safe_rows),
+        "review_text_exported": bool(export_review_text),
+        "audit_file_sha256": artifact_files,
+        **model_info,
+    }
+
+# ---------------------------------------------------------------------------
+# Training and inference entry points
+# ---------------------------------------------------------------------------
+
+def run_train(config: Config) -> Dict[str, Any]:
+    np.random.seed(config.seed)
+    run_id = secrets.token_hex(8)
+    started_at = utc_now_iso()
+    outdir = Path(config.outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+    frame, schema = load_and_prepare(config)
+    frame, split_audit = assign_group_split(frame, config)
+    pseudonym_key, pseudonym_key_source = resolve_pseudonym_key(config)
+
+    customer = frame[frame["_role"].eq("user")].copy().reset_index(drop=True)
+    if len(customer) < 30:
+        raise RuntimeError("Too few user/customer rows detected.")
+    customer_result = process_corpus(customer, "_text", "customer", config)
+    customer_export_audit = persist_result(
+        customer_result, "customer", outdir, pseudonym_key, config.persist_models,
+        config.export_review_text,
+    )
+
+    assistant_result: Optional[Dict[str, Any]] = None
+    assistant_export_audit: Optional[Dict[str, Any]] = None
+    assistant_skip_reason: Optional[str] = None
+    if config.include_assistant:
+        LOGGER.info("[6/9] Building assistant sentence units")
+        units = build_assistant_units(frame, config)
+        if len(units) >= 30:
+            try:
+                assistant_result = process_corpus(units, "assistant_sentence", "assistant", config)
+                assistant_export_audit = persist_result(
+                    assistant_result, "assistant", outdir, pseudonym_key, config.persist_models,
+                    config.export_review_text,
+                )
+            except Exception as exc:
+                LOGGER.warning("Assistant processing skipped: %s", exc)
+                assistant_skip_reason = str(exc)
+        else:
+            assistant_skip_reason = f"only {len(units)} sentence units available, 30 required"
+            LOGGER.warning("Assistant processing skipped: %s", assistant_skip_reason)
+    else:
+        assistant_skip_reason = "disabled with --skip-assistant"
+
+    LOGGER.info("[8/9] Writing consolidated audit report and manifest")
+    report = {
+        "pipeline": PIPELINE_NAME,
+        "pipeline_version": PIPELINE_VERSION,
+        "run_id": run_id,
+        "started_at_utc": started_at,
+        "completed_at_utc": utc_now_iso(),
+        "architecture": (
+            "group-isolated development/test -> privacy redaction -> raw-text baseline -> development-only "
+            "multi-clustering noise consensus -> development-only noise-policy ablation -> word+character TF-IDF -> "
+            "scalable ANN+exact duplicate validation -> representative-family fitting -> TruncatedSVD/LSA -> "
+            "UMAP/HDBSCAN multi-parameter search -> perturbation stability -> recursive refinement -> "
+            "statistically justified persisted cluster merge -> persisted cluster-specific outlier recovery -> "
+            "phrase-aware NPMI on a fixed reference corpus -> structural safety gate -> separate semantic regression guard -> "
+            "SME semantic-review artifacts -> locked-test transform only -> privacy-safe persisted inference + drift monitoring"
+        ),
+        "config": scrub_persisted_config(asdict(config)),
+        "schema": schema,
+        "runtime_versions": package_versions(),
+        "split_audit": split_audit,
+        "dataset": {
+            "rows": len(frame),
+            "user_rows": int((frame["_role"] == "user").sum()),
+            "assistant_rows": int((frame["_role"] == "assistant").sum()),
+            "development_rows": int((frame["data_split"] == "development").sum()),
+            "locked_test_rows": int((frame["data_split"] == "locked_test").sum()),
+        },
+        "customer": customer_result["summary"],
+        "customer_export_privacy_audit": customer_export_audit,
+        "assistant": assistant_result["summary"] if assistant_result else {
+            "status": "skipped", "reason": assistant_skip_reason
+        },
+        "assistant_export_privacy_audit": assistant_export_audit,
+        "governance": {
+            "cluster_labels": "unsupervised candidate groups, not SME-validated business intents",
+            "noise_terms": "learned from development-corpus statistics; no manually curated NORA noise/intent list",
+            "locked_test": "never used to fit noise model, noise-policy choice, duplicate threshold, vocabulary, SVD, UMAP, clustering, merge, recovery thresholds, or semantic guard",
+            "decision_separation": (
+                "structural safety, semantic-regression protection, and SME business acceptance are independent decisions"
+            ),
+            "standards_alignment": (
+                "TM Forum Intent Common Model / Intent Ontology should be used downstream for SME-approved taxonomy "
+                "normalization and governance; ontology terms are not injected into unsupervised clustering."
+            ),
+            "privacy": (
+                "raw input text and raw case/conversation/group identifiers are never exported. Row-level review text "
+                "is omitted by default and can be explicitly enabled only as redacted text."
+            ),
+            "pseudonym_key_source": pseudonym_key_source,
+        },
+    }
+    report_path = outdir / config.report_json
+    report_path.write_text(json.dumps(to_plain(report), indent=2), encoding="utf-8")
+    report_sha256 = sha256_file(report_path)
+    manifest = {
+        "pipeline": PIPELINE_NAME,
+        "version": PIPELINE_VERSION,
+        "run_id": run_id,
+        "created_at_utc": utc_now_iso(),
+        "created_for_mode": "train",
+        "artifact_format": ARTIFACT_FORMAT_VERSION,
+        "runtime_versions": package_versions(),
+        "artifacts": {
+            "customer_model": customer_export_audit.get("model_file"),
+            "customer_model_sha256": customer_export_audit.get("model_sha256"),
+            "assistant_model": assistant_export_audit.get("model_file") if assistant_export_audit else None,
+            "assistant_model_sha256": assistant_export_audit.get("model_sha256") if assistant_export_audit else None,
+            "report": config.report_json,
+            "report_sha256": report_sha256,
+        },
+        "privacy": {
+            "review_text_exported": bool(config.export_review_text),
+            "pseudonym_key_source": pseudonym_key_source,
+            "pseudonym_secret_persisted": False,
+        },
+        "security_note": (
+            "joblib artifacts must only be loaded from this trusted model directory; SHA-256 is verified before load."
+        ),
+    }
+    (outdir / "model_manifest.json").write_text(
+        json.dumps(to_plain(manifest), indent=2), encoding="utf-8"
+    )
+    LOGGER.info("[9/9] COMPLETE")
+    LOGGER.info("output directory: %s", outdir.resolve())
+    LOGGER.info("report: %s", report_path.resolve())
+    return report
+
+
+def run_inference(config: Config) -> Dict[str, Any]:
+    run_id = secrets.token_hex(8)
+    started_at = utc_now_iso()
+    outdir = Path(config.outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+    model_dir = Path(config.model_dir or "")
+    manifest_path = model_dir / "model_manifest.json"
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"Model manifest not found: {manifest_path}")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest.get("artifact_format") != ARTIFACT_FORMAT_VERSION:
+        raise RuntimeError(
+            f"Manifest artifact format {manifest.get('artifact_format')!r} does not match "
+            f"{ARTIFACT_FORMAT_VERSION!r}; retrain before inference."
+        )
+    artifacts = manifest.get("artifacts", {})
+
+    customer_file = artifacts.get("customer_model") or "customer_model.joblib"
+    customer_path = model_dir / customer_file
+    if not customer_path.exists():
+        raise FileNotFoundError(f"Customer model artifact not found: {customer_path}")
+    customer_bundle = load_bundle(customer_path, artifacts.get("customer_model_sha256"))
+
+    assistant_bundle: Optional[CorpusBundle] = None
+    assistant_file = artifacts.get("assistant_model")
+    if assistant_file and config.include_assistant:
+        assistant_path = model_dir / assistant_file
+        if assistant_path.exists():
+            assistant_bundle = load_bundle(assistant_path, artifacts.get("assistant_model_sha256"))
+
+    frame, schema = load_and_prepare(config)
+    pseudonym_key, pseudonym_key_source = resolve_pseudonym_key(config)
+    outputs: List[pd.DataFrame] = []
+    drift: Dict[str, Any] = {}
+
+    def build_safe_output(source: pd.DataFrame, detail: Dict[str, Any], corpus: str, sentence_index: Optional[pd.Series] = None) -> pd.DataFrame:
+        safe = pd.DataFrame({
+            "row_id": source["_row_id"].astype(int),
+            "case_ref": source["_case"].map(lambda x: pseudonymize(x, pseudonym_key)),
+            "conversation_ref": source["_conversation"].map(lambda x: pseudonymize(x, pseudonym_key)),
+            "cluster_id": detail["labels"],
+            "native_cluster_strength": detail["native_strengths"],
+            "assignment_source": detail["assignment_source"],
+            "recovery_similarity": detail["recovery_similarity"],
+            "recovery_margin": detail["recovery_margin"],
+            "cluster_descriptor": detail["descriptors"],
+            "corpus": corpus,
+        })
+        if sentence_index is not None:
+            safe["sentence_index"] = sentence_index.astype(int).values
+        if config.export_review_text:
+            safe["redacted_text"] = detail["redacted"]
+        return safe
+
+    def drift_payload(bundle: CorpusBundle, detail: Dict[str, Any]) -> Dict[str, Any]:
+        labels = np.asarray(detail["labels"], dtype=int)
+        strengths = np.asarray(detail["native_strengths"], dtype=float)
+        sources = np.asarray(detail["assignment_source"], dtype=object)
+        observed = cluster_distribution(labels)
+        native_mask = sources != "recovered_outlier"
+        return {
+            "cluster_js_distance": cluster_js_distance(bundle.reference_cluster_distribution, observed),
+            "reference_outlier_rate": bundle.reference_outlier_rate,
+            "observed_outlier_rate": float(np.mean(labels == -1)) if len(labels) else 0.0,
+            "reference_recovery_rate": bundle.reference_recovery_rate,
+            "observed_recovery_rate": float(np.mean(sources == "recovered_outlier")) if len(sources) else 0.0,
+            "reference_native_strength_quantiles": bundle.reference_strength_quantiles,
+            "observed_native_strength_quantiles": strength_quantiles(strengths[native_mask]) if native_mask.any() else {},
+            "noise_policy": bundle.noise_policy,
+        }
+
+    customer = frame[frame["_role"].eq("user")].copy().reset_index(drop=True)
+    if len(customer):
+        detail = customer_bundle.transform_texts_detailed(customer["_text"].tolist())
+        outputs.append(build_safe_output(customer, detail, "customer"))
+        drift["customer"] = drift_payload(customer_bundle, detail)
+
+    if assistant_bundle is not None:
+        units = build_assistant_units(frame.assign(data_split="inference"), config)
+        if len(units):
+            detail = assistant_bundle.transform_texts_detailed(units["assistant_sentence"].tolist())
+            outputs.append(build_safe_output(units, detail, "assistant", units["sentence_index"]))
+            drift["assistant"] = drift_payload(assistant_bundle, detail)
+
+    combined = pd.concat(outputs, ignore_index=True) if outputs else pd.DataFrame()
+    inference_path = outdir / "nora_phase2_inference.csv"
+    pii_scan: Dict[str, int] = {name: 0 for name, _ in PII_PATTERNS}
+    if not combined.empty:
+        scan_columns = ["cluster_descriptor"] + (["redacted_text"] if config.export_review_text else [])
+        pii_scan = residual_pii_counts(combined, scan_columns)
+        if any(v > 0 for v in pii_scan.values()):
+            raise RuntimeError(f"Privacy guard blocked inference export; residual patterns={pii_scan}")
+        combined.to_csv(inference_path, index=False)
+
+    report = {
+        "pipeline": PIPELINE_NAME,
+        "pipeline_version": PIPELINE_VERSION,
+        "run_id": run_id,
+        "started_at_utc": started_at,
+        "completed_at_utc": utc_now_iso(),
+        "mode": "infer",
+        "input_rows": len(frame),
+        "output_rows": len(combined),
+        "model_dir": str(model_dir),
+        "schema": schema,
+        "runtime_versions": package_versions(),
+        "artifact_manifest_verified": True,
+        "privacy": {
+            "review_text_exported": bool(config.export_review_text),
+            "residual_pattern_scan": pii_scan,
+            "pseudonym_key_source": pseudonym_key_source,
+        },
+        "drift": drift,
+    }
+    (outdir / "nora_phase2_inference_report.json").write_text(
+        json.dumps(to_plain(report), indent=2), encoding="utf-8"
+    )
+    LOGGER.info("Inference complete: %d output rows", len(combined))
+    return report
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def parse_args(argv: Optional[Sequence[str]] = None) -> Config:
+    parser = argparse.ArgumentParser(
+        description=f"{PIPELINE_NAME} - production-oriented noise reduction and cluster refinement"
+    )
+    parser.add_argument("--mode", choices=["train", "infer"], default="train")
+    parser.add_argument("--input", required=True, dest="input_path", help="Input flattened NORA CSV")
+    parser.add_argument("--outdir", default="nora_phase2_v2_out")
+    parser.add_argument("--model-dir", default=None, help="Required for --mode infer")
+    parser.add_argument("--report-json", default="nora_phase2_version2_report.json")
+    parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
+    parser.add_argument("--sample", type=int, default=0, dest="sample_rows", help="Functional smoke test only; 0 uses all rows")
+    parser.add_argument("--test-size", type=float, default=0.20)
+    parser.add_argument("--split-trials", type=int, default=64)
+    parser.add_argument("--max-word-features", type=int, default=60000)
+    parser.add_argument("--max-char-features", type=int, default=90000)
+    parser.add_argument("--svd-components", type=int, default=160)
+    parser.add_argument("--candidate-noise-features", type=int, default=50000)
+    parser.add_argument("--noise-max-ngram", type=int, default=3)
+    parser.add_argument("--noise-stability-repeats", type=int, default=4)
+    parser.add_argument("--noise-consensus-models", type=int, default=3)
+    parser.add_argument("--noise-subsample-fraction", type=float, default=0.80)
+    parser.add_argument(
+        "--noise-policy", choices=["auto", "shared_clean", "word_only", "raw"], default="auto",
+        help="development-only ablation by default; can be pinned for controlled experiments",
+    )
+    parser.add_argument("--noise-policy-search-trials", type=int, default=8)
+    parser.add_argument("--noise-policy-sample-rows", type=int, default=4000)
+    parser.add_argument("--model-search-trials", type=int, default=16)
+    parser.add_argument("--stability-repeats", type=int, default=4)
+    parser.add_argument("--stability-subsample-fraction", type=float, default=0.85)
+    parser.add_argument("--search-sample-rows", type=int, default=8000)
+    parser.add_argument("--recursive-max-depth", type=int, default=2)
+    parser.add_argument("--representative-examples", type=int, default=5)
+    parser.add_argument("--max-cluster-fit-rows", type=int, default=30000)
+    parser.add_argument("--assistant-max-units", type=int, default=120000)
+    parser.add_argument("--duplicate-projection-components", type=int, default=64)
+    parser.add_argument("--duplicate-neighbors", type=int, default=8)
+    parser.add_argument("--ann-min-rows", type=int, default=5000)
+    parser.add_argument("--transform-batch-size", type=int, default=4096)
+    parser.add_argument("--export-review-text", action="store_true", help="Export redacted review text; off by default for privacy")
+    parser.add_argument("--pseudonym-key-env", default="NORA_PSEUDONYM_KEY", help="Environment variable containing a stable pseudonymization secret")
+    parser.add_argument("--skip-assistant", action="store_true")
+    parser.add_argument("--no-persist-models", action="store_true")
+    parser.add_argument("--no-merge-clusters", action="store_true", help="Disable statistically justified post-refinement cluster merge")
+    parser.add_argument("--no-reassign-outliers", action="store_true", help="Disable persisted conservative outlier recovery")
+    parser.add_argument("--coherence-top-terms", type=int, default=10)
+    parser.add_argument(
+        "--semantic-guard-mode", choices=["block", "warn"], default="block",
+        help="block or warn when paired-bootstrap NPMI shows a statistically supported regression",
+    )
+    parser.add_argument("--semantic-bootstrap-repeats", type=int, default=64)
+    parser.add_argument("--semantic-bootstrap-fraction", type=float, default=0.80)
+    parser.add_argument("--semantic-guard-alpha", type=float, default=0.05)
+    parser.add_argument(
+        "--on-regression", choices=["report", "revert"], default="revert",
+        help="Deployment behavior when the structural Phase-2 safety gate fails",
+    )
+    args = parser.parse_args(argv)
+
+    if args.mode == "train" and not (0.05 <= args.test_size <= 0.40):
+        parser.error("--test-size must be between 0.05 and 0.40")
+    if args.noise_max_ngram < 1 or args.noise_max_ngram > 5:
+        parser.error("--noise-max-ngram must be between 1 and 5")
+    if not (0.60 <= args.noise_subsample_fraction <= 1.0):
+        parser.error("--noise-subsample-fraction must be between 0.60 and 1.0")
+    if args.noise_stability_repeats < 0:
+        parser.error("--noise-stability-repeats must be >= 0")
+    if args.noise_consensus_models < 1:
+        parser.error("--noise-consensus-models must be >= 1")
+    if args.noise_policy_search_trials < 1:
+        parser.error("--noise-policy-search-trials must be >= 1")
+    if args.noise_policy_sample_rows < 0:
+        parser.error("--noise-policy-sample-rows must be >= 0")
+    if args.coherence_top_terms < 2:
+        parser.error("--coherence-top-terms must be >= 2")
+    if args.semantic_bootstrap_repeats < 0:
+        parser.error("--semantic-bootstrap-repeats must be >= 0")
+    if not (0.50 <= args.semantic_bootstrap_fraction <= 1.0):
+        parser.error("--semantic-bootstrap-fraction must be between 0.50 and 1.0")
+    if not (0.001 <= args.semantic_guard_alpha <= 0.25):
+        parser.error("--semantic-guard-alpha must be between 0.001 and 0.25")
+    if not (0.60 <= args.stability_subsample_fraction <= 1.0):
+        parser.error("--stability-subsample-fraction must be between 0.60 and 1.0")
+    if args.mode == "infer" and not args.model_dir:
+        parser.error("--model-dir is required when --mode infer")
+
+    return Config(
+        input_path=args.input_path,
+        outdir=args.outdir,
+        report_json=args.report_json,
+        mode=args.mode,
+        model_dir=args.model_dir,
+        seed=args.seed,
+        sample_rows=args.sample_rows,
+        test_size=args.test_size,
+        split_trials=args.split_trials,
+        max_word_features=args.max_word_features,
+        max_char_features=args.max_char_features,
+        svd_components=args.svd_components,
+        candidate_noise_features=args.candidate_noise_features,
+        noise_max_ngram=args.noise_max_ngram,
+        noise_stability_repeats=args.noise_stability_repeats,
+        noise_consensus_models=args.noise_consensus_models,
+        noise_subsample_fraction=args.noise_subsample_fraction,
+        noise_policy=args.noise_policy,
+        noise_policy_search_trials=args.noise_policy_search_trials,
+        noise_policy_sample_rows=args.noise_policy_sample_rows,
+        model_search_trials=args.model_search_trials,
+        stability_repeats=args.stability_repeats,
+        stability_subsample_fraction=args.stability_subsample_fraction,
+        search_sample_rows=args.search_sample_rows,
+        recursive_max_depth=args.recursive_max_depth,
+        representative_examples=args.representative_examples,
+        max_cluster_fit_rows=args.max_cluster_fit_rows,
+        assistant_max_units=args.assistant_max_units,
+        duplicate_projection_components=args.duplicate_projection_components,
+        duplicate_neighbors=args.duplicate_neighbors,
+        ann_min_rows=args.ann_min_rows,
+        transform_batch_size=args.transform_batch_size,
+        export_review_text=args.export_review_text,
+        pseudonym_key_env=args.pseudonym_key_env,
+        include_assistant=not args.skip_assistant,
+        on_regression=args.on_regression,
+        persist_models=not args.no_persist_models,
+        merge_clusters=not args.no_merge_clusters,
+        reassign_outliers=not args.no_reassign_outliers,
+        coherence_top_terms=args.coherence_top_terms,
+        semantic_guard_mode=args.semantic_guard_mode,
+        semantic_bootstrap_repeats=args.semantic_bootstrap_repeats,
+        semantic_bootstrap_fraction=args.semantic_bootstrap_fraction,
+        semantic_guard_alpha=args.semantic_guard_alpha,
+    )
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    configure_logging()
+    try:
+        config = parse_args(argv)
+        if config.mode == "train":
+            run_train(config)
+        else:
+            run_inference(config)
+        return 0
+    except KeyboardInterrupt:
+        LOGGER.error("Interrupted by user.")
+        return 130
+    except Exception as exc:
+        LOGGER.exception("Phase 2 failed: %s", exc)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

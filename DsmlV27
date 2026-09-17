@@ -1,0 +1,791 @@
+#!/usr/bin/env python3
+"""NORA Entity-Context 4.1.1 — offline entity/context/evidence pipeline."""
+from __future__ import annotations
+import argparse, hashlib, html as html_lib, json, logging, math, os, platform, re, secrets, sys, time
+from collections import Counter, defaultdict
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+import joblib
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from scipy import sparse
+from scipy.cluster.hierarchy import leaves_list, linkage
+from scipy.spatial.distance import squareform
+from sklearn.cluster import MiniBatchKMeans
+from sklearn.decomposition import TruncatedSVD
+from sklearn.feature_extraction.text import CountVectorizer, ENGLISH_STOP_WORDS, TfidfVectorizer
+from sklearn.manifold import TSNE
+from sklearn.metrics import adjusted_rand_score, silhouette_score
+from sklearn.mixture import GaussianMixture
+from sklearn.pipeline import FeatureUnion, Pipeline
+from sklearn.preprocessing import Normalizer
+
+PIPELINE_NAME='NORA Entity-Context 4.1.1'; PIPELINE_VERSION='4.1.1'
+ARTIFACT_FORMAT_VERSION='nora-entity-context-4.1.1-bundle-1'; DEFAULT_SEED=42
+LOGGER=logging.getLogger('nora_entity_context_v4_1_1')
+SCOPE_LOCK={'included':['entity_extraction','context_extraction','content_structuring','entity_normalization','key_value_extraction','diagnostic_evidence_extraction','root_cause_extraction','remediation_extraction','relationship_extraction','confidence_scoring','domain_ontology_alignment','structured_dictionary_output','semantic_entity_context_clustering'],'excluded':['training_upstream_intent_classifier','replacing_upstream_intent_classifier','using_upstream_intent_labels_as_training_features']}
+ONTOLOGY_ALIGNMENT_ROWS=[
+ {'semantic_class':'COMMON_SEMANTICS','alignment_family':'Intent Common Model','reference':'TR290 / TR290V','use_in_pipeline':'common semantic naming and vocabulary alignment'},
+ {'semantic_class':'ACTOR_OR_ROLE','alignment_family':'Intent Management Elements','reference':'TR292A','use_in_pipeline':'actors, roles, channels and participating functions'},
+ {'semantic_class':'FUNCTION_OR_ACTION','alignment_family':'Function Definition Ontology','reference':'TR292C','use_in_pipeline':'diagnostic and remediation actions'},
+ {'semantic_class':'QUANTITY_OR_UNIT','alignment_family':'Quantity Ontology','reference':'TR292D','use_in_pipeline':'measurements, values and units'},
+ {'semantic_class':'METRIC_OR_OBSERVATION','alignment_family':'Metrics and Observations','reference':'TR292G','use_in_pipeline':'diagnostic evidence and observations'},
+ {'semantic_class':'ONTOLOGY_FOUNDATION','alignment_family':'TM Forum Intent Ontology','reference':'TR292','use_in_pipeline':'upper semantic relationship alignment'}]
+TOKEN_RE=re.compile(r"(?u)\b[a-zA-Z][a-zA-Z0-9_'\-]{1,}\b"); SENTENCE_SPLIT_RE=re.compile(r'(?<=[.!?;])\s+|\n+')
+KV_RE=re.compile(r'(?im)(?P<key>[A-Za-z][A-Za-z0-9 _/\-]{1,60})\s*[:=]\s*(?P<value>[^\n|;]{1,180})')
+MEASUREMENT_RE=re.compile(r'(?i)\b(?P<key>[A-Za-z][A-Za-z0-9 _/\-]{1,50}?)\s*[:=]?\s*(?P<value>-?\d+(?:\.\d+)?)\s*(?P<unit>dBm|dB|ms|s|sec|seconds?|Mbps|Gbps|Kbps|MB|GB|GiB|%|MHz|GHz|kHz|mV|V|A|mA|W|km|m|mi|hours?|hrs?|minutes?|mins?)\b')
+ERROR_CODE_RE=re.compile(r'(?i)\b(?:error|code|status)\s*[:=#-]?\s*([A-Z]{1,10}[-_]?\d{2,8}|\d{3,8})\b')
+TIME_RE=re.compile(r'(?i)\b(?:today|yesterday|tomorrow|last\s+(?:night|week|month)|since\s+\w+|for\s+\d+\s+(?:minutes?|hours?|days?|weeks?|months?)|\d+\s+(?:minutes?|hours?|days?|weeks?|months?)\s+ago)\b')
+CAUSE_CUE_RE=re.compile(r'(?i)\b(?:root\s*cause|caused\s+by|due\s+to|because\s+of|because|attribut(?:ed|able)\s+to|result(?:ed|ing)?\s+from|identified\s+as)\b')
+REMEDIATION_CUE_RE=re.compile(r'(?i)\b(?:recommend(?:ed|ation)?|resolve(?:d|tion)?|remediat(?:e|ion)|reboot|restart|reset|replace|update|upgrade|reprovision|provision|refresh|reconnect|retest|power\s*cycle|factory\s*reset|escalat(?:e|ed|ion)|enable|disable|configure|reconfigure)\b')
+DIAGNOSTIC_CUE_RE=re.compile(r'(?i)\b(?:check(?:ed)?|verify|verified|test(?:ed)?|diagnos(?:e|ed|tic)|trace|query|lookup|inspect(?:ed)?|measure(?:d|ment)?|signal|alarm|telemetry|status|registration|provisioning|snapshot|counter|metric|observ(?:e|ed|ation)|retriev(?:e|ed|al))\b')
+STATE_CUE_RE=re.compile(r'(?i)\b(?:online|offline|active|inactive|registered|not[- ]registered|connected|disconnected|blocked|enabled|disabled|failed|failing|degraded|normal|healthy|unhealthy|available|unavailable|throttled|provisioned|unprovisioned)\b')
+IMPACT_CUE_RE=re.compile(r"(?i)\b(?:unable|cannot|can't|not\s+working|no\s+(?:service|data|internet|signal)|dropp(?:ed|ing)|slow|latency|intermittent|outage|degrad(?:ed|ation)|failed|failure|impact(?:ed|ing)?|poor\s+coverage|weak\s+signal)\b")
+ACTION_VERB_RE=re.compile(r'(?i)\b(?:reboot|restart|reset|replace|update|upgrade|provision|reprovision|refresh|reconnect|retest|check|verify|test|query|lookup|escalate|activate|deactivate|enable|disable|configure|reconfigure|change|remove|add)\b')
+LEADING_OBSERVATION_VERB_RE=re.compile(r'(?i)^\s*(?:checked?|verified?|queried?|retrieved?|returned?|observed?|measured?)\s+')
+SCRIPT_STYLE_RE=re.compile(r'(?is)<(?:script|style)\b[^>]*>.*?</(?:script|style)>'); HTML_TAG_RE=re.compile(r'(?is)<[^>]+>')
+CSS_FRAGMENT_RE=re.compile(r'(?i)\b(?:style|color|font|background|border|padding|margin|display|width|height)\s*[:=]\s*[^;|,]+[;]?')
+FIELD_LABEL_RE=re.compile(r'(?i)\b(?:customer\s+name|billing\s+account(?:\s+number)?|callback\s+number|call\s+back\s+number|email\s+address|phone\s+number|contact\s+number|account\s+number|ban|imei|iccid|eid|msisdn)\b\s*[:=\-]?')
+PII_PATTERNS=(('email',re.compile(r'\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b')),('url',re.compile(r'https?://\S+',re.I)),('ipv4',re.compile(r'\b(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\b')),('mac',re.compile(r'\b(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}\b')),('uuid',re.compile(r'\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b')),('iccid',re.compile(r'\b89\d{17,20}\b')),('imei',re.compile(r'\b\d{14,17}\b')),('phone',re.compile(r'(?<!\d)(?:\+?\d{1,3}[\s\-.]?)?\(?\d{3}\)?[\s\-.]?\d{3}[\s\-.]?\d{4}(?!\d)')),('coordinate',re.compile(r'\b(?:lat(?:itude)?|lon(?:gitude)?)\s*[:=]?\s*-?\d{1,3}(?:\.\d+)?\b',re.I)),('long_number',re.compile(r'(?<!\d)\d{7,}(?!\d)')))
+STRUCTURAL_TOKENS={'redacted','nbsp','html','body','script','style','class','href','span','div','font','color','background','padding','margin'}
+GENERIC_INTERACTION_PRIOR={'customer','caller','called','contacted','support','agent','representative','regarding','stated','reported','reporting','please','help','assistance','information','details','detail','today','yesterday','currently','issue','issues'}
+NEGATION_KEEP={'no','not','never','without','cannot','cant',"can't",'unable','failed','failing','failure','down','offline','blocked'}
+SAFE_ENGLISH_STOPWORDS=set(ENGLISH_STOP_WORDS)-NEGATION_KEEP
+
+@dataclass(frozen=True)
+class Config:
+ input_path:str; outdir:str; mode:str='train'; model_dir:Optional[str]=None; ontology_path:Optional[str]=None; stopword_seed_path:Optional[str]=None; profile:str='production'; seed:int=DEFAULT_SEED; sample_rows:int=0; test_size:float=.20; validation_within_development:float=.15; split_trials:int=64; max_word_features:int=70000; max_char_features:int=90000; max_semantic_features:int=50000; svd_components:int=192; candidate_noise_features:int=70000; noise_ngram_max:int=3; model_search_trials:int=20; stability_repeats:int=4; search_sample_rows:int=8000; transform_batch_size:int=4096; representative_examples:int=4; ontology_match_threshold:float=.82; phrase_min_df:int=3; phrase_top_candidates:int=5000; semantic_weight:float=2.10; word_weight:float=.75; char_weight:float=.30; persist_model:bool=True; enable_cache:bool=True; cache_dir_name:str='.nora_v411_cache'; pseudonym_key_env:str='NORA_PSEUDONYM_KEY'; heatmap_top_n:int=24; top_cluster_terms:int=10; projection_sample:int=3000; contingency_top_labels:int=25
+@dataclass
+class OntologyEntry:
+ canonical_name:str; entity_type:str; synonyms:List[str]=field(default_factory=list); parent:Optional[str]=None; source:Optional[str]=None; source_ref:Optional[str]=None
+@dataclass
+class NoiseModel:
+ learned_stopwords:set[str]; template_phrases:set[str]; protected_phrases:set[str]; protected_unigrams:set[str]; descriptor_blocklist:set[str]; stopword_threshold:float; template_threshold:float; threshold_method:str
+@dataclass
+class LatentModel:
+ vectorizer:FeatureUnion; svd:TruncatedSVD; normalizer:Normalizer; batch_size:int
+ def transform(self,texts,signatures):
+  rows=[{'text':str(t),'semantic':str(s)} for t,s in zip(texts,signatures)]; parts=[]; bs=max(1,self.batch_size)
+  for start in range(0,len(rows),bs):
+   x=self.vectorizer.transform(rows[start:start+bs]); parts.append(np.asarray(self.normalizer.transform(self.svd.transform(x)),dtype=np.float32))
+  return np.vstack(parts) if parts else np.empty((0,int(self.svd.n_components)),dtype=np.float32)
+@dataclass
+class ClusterModel:
+ method:str; reducer:Any; clusterer:Any; parameters:Dict[str,Any]; silhouette:Optional[float]; assigned_fraction:float; stability_ari:Optional[float]; outlier_jaccard:Optional[float]
+@dataclass
+class PipelineBundle:
+ pipeline_name:str; pipeline_version:str; ontology_entries:List[Dict[str,Any]]; noise_model:NoiseModel; domain_phrases:List[Dict[str,Any]]; selected_noise_policy:str; latent_model:LatentModel; cluster_model:ClusterModel; cluster_descriptions:Dict[int,Dict[str,Any]]; config:Dict[str,Any]
+@dataclass
+class PolicyResult:
+ policy:str; latent:LatentModel; cluster_model:ClusterModel; train_vectors:np.ndarray; train_labels:np.ndarray; train_strengths:np.ndarray; train_metrics:Dict[str,Any]; validation_metrics:Dict[str,Any]; search_table:pd.DataFrame; score:float
+
+def utc_now_iso(): return datetime.now(timezone.utc).isoformat()
+def configure_logging(): logging.basicConfig(level=logging.INFO,format='%(asctime)s | %(levelname)s | %(message)s',datefmt='%H:%M:%S')
+def normalize_space(x): return re.sub(r'\s+',' ',str(x or '')).strip()
+def tokenize(x): return [m.group(0).lower() for m in TOKEN_RE.finditer(str(x or ''))]
+def normalize_term(x): return ' '.join(tokenize(x))
+def normalise_key(x): return re.sub(r'[^a-z0-9]+','_',str(x).strip().lower()).strip('_')
+def safe_float(v,d=0.0):
+ try:
+  x=float(v); return x if np.isfinite(x) else d
+ except Exception: return d
+def to_plain(v):
+ if v is None:return None
+ if isinstance(v,dict):return {str(k):to_plain(x) for k,x in v.items()}
+ if isinstance(v,(list,tuple,set)):return [to_plain(x) for x in v]
+ if isinstance(v,np.ndarray):return [to_plain(x) for x in v.tolist()]
+ if isinstance(v,np.integer):return int(v)
+ if isinstance(v,np.floating):return None if not np.isfinite(v) else float(v)
+ try:
+  if pd.isna(v):return None
+ except Exception:pass
+ return v
+def robust_upper_fence(vals,m=1.5):
+ a=np.asarray([v for v in vals if np.isfinite(v)],float)
+ if not len(a):return float('inf')
+ q1,q3=np.quantile(a,[.25,.75]); return float(q3+m*(q3-q1))
+def distribution_upper_tail(vals,seed):
+ a=np.asarray([v for v in vals if np.isfinite(v)],float)
+ if not len(a):return float('inf'),'empty'
+ if len(a)<20 or float(np.std(a))<1e-9:return robust_upper_fence(a),'robust_upper_fence'
+ x=a.reshape(-1,1)
+ try:
+  g1=GaussianMixture(1,random_state=seed).fit(x); g2=GaussianMixture(2,random_state=seed).fit(x)
+  if g2.bic(x)+2<g1.bic(x):
+   means=g2.means_.ravel(); hi,lo=int(np.argmax(means)),int(np.argmin(means)); grid=np.linspace(float(a.min()),float(a.max()),4096).reshape(-1,1); d=g2.predict_proba(grid)[:,hi]-g2.predict_proba(grid)[:,lo]; c=np.flatnonzero(np.signbit(d[:-1])!=np.signbit(d[1:])); return (float(grid[int(c[-1])+1,0]),'gmm_bic_two_component') if len(c) else (float(np.mean(means)),'gmm_midpoint')
+ except Exception:pass
+ return robust_upper_fence(a),'robust_upper_fence'
+def percentile_rank(s,higher=True):
+ x=pd.to_numeric(s,errors='coerce'); return pd.Series(np.full(len(s),.5),index=s.index) if x.notna().sum()<=1 else x.rank(pct=True,ascending=True if higher else False).fillna(0)
+def sha256_file(p):
+ h=hashlib.sha256()
+ with Path(p).open('rb') as f:
+  for b in iter(lambda:f.read(1024*1024),b''):h.update(b)
+ return h.hexdigest()
+def package_versions():
+ out={'python':platform.python_version(),'numpy':np.__version__,'pandas':pd.__version__}
+ try:
+  import sklearn; out['scikit_learn']=sklearn.__version__
+ except Exception:pass
+ for name in ('umap','hdbscan','joblib'):
+  try:out[name]=str(getattr(__import__(name),'__version__','installed'))
+  except Exception:out[name]='not_available'
+ return out
+def dedupe_dicts(rows,keys):
+ best={}
+ for r in rows:
+  k=tuple(str(r.get(x,'')) for x in keys)
+  if k not in best or safe_float(r.get('confidence'))>safe_float(best[k].get('confidence')):best[k]=dict(r)
+ return list(best.values())
+def redact_pii(text):
+ v=str(text or '')
+ for name,p in PII_PATTERNS:v=p.sub(f' [redacted_{name}] ',v)
+ return normalize_space(v)
+def sanitize_text(text):
+ v=html_lib.unescape(str(text or '')); v=SCRIPT_STYLE_RE.sub(' ',v); v=HTML_TAG_RE.sub(' ',v); v=CSS_FRAGMENT_RE.sub(' ',v); v=FIELD_LABEL_RE.sub(' ',v); v=re.sub(r'\[\s*redacted_[a-z0-9_]+\s*\]|\bredacted_[a-z0-9_]+\b',' ',v,flags=re.I); return normalize_space(v)
+def resolve_pseudonym_key(c):
+ raw=os.environ.get(c.pseudonym_key_env,'') if c.pseudonym_key_env else ''
+ return (hashlib.sha256(raw.encode()).digest(),f'environment:{c.pseudonym_key_env}') if raw else (secrets.token_bytes(32),'ephemeral_per_run')
+def pseudonymize(v,key): return hashlib.blake2b(str(v or '').encode('utf-8',errors='ignore'),key=key,digest_size=12).hexdigest()
+
+def find_column(cols,patterns):
+ norm={c:normalise_key(c) for c in cols}
+ for p in patterns:
+  for c,k in norm.items():
+   if re.search(p,k):return c
+ return None
+def discover_schema(df):
+ c=list(df.columns); return {'case':find_column(c,[r'^source_row$',r'source.*row',r'case.*id',r'ticket.*id']),'turn':find_column(c,[r'message_index',r'turn.*index',r'sequence',r'^index$']),'conversation':find_column(c,[r'message.*cid',r'^cid$',r'conversation.*id',r'interaction.*id']),'text':find_column(c,[r'message.*content',r'^content$',r'^text$',r'message.*text']),'upstream_label':find_column(c,[r'classification.*intent',r'upstream.*label',r'^intent$']),'role':find_column(c,[r'^message_type$',r'message.*type',r'^role$'])}
+def infer_role(row,role_col):
+ vals=[]
+ if role_col and role_col in row.index:vals.append(str(row.get(role_col,'')))
+ for c in row.index:
+  if 'role' in normalise_key(c) or 'type' in normalise_key(c):vals.append(str(row.get(c,'')))
+ j=' '.join(vals).lower()
+ if re.search(r'\b(user|customer|human|subscriber)\b',j):return 'customer'
+ if re.search(r'\b(assistant|agent|bot)\b',j):return 'assistant'
+ if re.search(r'\b(tool|function|evidence|system)\b',j):return 'evidence'
+ return 'unknown'
+def group_preserving_sample(f,target,seed):
+ if target<=0 or len(f)<=target:return f.copy()
+ s=f.groupby('_group',sort=False).size().reset_index(name='rows'); rng=np.random.default_rng(seed); sel=[]; running=0
+ for pos in rng.permutation(len(s)).tolist():
+  g,size=str(s.at[pos,'_group']),int(s.at[pos,'rows'])
+  if not sel or abs(target-(running+size))<=abs(target-running):sel.append(g);running+=size
+  elif running>=target:break
+ return f[f['_group'].isin(set(sel))].copy().reset_index(drop=True)
+def load_and_prepare(c):
+ p=Path(c.input_path)
+ if not p.exists():raise FileNotFoundError(f'Input CSV not found: {p}')
+ df=pd.read_csv(p,low_memory=False); s=discover_schema(df)
+ if not s['text']:raise ValueError('Unable to discover message text column.')
+ f=df.copy().reset_index(drop=True); f['_row_id']=np.arange(len(f)); f['_raw_text']=f[s['text']].fillna('').astype(str); f['_redacted_text']=f['_raw_text'].map(redact_pii); f['_sanitized_text']=f['_redacted_text'].map(sanitize_text); f['_role']=f.apply(lambda r:infer_role(r,s['role']),axis=1); f['_case']=f[s['case']].fillna('').astype(str) if s['case'] else 'row_'+f['_row_id'].astype(str); f['_conversation']=f[s['conversation']].fillna('').astype(str) if s['conversation'] else f['_case']; f['_group']=f['_conversation'].where(f['_conversation'].str.len()>0,f['_case']); f['_group']=f['_group'].where(f['_group'].str.len()>0,'row_'+f['_row_id'].astype(str)); f['_upstream_label']=f[s['upstream_label']].fillna('').astype(str) if s['upstream_label'] else ''
+ if c.sample_rows>0:f=group_preserving_sample(f,c.sample_rows,c.seed);f['_row_id']=np.arange(len(f))
+ LOGGER.info('rows=%d customer=%d assistant=%d evidence=%d unknown=%d',len(f),int((f['_role']=='customer').sum()),int((f['_role']=='assistant').sum()),int((f['_role']=='evidence').sum()),int((f['_role']=='unknown').sum())); return f,s
+def _choose_group_subset(f,groups,ratio,seed,trials):
+ s=f[f['_group'].isin(set(groups))].groupby('_group',sort=False).size().reset_index(name='rows'); total=int(s.rows.sum()); target=int(round(total*ratio)); best=None
+ for t in range(max(8,trials)):
+  rng=np.random.default_rng(seed+t*10007); chosen=[]; running=0
+  for pos in rng.permutation(len(s)).tolist():
+   size=int(s.at[pos,'rows'])
+   if not chosen or abs(target-(running+size))<=abs(target-running):chosen.append(pos);running+=size
+   elif running>=target:break
+  sel=set(s.loc[chosen,'_group'].astype(str)); score=abs(running/max(total,1)-ratio)
+  if best is None or score<best[0]:best=(score,sel)
+ if best is None:raise RuntimeError('Unable to construct grouped split.')
+ return best[1]
+def assign_splits(f,c):
+ out=f.copy(); groups=sorted(out['_group'].astype(str).unique())
+ if len(groups)<5:raise RuntimeError('Too few interaction groups for split.')
+ test=_choose_group_subset(out,groups,c.test_size,c.seed+11,c.split_trials); dev=[g for g in groups if g not in test]; val=_choose_group_subset(out[out['_group'].isin(dev)],dev,c.validation_within_development,c.seed+29,c.split_trials); out['data_split']='train';out.loc[out['_group'].isin(val),'data_split']='validation';out.loc[out['_group'].isin(test),'data_split']='locked_test'; gs={s:set(out.loc[out.data_split==s,'_group'].astype(str)) for s in ('train','validation','locked_test')}; overlap=len(gs['train']&gs['validation'])+len(gs['train']&gs['locked_test'])+len(gs['validation']&gs['locked_test'])
+ if overlap:raise AssertionError('Grouped split leakage detected.')
+ return out,{'group_overlap_count':overlap,'rows':{s:int((out.data_split==s).sum()) for s in gs},'groups':{s:len(v) for s,v in gs.items()},'outer_locked_test_target':c.test_size,'validation_within_development_target':c.validation_within_development}
+
+def load_ontology(path):
+ if not path:return []
+ p=Path(path)
+ if not p.exists():raise FileNotFoundError(f'Ontology lexicon not found: {p}')
+ if p.suffix.lower()=='.csv':rows=pd.read_csv(p).to_dict('records')
+ elif p.suffix.lower()=='.jsonl':rows=[json.loads(x) for x in p.read_text(encoding='utf-8').splitlines() if x.strip()]
+ elif p.suffix.lower()=='.json':
+  z=json.loads(p.read_text(encoding='utf-8')); rows=z if isinstance(z,list) else z.get('entries',[])
+ else:raise ValueError('Ontology lexicon must be CSV, JSON, or JSONL.')
+ out=[]
+ for r in rows:
+  name=str(r.get('canonical_name','')).strip()
+  if not name:continue
+  raw=r.get('synonyms',[]); syn=[x.strip() for x in re.split(r'[|;]',raw) if x.strip()] if isinstance(raw,str) else [str(x).strip() for x in raw if str(x).strip()] if isinstance(raw,list) else []
+  out.append(OntologyEntry(name,str(r.get('entity_type','DOMAIN_CONCEPT')).strip() or 'DOMAIN_CONCEPT',syn,str(r.get('parent','')).strip() or None,str(r.get('source','')).strip() or None,str(r.get('source_ref','')).strip() or None))
+ return out
+class OntologyMatcher:
+ def __init__(self,entries,threshold):
+  self.entries=list(entries);self.threshold=float(threshold);self.aliases=[]
+  for i,e in enumerate(self.entries):
+   for n in [e.canonical_name]+list(e.synonyms):
+    n=normalize_term(n)
+    if n:self.aliases.append((n,i))
+  self.vectorizer=self.matrix=None
+  if self.aliases:self.vectorizer=TfidfVectorizer(analyzer='char_wb',ngram_range=(3,5),min_df=1,norm='l2');self.matrix=self.vectorizer.fit_transform([x[0] for x in self.aliases]).tocsr()
+ def exact_mentions(self,text):
+  n=' '+normalize_term(text)+' ';rows=[]
+  for a,i in self.aliases:
+   if f' {a} ' in n:
+    e=self.entries[i];rows.append({'surface':a,'canonical_name':e.canonical_name,'entity_type':e.entity_type,'parent':e.parent,'source':e.source,'source_ref':e.source_ref,'confidence':.97,'method':'ontology_exact'})
+  return dedupe_dicts(rows,('canonical_name','entity_type','surface'))
+ def fuzzy_match(self,phrase):
+  if self.vectorizer is None or not normalize_term(phrase):return None
+  sims=np.asarray(self.vectorizer.transform([normalize_term(phrase)])@self.matrix.T).ravel()
+  if not len(sims):return None
+  j=int(np.argmax(sims));score=float(sims[j])
+  if score<self.threshold:return None
+  e=self.entries[self.aliases[j][1]];return {'surface':normalize_term(phrase),'canonical_name':e.canonical_name,'entity_type':e.entity_type,'parent':e.parent,'source':e.source,'source_ref':e.source_ref,'confidence':float(min(.95,.60+.40*score)),'method':'ontology_char_similarity'}
+
+def adaptive_min_df(n):return max(2,int(round(math.log2(max(n,4))/2)))
+def load_stopword_seed(path):
+ terms=set(GENERIC_INTERACTION_PRIOR)|set(STRUCTURAL_TOKENS)
+ if not path:return terms
+ p=Path(path)
+ if not p.exists():raise FileNotFoundError(f'Stopword seed file not found: {p}')
+ vals=pd.read_csv(p)[('term' if 'term' in pd.read_csv(p,nrows=0).columns else pd.read_csv(p,nrows=0).columns[0])].dropna().astype(str).tolist() if p.suffix.lower()=='.csv' else [x.strip() for x in p.read_text(encoding='utf-8').splitlines() if x.strip()]
+ terms.update(normalize_term(x) for x in vals if normalize_term(x));return terms
+def fit_preliminary_partition(texts,seed):
+ vals=list(texts)
+ if len(vals)<10:return np.zeros(len(vals),int)
+ v=TfidfVectorizer(ngram_range=(1,2),min_df=adaptive_min_df(len(vals)),max_features=45000,sublinear_tf=True,norm='l2',token_pattern=r"(?u)\b[a-zA-Z][a-zA-Z0-9_'\-]{1,}\b")
+ try:x=v.fit_transform(vals)
+ except ValueError:v.set_params(min_df=1);x=v.fit_transform(vals)
+ nc=min(96,x.shape[0]-1,x.shape[1]-1)
+ if nc<2:return np.zeros(len(vals),int)
+ z=Normalizer(copy=False).fit_transform(TruncatedSVD(n_components=nc,random_state=seed).fit_transform(x));k=max(2,min(28,int(round(math.sqrt(len(vals))/1.7))));return MiniBatchKMeans(k,random_state=seed,batch_size=min(2048,max(128,len(vals))),n_init='auto').fit_predict(z).astype(int)
+def term_cluster_entropy(x,labels):
+ ids=sorted(set(int(i) for i in labels.tolist()))
+ if len(ids)<2:return np.ones(x.shape[1])
+ c=np.zeros((len(ids),x.shape[1]))
+ for i,cid in enumerate(ids):c[i]=np.asarray((x[labels==cid]>0).sum(axis=0)).ravel()
+ total=c.sum(axis=0);total[total==0]=1;p=c/total;return -np.sum(np.where(p>0,p*np.log(p+1e-12),0),axis=0)/max(math.log(len(ids)),1e-12)
+def max_regularized_log_odds_z(x,labels):
+ b=(x>0).astype(np.int8);total=np.asarray(b.sum(axis=0)).ravel().astype(float);n=b.shape[0];out=np.zeros(b.shape[1]);a0=.5
+ for cid in sorted(set(int(i) for i in labels.tolist())):
+  m=labels==cid;a=np.asarray(b[m].sum(axis=0)).ravel().astype(float);bb=total-a;n1,n0=float(m.sum()),float(n-m.sum());delta=np.log((a+a0)/np.maximum(n1-a+a0,1e-9))-np.log((bb+a0)/np.maximum(n0-bb+a0,1e-9));var=1/(a+a0)+1/(bb+a0);out=np.maximum(out,delta/np.sqrt(np.maximum(var,1e-9)))
+ return out
+def boundary_document_frequency(texts,max_ngram=3,boundary=6):
+ out=Counter()
+ for text in texts:
+  t=tokenize(text);seen=set()
+  for n in range(2,max_ngram+1):
+   for i in range(max(0,len(t)-n+1)):
+    if i<boundary or i+n>max(0,len(t)-boundary):seen.add(' '.join(t[i:i+n]))
+  out.update(seen)
+ return out
+def phrase_association_npmi(phrase,pdf,udf,n):
+ toks=phrase.split()
+ if len(toks)<2 or pdf<=0 or n<=0:return float('nan')
+ pp=max(float(pdf)/n,1e-12);exp=1.0
+ for tok in toks:exp*=max(float(udf.get(tok,0))/n,1e-12)
+ den=-math.log(min(pp,1-1e-12));return 0.0 if den<=1e-12 else float(np.clip(math.log(pp/exp)/den,-1,1))
+def extract_key_values(text,ref):
+ rows=[]
+ for m in KV_RE.finditer(text):
+  k=normalize_space(LEADING_OBSERVATION_VERB_RE.sub('',normalize_space(m.group('key'))));v=normalize_space(m.group('value'))
+  if tokenize(k) and v:rows.append({'key':k,'value':v,'normalized_key':normalize_term(k),'normalized_value':normalize_term(v),'unit':None,'confidence':.92,'method':'explicit_key_value','evidence_ref':ref})
+ for m in MEASUREMENT_RE.finditer(text):
+  k=normalize_space(LEADING_OBSERVATION_VERB_RE.sub('',normalize_space(m.group('key'))));rv=m.group('value');u=m.group('unit')
+  try:nv=float(rv)
+  except Exception:nv=rv
+  rows.append({'key':k,'value':rv,'normalized_key':normalize_term(k),'normalized_value':nv,'unit':u,'confidence':.97,'method':'measurement_pattern','evidence_ref':ref})
+ for m in ERROR_CODE_RE.finditer(text):rows.append({'key':'error_code','value':m.group(1),'normalized_key':'error_code','normalized_value':m.group(1).upper(),'unit':None,'confidence':.91,'method':'error_code_pattern','evidence_ref':ref})
+ return dedupe_dicts(rows,('normalized_key','normalized_value','unit','evidence_ref'))
+def derive_structured_protected_terms(f):
+ out=set(NEGATION_KEEP)
+ for _,r in f.iterrows():
+  for kv in extract_key_values(str(r['_sanitized_text']),str(r['_row_ref'])):
+   k=normalize_term(kv['key']);out.add(k);out.update(k.split())
+   if kv.get('unit'):out.add(normalize_term(kv['unit']))
+ return out
+def mine_protected_phrases(texts,labels,seed_terms,c):
+ v=CountVectorizer(ngram_range=(1,3),min_df=max(2,c.phrase_min_df),binary=True,max_features=max(c.phrase_top_candidates*10,25000),token_pattern=r"(?u)\b[a-zA-Z][a-zA-Z0-9_'\-]{1,}\b")
+ try:x=v.fit_transform(list(texts)).tocsr()
+ except ValueError:return pd.DataFrame(columns=['phrase','ngram_order','document_frequency','specificity','association_npmi','log_odds_z','content_ratio','phrase_score','selected_as_domain_signal'])
+ terms=np.asarray(v.get_feature_names_out());order=np.asarray([str(t).count(' ')+1 for t in terms]);df=np.asarray(x.sum(axis=0)).ravel().astype(float);spec=1-term_cluster_entropy(x,labels);lod=max_regularized_log_odds_z(x,labels);udf={str(t):float(f) for t,f,o in zip(terms,df,order) if o==1};assoc=np.asarray([phrase_association_npmi(str(t),f,udf,len(texts)) if o>1 else np.nan for t,f,o in zip(terms,df,order)]);sr=pd.Series(df).rank(pct=True).to_numpy();lr=pd.Series(lod).rank(pct=True).to_numpy();au=np.where(np.isfinite(assoc),(assoc+1)/2,.5)
+ def content(tok):return tok not in SAFE_ENGLISH_STOPWORDS and tok not in seed_terms and tok not in STRUCTURAL_TOKENS and not tok.startswith('redacted')
+ cr=np.asarray([len([z for z in str(t).split() if content(z)])/max(o,1) for t,o in zip(terms,order)]);placeholder=np.asarray([any(z in STRUCTURAL_TOKENS or z.startswith('redacted') for z in str(t).split()) for t in terms]);edge=np.asarray([bool(str(t).split()) and content(str(t).split()[0]) and content(str(t).split()[-1]) for t in terms]);score=np.power(np.clip(sr,1e-9,1)*np.clip(spec,1e-9,1)*np.clip(lr,1e-9,1)*np.clip(au,1e-9,1)*np.clip(cr,1e-9,1),.2);score[placeholder|(~edge)]=0;multi=order>1;score[multi&(~(np.isfinite(assoc)&(assoc>.05)))]=0;valid=score[score>0];cut,method=distribution_upper_tail(valid,c.seed+191) if len(valid) else (float('inf'),'empty');selected=(score>=cut) if np.isfinite(cut) else np.zeros(len(score),bool);lodcut=float(np.quantile(lod,.93)) if len(lod) else float('inf');selected|=(order==1)&edge&(~placeholder)&(lod>=lodcut)&(df>=max(2,c.phrase_min_df));tab=pd.DataFrame({'phrase':terms,'ngram_order':order,'document_frequency':df.astype(int),'specificity':spec,'association_npmi':assoc,'log_odds_z':lod,'content_ratio':cr,'phrase_score':score,'selection_threshold':cut,'selection_threshold_method':method,'selected_as_domain_signal':selected});return tab[(tab.phrase_score>0)&(tab.content_ratio>=.5)].sort_values(['selected_as_domain_signal','phrase_score','document_frequency'],ascending=[False,False,False]).head(c.phrase_top_candidates).reset_index(drop=True)
+def learn_noise_model(texts,labels,structured,phrases,seed_terms,c):
+ vals=list(texts);v=CountVectorizer(ngram_range=(1,c.noise_ngram_max),min_df=adaptive_min_df(len(vals)),binary=True,max_features=c.candidate_noise_features,token_pattern=r"(?u)\b[a-zA-Z][a-zA-Z0-9_'\-]{1,}\b")
+ try:x=v.fit_transform(vals).tocsr()
+ except ValueError:v.set_params(min_df=1);x=v.fit_transform(vals).tocsr()
+ terms=np.asarray(v.get_feature_names_out());order=np.asarray([str(t).count(' ')+1 for t in terms]);df=np.asarray(x.sum(axis=0)).ravel().astype(float);dfr=df/max(len(vals),1);ent=term_cluster_entropy(x,labels);lod=max_regularized_log_odds_z(x,labels);fr=pd.Series(dfr).rank(pct=True).to_numpy();er=pd.Series(ent).rank(pct=True).to_numpy();dr=pd.Series(lod).rank(pct=True).to_numpy();bdf=boundary_document_frequency(vals,c.noise_ngram_max);br=np.asarray([bdf.get(str(t),0)/max(float(f),1) if o>1 else 0 for t,f,o in zip(terms,df,order)]);brr=pd.Series(br).rank(pct=True).to_numpy();ss=np.power(np.clip(fr,1e-9,1)*np.clip(er,1e-9,1)*np.clip(.35+.65*brr,1e-9,1)*np.clip(1-dr+1e-6,1e-9,1),.25);uni=order==1;stopcut,sm=distribution_upper_tail(ss[uni],c.seed+71);ts=np.sqrt(np.clip(fr,0,1)*np.clip(ent,0,1)*np.clip(br,0,1));pm=order>1;tempcut,tm=distribution_upper_tail(ts[pm],c.seed+101) if pm.any() else (float('inf'),'empty');selected_phrases=set(phrases.loc[phrases.selected_as_domain_signal==True,'phrase'].astype(str)) if not phrases.empty else set();pu=set(structured)|set(NEGATION_KEEP);[pu.add(p) for p in selected_phrases if len(p.split())==1];pp={p for p in selected_phrases if len(p.split())>1};forced=np.asarray([(o==1 and str(t) in SAFE_ENGLISH_STOPWORDS) or (o==1 and str(t) in seed_terms) or any(z in STRUCTURAL_TOKENS for z in str(t).split()) for t,o in zip(terms,order)]);prot=np.asarray([str(t) in pu or str(t) in pp or any(z in NEGATION_KEEP for z in str(t).split()) for t in terms]);learned=uni&(ss>=stopcut)&(~prot);template=pm&(ts>=tempcut)&(~prot) if np.isfinite(tempcut) else np.zeros(len(terms),bool);sel=(learned|forced|template)&(~prot);reasons=['protected_semantic_signal' if prot[i] else 'structural_or_interaction_background' if forced[i] else 'recurrent_template' if template[i] else 'learned_corpus_stopword' if learned[i] else 'retained' for i in range(len(terms))];audit=pd.DataFrame({'term':terms,'ngram_order':order,'document_frequency':df.astype(int),'document_frequency_ratio':dfr,'cluster_entropy':ent,'max_regularized_log_odds_z':lod,'boundary_ratio':br,'stopword_score':ss,'stopword_threshold':stopcut,'template_score':ts,'template_threshold':tempcut,'selected_as_noise':sel,'protected':prot,'reason':reasons}).sort_values(['selected_as_noise','protected','stopword_score','max_regularized_log_odds_z'],ascending=[False,False,False,False]).reset_index(drop=True);lu=set(terms[sel&(order==1)].astype(str));tp=set(terms[sel&(order>1)].astype(str));model=NoiseModel(lu,tp,pp,pu,lu|tp|set(STRUCTURAL_TOKENS)|set(seed_terms),float(stopcut),float(tempcut),f'stop:{sm}+template:{tm}+phrase_span_protection');return model,audit,audit[(audit.selected_as_noise==True)&(audit.ngram_order==1)].copy()
+def apply_noise_model(text,m):
+ t=tokenize(text)
+ if not t:return ''
+ prot=np.zeros(len(t),bool)
+ for n in range(max([len(x.split()) for x in m.protected_phrases],default=1),1,-1):
+  for i in range(max(0,len(t)-n+1)):
+   if ' '.join(t[i:i+n]) in m.protected_phrases:prot[i:i+n]=True
+ for i,z in enumerate(t):
+  if z in m.protected_unigrams:prot[i]=True
+ drop=np.zeros(len(t),bool)
+ for n in range(max([len(x.split()) for x in m.template_phrases],default=1),1,-1):
+  for i in range(max(0,len(t)-n+1)):
+   if not prot[i:i+n].any() and ' '.join(t[i:i+n]) in m.template_phrases:drop[i:i+n]=True
+ for i,z in enumerate(t):
+  if not prot[i] and z in m.learned_stopwords:drop[i]=True
+ keep=[z for z,d in zip(t,drop) if not d];return ' '.join(t) if len(keep)<2 else ' '.join(keep)
+
+def split_sentences(text):return [normalize_space(x) for x in SENTENCE_SPLIT_RE.split(str(text or '')) if len(tokenize(x))>=2]
+def classify_sentence_context(s):
+ out=[]
+ for p,k,c in [(DIAGNOSTIC_CUE_RE,'DIAGNOSTIC',.82),(CAUSE_CUE_RE,'ROOT_CAUSE',.91),(REMEDIATION_CUE_RE,'REMEDIATION',.87),(STATE_CUE_RE,'STATE',.80),(IMPACT_CUE_RE,'SYMPTOM_OR_IMPACT',.80),(TIME_RE,'TEMPORAL',.92),(ACTION_VERB_RE,'ACTION',.78)]:
+  if p.search(s):out.append((k,c))
+ return out
+def context_records(text,ref,role):return [{'context_type':k,'statement':s,'role':role,'confidence':c,'sentence_index':i,'evidence_ref':ref} for i,s in enumerate(split_sentences(text)) for k,c in classify_sentence_context(s)]
+def role_entities(role,ref):
+ mp={'customer':[('customer','ACTOR')],'assistant':[('assistant','ACTOR'),('call_center','CHANNEL_OR_ACTOR')],'evidence':[('evidence_source','SYSTEM_OR_SOURCE')]};return [{'surface':n,'canonical_name':n,'entity_type':t,'confidence':.99,'method':'interaction_role','source_ref':'TR292A' if t in {'ACTOR','CHANNEL_OR_ACTOR'} else 'TR292G','evidence_ref':ref} for n,t in mp.get(role,[])]
+def kv_entities(kvs,ontology):
+ out=[]
+ for kv in kvs:
+  k=str(kv['normalized_key']);m=ontology.fuzzy_match(k)
+  if m:m['evidence_ref']=kv['evidence_ref'];out.append(m)
+  else:out.append({'surface':k,'canonical_name':k,'entity_type':'ATTRIBUTE_OR_METRIC','confidence':.90 if kv.get('unit') else .80,'method':'structured_key','source_ref':'TR292D/TR292G' if kv.get('unit') else 'TR292G','evidence_ref':kv['evidence_ref']})
+ return dedupe_dicts(out,('canonical_name','entity_type','evidence_ref'))
+def phrase_entities(text,ref,pt,ontology):
+ n=' '+normalize_term(text)+' ';out=[]
+ for x in ontology.exact_mentions(text):x['evidence_ref']=ref;out.append(x)
+ if pt.empty:return dedupe_dicts(out,('canonical_name','entity_type','evidence_ref'))
+ cand=pt[pt.selected_as_domain_signal==True] if 'selected_as_domain_signal' in pt.columns else pt;matches=[]
+ for r in cand.head(1500).itertuples(index=False):
+  p=str(r.phrase)
+  if not (ACTION_VERB_RE.search(p) or CAUSE_CUE_RE.search(p) or REMEDIATION_CUE_RE.search(p)) and f' {p} ' in n:matches.append((p,float(r.phrase_score),int(r.ngram_order)))
+ selected=[]
+ for p,s,o in sorted(matches,key=lambda x:(-x[2],-x[1],x[0])):
+  toks=set(p.split())
+  if any(toks.issubset(set(e.split())) or len(toks&set(e.split()))/max(len(toks|set(e.split())),1)>=.75 for e,_,_ in selected):continue
+  selected.append((p,s,o))
+  if len(selected)>=12:break
+ for p,s,_ in selected:
+  m=ontology.fuzzy_match(p)
+  if m:m['evidence_ref']=ref;out.append(m)
+  else:out.append({'surface':p,'canonical_name':p,'entity_type':'DOMAIN_CONCEPT','confidence':float(np.clip(.54+.36*s,.54,.89)),'method':'corpus_phrase_mining','source_ref':'TR290/TR292','evidence_ref':ref})
+ return dedupe_dicts(out,('canonical_name','entity_type','evidence_ref'))
+def extract_entities_for_row(text,role,ref,kvs,pt,ontology):return dedupe_dicts(role_entities(role,ref)+kv_entities(kvs,ontology)+phrase_entities(text,ref,pt,ontology),('canonical_name','entity_type','evidence_ref'))
+def normalize_statement_signature(text):return ' '.join([z for z in tokenize(text) if z not in SAFE_ENGLISH_STOPWORDS and z not in GENERIC_INTERACTION_PRIOR][:30])
+def build_evidence_records(contexts,kvs):
+ by=defaultdict(list)
+ for kv in kvs:by[kv['evidence_ref']].append(kv)
+ rows=[]
+ for c in contexts:
+  if c['context_type'] not in {'DIAGNOSTIC','STATE','SYMPTOM_OR_IMPACT'}:continue
+  linked=by.get(c['evidence_ref'],[]);base=.44+(.27 if c['role']=='evidence' else .13 if c['role']=='assistant' else 0)+(.14 if linked else 0)+(.09 if DIAGNOSTIC_CUE_RE.search(c['statement']) else 0)+(.05 if c['context_type']=='DIAGNOSTIC' else 0);rows.append({'evidence_type':c['context_type'],'statement':c['statement'],'role':c['role'],'key_values':linked[:12],'confidence':float(c['confidence']),'evidence_strength':float(np.clip(base,0,.99)),'evidence_ref':c['evidence_ref'],'_sig':normalize_statement_signature(c['statement'])})
+ for kv in kvs:
+  if kv.get('unit'):rows.append({'evidence_type':'MEASUREMENT','statement':f"{kv['key']}={kv['value']} {kv['unit']}",'role':None,'key_values':[kv],'confidence':float(kv['confidence']),'evidence_strength':.95,'evidence_ref':kv['evidence_ref'],'_sig':normalize_statement_signature(f"{kv['key']} {kv['unit']}")})
+ refs=defaultdict(set);roles=defaultdict(set)
+ for r in rows:
+  if r['_sig']:refs[r['_sig']].add(r['evidence_ref']);roles[r['_sig']].add(str(r.get('role') or ''))
+ for r in rows:
+  n=len(refs.get(r['_sig'],set())) or 1;rd=len([x for x in roles.get(r['_sig'],set()) if x]) or 1;r['corroboration_count']=n;r['role_diversity']=rd;r['evidence_strength']=float(min(.99,r['evidence_strength']+min(.08,.02*max(0,n-1))+min(.05,.025*max(0,rd-1))));r.pop('_sig',None)
+ return dedupe_dicts(rows,('evidence_type','statement','evidence_ref'))
+def build_cause_records(contexts,evidence):
+ by=defaultdict(list)
+ for e in evidence:by[e['evidence_ref']].append(e)
+ out=[]
+ for c in contexts:
+  if c['context_type']=='ROOT_CAUSE':
+   linked=by.get(c['evidence_ref'],[]);sup=float(np.mean([safe_float(x.get('evidence_strength')) for x in linked])) if linked else 0;out.append({'statement':c['statement'],'confidence':float(min(.97,.76+.15*sup+(.05 if linked else 0))),'linked_evidence_refs':sorted({x['evidence_ref'] for x in linked}),'supporting_evidence_count':len(linked),'evidence_ref':c['evidence_ref']})
+ return dedupe_dicts(out,('statement','evidence_ref'))
+def build_remediation_records(contexts,evidence):
+ by=defaultdict(list)
+ for e in evidence:by[e['evidence_ref']].append(e)
+ out=[]
+ for c in contexts:
+  if c['context_type'] in {'REMEDIATION','ACTION'}:
+   linked=by.get(c['evidence_ref'],[]);sup=float(np.mean([safe_float(x.get('evidence_strength')) for x in linked])) if linked else 0;out.append({'statement':c['statement'],'action_type':c['context_type'],'confidence':float(min(.96,safe_float(c['confidence'])+.05*sup+(.03 if linked else 0))),'linked_evidence_refs':sorted({x['evidence_ref'] for x in linked}),'supporting_evidence_count':len(linked),'evidence_ref':c['evidence_ref']})
+ return dedupe_dicts(out,('statement','action_type','evidence_ref'))
+def build_relationships(entities,contexts,kvs,causes,remediations):
+ byent=defaultdict(list);byctx=defaultdict(list)
+ for e in entities:byent[e['evidence_ref']].append(e)
+ for c in contexts:byctx[c['evidence_ref']].append(c)
+ out=[]
+ for ref,ents in byent.items():
+  strong=sorted(ents,key=lambda x:safe_float(x.get('confidence')),reverse=True)[:8];emitted=0
+  for i in range(len(strong)):
+   for j in range(i+1,len(strong)):
+    a,b=strong[i],strong[j]
+    if a['canonical_name']==b['canonical_name'] or (a['entity_type']==b['entity_type']=='DOMAIN_CONCEPT'):continue
+    out.append({'subject':a['canonical_name'],'predicate':'CO_OBSERVED_WITH','object':b['canonical_name'],'confidence':float(min(safe_float(a['confidence']),safe_float(b['confidence']))*.78),'evidence_ref':ref,'source_ref':'TR292'});emitted+=1
+    if emitted>=8:break
+   if emitted>=8:break
+ for kv in kvs:
+  ents=byent.get(kv['evidence_ref'],[]);cand=[e for e in ents if e['entity_type'] not in {'ACTOR','CHANNEL_OR_ACTOR'}];sub=max(cand or ents,key=lambda x:safe_float(x.get('confidence')))['canonical_name'] if ents else 'interaction';obj=f"{kv['normalized_key']}={kv['normalized_value']}"+(f" {kv['unit']}" if kv.get('unit') else '');out.append({'subject':sub,'predicate':'HAS_OBSERVATION' if kv.get('unit') else 'HAS_ATTRIBUTE','object':obj,'confidence':float(min(.97,safe_float(kv['confidence']))),'evidence_ref':kv['evidence_ref'],'source_ref':'TR292D/TR292G' if kv.get('unit') else 'TR292G'})
+ for x in causes:out.append({'subject':'observed_issue','predicate':'HAS_POSSIBLE_CAUSE','object':x['statement'],'confidence':x['confidence'],'evidence_ref':x['evidence_ref'],'source_ref':'TR290/TR292'})
+ for x in remediations:out.append({'subject':'observed_issue','predicate':'HAS_REMEDIATION','object':x['statement'],'confidence':x['confidence'],'evidence_ref':x['evidence_ref'],'source_ref':'TR292C'})
+ for ref,cs in byctx.items():
+  states=[x for x in cs if x['context_type']=='STATE'][:3];ents=byent.get(ref,[]);cand=[e for e in ents if e['entity_type'] not in {'ACTOR','CHANNEL_OR_ACTOR'}];sub=max(cand or ents,key=lambda x:safe_float(x.get('confidence')))['canonical_name'] if ents else 'interaction'
+  for s in states:out.append({'subject':sub,'predicate':'HAS_STATE','object':s['statement'],'confidence':float(safe_float(s['confidence'])*.9),'evidence_ref':ref,'source_ref':'TR292A/TR292G'})
+ return dedupe_dicts(out,('subject','predicate','object','evidence_ref'))
+def semantic_signature(r):
+ toks=[]
+ for e in r['entities']:toks+=['etype_'+normalize_term(e['entity_type']).replace(' ','_'),'entity_'+normalize_term(e['canonical_name']).replace(' ','_')]
+ for c in r['context']:toks.append('context_'+normalize_term(c['context_type']).replace(' ','_'))
+ for kv in r['key_values']:
+  toks.append('kvkey_'+normalize_term(kv['normalized_key']).replace(' ','_'))
+  if kv.get('unit'):toks.append('unit_'+normalize_term(kv['unit']).replace(' ','_'))
+ for rel in r['relationships']:toks.append('relation_'+normalize_term(rel['predicate']).replace(' ','_'))
+ if r['root_cause']:toks.append('has_root_cause')
+ if r['remediation']:toks.append('has_remediation')
+ return ' '.join(sorted(set(x for x in toks if x and not x.endswith('_'))))
+def descriptor_signature(r):
+ p=[str(e['canonical_name']) for e in r['entities'] if e['entity_type'] not in {'ACTOR','CHANNEL_OR_ACTOR','SYSTEM_OR_SOURCE'}]+[str(kv['normalized_key']) for kv in r['key_values']]+[x.lower().replace('_',' ') for x in sorted(set(c['context_type'] for c in r['context']))];return ' '.join(dict.fromkeys(normalize_space(x) for x in p if normalize_space(x)))
+def ontology_alignment_summary(r):
+ refs=Counter()
+ for f in ('entities','relationships'):
+  for x in r[f]:
+   z=str(x.get('source_ref') or '').strip()
+   if z:refs[z]+=1
+ if r['key_values']:refs['TR292D/TR292G']+=len(r['key_values'])
+ if r['diagnostic_evidence']:refs['TR292G']+=len(r['diagnostic_evidence'])
+ if r['remediation']:refs['TR292C']+=len(r['remediation'])
+ return {'aligned_references':dict(refs),'alignment_mode':'semantic_alignment_not_full_ontology_replication'}
+def build_interaction_records(f,pt,ontology,noise,key,policy):
+ records=[]
+ for group,b in f.groupby('_group',sort=False):
+  ents=[];ctx=[];kvs=[];clean=[];roles=Counter();up=Counter()
+  for _,row in b.iterrows():
+   text,role,ref=str(row['_sanitized_text']),str(row['_role']),str(row['_row_ref']);roles[role]+=1;lab=str(row['_upstream_label'] or '')
+   if lab:up[lab]+=1
+   lk=extract_key_values(text,ref);lc=context_records(text,ref,role);le=extract_entities_for_row(text,role,ref,lk,pt,ontology);kvs+=lk;ctx+=lc;ents+=le;clean.append(apply_noise_model(text,noise) if policy=='learned_clean' else normalize_term(text))
+  ents=dedupe_dicts(ents,('canonical_name','entity_type','evidence_ref'));ctx=dedupe_dicts(ctx,('context_type','statement','evidence_ref'));kvs=dedupe_dicts(kvs,('normalized_key','normalized_value','unit','evidence_ref'));ev=build_evidence_records(ctx,kvs);ca=build_cause_records(ctx,ev);rem=build_remediation_records(ctx,ev);rel=build_relationships(ents,ctx,kvs,ca,rem);r={'interaction_ref':pseudonymize(group,key),'data_split':str(b.data_split.iloc[0]),'roles':dict(roles),'upstream_labels_passthrough':dict(up),'entities':ents,'context':ctx,'key_values':kvs,'diagnostic_evidence':ev,'root_cause':ca,'remediation':rem,'relationships':rel,'confidence_summary':{'entity_mean':float(np.mean([safe_float(x['confidence']) for x in ents])) if ents else None,'context_mean':float(np.mean([safe_float(x['confidence']) for x in ctx])) if ctx else None,'evidence_strength_mean':float(np.mean([safe_float(x['evidence_strength']) for x in ev])) if ev else None,'root_cause_mean':float(np.mean([safe_float(x['confidence']) for x in ca])) if ca else None,'remediation_mean':float(np.mean([safe_float(x['confidence']) for x in rem])) if rem else None},'_clean_text':normalize_space(' '.join(clean))};r['semantic_signature']=semantic_signature(r);r['_descriptor_text']=descriptor_signature(r);r['ontology_alignment']=ontology_alignment_summary(r);records.append(r)
+ return records
+
+class FieldSelector:
+ def __init__(self,field):self.field=field
+ def fit(self,X,y=None):return self
+ def transform(self,X):return [str(r.get(self.field,'')) for r in X]
+ def get_params(self,deep=True):return {'field':self.field}
+ def set_params(self,**p):
+  if 'field' in p:self.field=p['field']
+  return self
+def build_hybrid_vectorizer(c,n):
+ md=adaptive_min_df(n);word=Pipeline([('select',FieldSelector('text')),('tfidf',TfidfVectorizer(ngram_range=(1,3),min_df=md,max_features=c.max_word_features,sublinear_tf=True,norm='l2',token_pattern=r"(?u)\b[a-zA-Z][a-zA-Z0-9_'\-]{1,}\b"))]);char=Pipeline([('select',FieldSelector('text')),('tfidf',TfidfVectorizer(analyzer='char_wb',ngram_range=(3,5),min_df=md,max_features=c.max_char_features,sublinear_tf=True,norm='l2'))]);sem=Pipeline([('select',FieldSelector('semantic')),('tfidf',TfidfVectorizer(ngram_range=(1,2),min_df=1,max_features=c.max_semantic_features,sublinear_tf=True,norm='l2',token_pattern=r"(?u)\b[a-zA-Z][a-zA-Z0-9_'\-]{1,}\b"))]);return FeatureUnion([('word',word),('char',char),('semantic',sem)],transformer_weights={'word':c.word_weight,'char':c.char_weight,'semantic':c.semantic_weight})
+def fit_latent(texts,sigs,c):
+ rows=[{'text':str(t),'semantic':str(s)} for t,s in zip(texts,sigs)];v=build_hybrid_vectorizer(c,len(rows))
+ try:x=v.fit_transform(rows)
+ except ValueError:
+  v=build_hybrid_vectorizer(c,max(2,len(rows)))
+  for _,p in v.transformer_list:
+   if hasattr(p,'named_steps') and 'tfidf' in p.named_steps:p.named_steps['tfidf'].set_params(min_df=1)
+  x=v.fit_transform(rows)
+ nc=min(c.svd_components,x.shape[0]-1,x.shape[1]-1)
+ if nc<2:raise RuntimeError('Insufficient samples/features for latent representation.')
+ svd=TruncatedSVD(n_components=nc,random_state=c.seed);z=svd.fit_transform(x);norm=Normalizer(copy=False);z=norm.fit_transform(z);return LatentModel(v,svd,norm,c.transform_batch_size),np.asarray(z,dtype=np.float32)
+def safe_silhouette(v,l,seed):
+ m=l!=-1
+ if m.sum()<3 or len(set(l[m].tolist()))<2:return None
+ try:
+  x=float(silhouette_score(v[m],l[m],metric='cosine',sample_size=min(5000,int(m.sum())),random_state=seed));return x if np.isfinite(x) else None
+ except Exception:return None
+def cluster_entropy(l):
+ v=l[l!=-1]
+ if not len(v):return 0.0
+ c=np.asarray(list(Counter(v.tolist()).values()),float);p=c/c.sum();return float(-np.sum(p*np.log(p+1e-12))/max(math.log(max(len(c),2)),1e-12))
+def candidate_metrics(v,l,seed):
+ valid=l[l!=-1];largest=max(Counter(valid.tolist()).values())/len(valid) if len(valid) else 1;s=safe_silhouette(v,l,seed);return {'silhouette':float(s) if s is not None else np.nan,'assigned_fraction':float(np.mean(l!=-1)),'noise_rate':float(np.mean(l==-1)),'balance_entropy':cluster_entropy(l),'n_clusters':float(len(set(valid.tolist()))),'largest_cluster_share':float(largest)}
+def derive_hdbscan_grid(n,trials):
+ if n<8:return []
+ root,logn=math.sqrt(n),math.log2(max(n,4));mcs=sorted(set(max(5,min(max(5,n//3),int(round(v)))) for v in (1.5*logn,.30*root,.50*root,.80*root)));rows=[]
+ for a in mcs:
+  for b in sorted(set(max(2,min(a,int(round(v)))) for v in (logn,math.sqrt(a),a/3))):
+   for method in ('eom','leaf'):rows.append({'min_cluster_size':a,'min_samples':b,'cluster_selection_method':method})
+ if len(rows)<=trials:return rows
+ idx=np.linspace(0,len(rows)-1,trials).round().astype(int);return [rows[i] for i in sorted(set(idx.tolist()))]
+def derive_umap_grid(n,trials):
+ base=derive_hdbscan_grid(n,max(4,trials//2));root,logn=math.sqrt(max(n,4)),math.log2(max(n,4));nn=sorted(set(min(n-1,max(5,int(round(v)))) for v in (logn,2*logn,root*.5,root)));dims=sorted(set(max(2,int(round(v))) for v in (5,logn,min(15,1.5*logn))));rows=[{**p,'n_neighbors':a,'n_components':d,'min_dist':0.0} for p in base for a in nn for d in dims]
+ if len(rows)<=trials:return rows
+ idx=np.linspace(0,len(rows)-1,trials).round().astype(int);return [rows[i] for i in sorted(set(idx.tolist()))]
+def fit_direct_hdbscan_once(v,p):
+ from hdbscan import HDBSCAN
+ m=HDBSCAN(min_cluster_size=int(p['min_cluster_size']),min_samples=int(p['min_samples']),metric='euclidean',cluster_selection_method=str(p['cluster_selection_method']),prediction_data=True,core_dist_n_jobs=-1);l=m.fit_predict(v).astype(int);return m,l,np.asarray(m.probabilities_,float)
+def fit_umap_hdbscan_once(v,p,seed):
+ from umap import UMAP
+ from hdbscan import HDBSCAN
+ r=UMAP(n_neighbors=int(p['n_neighbors']),n_components=int(p['n_components']),min_dist=float(p['min_dist']),metric='cosine',random_state=seed,transform_seed=seed,low_memory=True);z=r.fit_transform(v);m=HDBSCAN(min_cluster_size=int(p['min_cluster_size']),min_samples=int(p['min_samples']),metric='euclidean',cluster_selection_method=str(p['cluster_selection_method']),prediction_data=True,core_dist_n_jobs=-1);l=m.fit_predict(z).astype(int);return r,m,l,np.asarray(m.probabilities_,float)
+def stability_for_candidate(v,method,p,seed,repeats):
+ if len(v)<10:return 0.0,0.0
+ n=len(v);sn=max(8,int(round(.85*n)));runs=[]
+ for i in range(max(2,repeats)):
+  rng=np.random.default_rng(seed+i*1009);idx=np.sort(rng.choice(n,sn,replace=False));q=dict(p);ratio=sn/n;q['min_cluster_size']=max(5,min(max(5,sn//3),int(round(q['min_cluster_size']*ratio))));q['min_samples']=max(2,min(q['min_cluster_size'],int(round(q['min_samples']*ratio))))
+  try:
+   if method=='direct_hdbscan':_,l,_=fit_direct_hdbscan_once(v[idx],q)
+   else:q['n_neighbors']=min(int(q['n_neighbors']),sn-1);_,_,l,_=fit_umap_hdbscan_once(v[idx],q,seed+i*97)
+   runs.append((idx,l))
+  except Exception:pass
+ aris=[];jacs=[]
+ for i in range(len(runs)):
+  for j in range(i+1,len(runs)):
+   ia,la=runs[i];ib,lb=runs[j];common,aidx,bidx=np.intersect1d(ia,ib,return_indices=True)
+   if len(common)<3:continue
+   a,b=la[aidx],lb[bidx];aris.append(float(adjusted_rand_score(a,b)));ao=set(np.flatnonzero(a==-1));bo=set(np.flatnonzero(b==-1));u=ao|bo;jacs.append(1.0 if not u else len(ao&bo)/len(u))
+ return float(np.mean(aris)) if aris else 0.0,float(np.mean(jacs)) if jacs else 0.0
+def fit_kmeans_fallback(v,seed):
+ rows=[];models={};mk=max(2,min(40,int(round(math.sqrt(max(len(v),4))))))
+ for k in range(2,mk+1):
+  m=MiniBatchKMeans(k,random_state=seed,batch_size=min(4096,max(128,len(v))),n_init='auto');l=m.fit_predict(v).astype(int);z=candidate_metrics(v,l,seed)
+  if np.isfinite(z['silhouette']):rows.append({'method':'minibatch_kmeans','k':k,**z});models[k]=m
+ t=pd.DataFrame(rows)
+ if t.empty:raise RuntimeError('Unable to fit clustering fallback.')
+ t['score']=pd.concat([percentile_rank(t.silhouette,True),percentile_rank(t.balance_entropy,True),percentile_rank(t.largest_cluster_share,False)],axis=1).mean(axis=1);b=t.sort_values('score',ascending=False).iloc[0];m=models[int(b.k)];l=m.predict(v).astype(int);s=1/(1+np.min(m.transform(v),axis=1));return ClusterModel('minibatch_kmeans',None,m,{'k':int(b.k)},float(b.silhouette),1.0,None,None),l,s,t.sort_values('score',ascending=False).reset_index(drop=True)
+def fit_cluster_search(v,c):
+ try:import hdbscan
+ except Exception:LOGGER.warning('HDBSCAN unavailable; using MiniBatchKMeans fallback.');return fit_kmeans_fallback(v,c.seed)
+ if c.search_sample_rows>0 and len(v)>c.search_sample_rows:rng=np.random.default_rng(c.seed);sv=v[np.sort(rng.choice(len(v),c.search_sample_rows,replace=False))]
+ else:sv=v
+ rows=[];dt=max(4,c.model_search_trials//2)
+ for p in derive_hdbscan_grid(len(sv),dt):
+  try:
+   _,l,_=fit_direct_hdbscan_once(sv,p);m=candidate_metrics(sv,l,c.seed)
+   if m['n_clusters']>=2 and np.isfinite(m['silhouette']):rows.append({'method':'direct_hdbscan',**p,**m})
+  except Exception:pass
+ try:
+  import umap
+  for p in derive_umap_grid(len(sv),max(4,c.model_search_trials-dt)):
+   try:
+    _,_,l,_=fit_umap_hdbscan_once(sv,p,c.seed);m=candidate_metrics(sv,l,c.seed)
+    if m['n_clusters']>=2 and np.isfinite(m['silhouette']):rows.append({'method':'umap_hdbscan',**p,**m})
+   except Exception:pass
+ except Exception:pass
+ if not rows:return fit_kmeans_fallback(v,c.seed)
+ t=pd.DataFrame(rows);t['coarse_score']=pd.concat([percentile_rank(t.silhouette,True),percentile_rank(t.balance_entropy,True),percentile_rank(t.largest_cluster_share,False),percentile_rank(t.assigned_fraction,True)],axis=1).mean(axis=1);t['stability_ari']=np.nan;t['outlier_jaccard']=np.nan
+ for idx in t.nlargest(min(len(t),max(2,int(round(math.sqrt(len(t)))))), 'coarse_score').index.tolist():
+  method=str(t.at[idx,'method']);p={'min_cluster_size':int(t.at[idx,'min_cluster_size']),'min_samples':int(t.at[idx,'min_samples']),'cluster_selection_method':str(t.at[idx,'cluster_selection_method'])}
+  if method=='umap_hdbscan':p.update({'n_neighbors':int(t.at[idx,'n_neighbors']),'n_components':int(t.at[idx,'n_components']),'min_dist':float(t.at[idx,'min_dist'])})
+  a,j=stability_for_candidate(sv,method,p,c.seed+303,c.stability_repeats);t.at[idx,'stability_ari']=a;t.at[idx,'outlier_jaccard']=j
+ t['score']=pd.concat([percentile_rank(t.silhouette,True),percentile_rank(t.balance_entropy,True),percentile_rank(t.largest_cluster_share,False),percentile_rank(t.assigned_fraction,True),percentile_rank(t.stability_ari,True),percentile_rank(t.outlier_jaccard,True)],axis=1).mean(axis=1);b=t.sort_values('score',ascending=False).iloc[0];method=str(b['method']);p={'min_cluster_size':int(b['min_cluster_size']),'min_samples':int(b['min_samples']),'cluster_selection_method':str(b['cluster_selection_method'])}
+ if method=='umap_hdbscan':p.update({'n_neighbors':int(b['n_neighbors']),'n_components':int(b['n_components']),'min_dist':float(b['min_dist'])})
+ if len(sv)<len(v):
+  ratio=len(v)/len(sv);p['min_cluster_size']=max(5,min(max(5,len(v)//3),int(round(p['min_cluster_size']*ratio))));p['min_samples']=max(2,min(p['min_cluster_size'],int(round(p['min_samples']*ratio))))
+  if method=='umap_hdbscan':p['n_neighbors']=min(p['n_neighbors'],len(v)-1)
+ if method=='direct_hdbscan':cl,l,s=fit_direct_hdbscan_once(v,p);r=None
+ else:r,cl,l,s=fit_umap_hdbscan_once(v,p,c.seed)
+ met=candidate_metrics(v,l,c.seed);a,j=stability_for_candidate(v,method,p,c.seed+707,c.stability_repeats);return ClusterModel(method,r,cl,p,float(met['silhouette']) if np.isfinite(met['silhouette']) else None,float(met['assigned_fraction']),a,j),l,s,t.sort_values('score',ascending=False).reset_index(drop=True)
+def predict_cluster(m,v):
+ if not len(v):return np.asarray([],int),np.asarray([],float)
+ if m.method in {'direct_hdbscan','umap_hdbscan'}:
+  from hdbscan.prediction import approximate_predict
+  d=v if m.reducer is None else m.reducer.transform(v);l,s=approximate_predict(m.clusterer,d);return l.astype(int),s.astype(float)
+ l=m.clusterer.predict(v).astype(int);return l,1/(1+np.min(m.clusterer.transform(v),axis=1))
+def validation_metrics(m,latent,records,c):
+ if not records:return {}
+ v=latent.transform([r['_clean_text'] for r in records],[r['semantic_signature'] for r in records]);l,s=predict_cluster(m,v);z=candidate_metrics(v,l,c.seed);z['mean_strength']=float(np.mean(s[l!=-1])) if np.any(l!=-1) else np.nan;return z
+def policy_quality_score(tr,val):
+ vs=safe_float(val.get('silhouette'),-1);va=safe_float(val.get('assigned_fraction'),0);vb=safe_float(val.get('balance_entropy'),0);vl=safe_float(val.get('largest_cluster_share'),1);vn=safe_float(val.get('noise_rate'),1);ts=safe_float(tr.get('silhouette'),-1);return float(.42*vs+.18*va+.14*vb+.10*(1-vl)+.06*(1-abs(vn-.18))+.10*ts)
+def fit_policy(policy,f,pt,ontology,noise,key,c):
+ records=build_interaction_records(f,pt,ontology,noise,key,policy);tr=[r for r in records if r['data_split']=='train'];val=[r for r in records if r['data_split']=='validation']
+ if len(tr)<20:raise RuntimeError(f'Too few training interactions after grouping: {len(tr)}')
+ latent,v=fit_latent([r['_clean_text'] for r in tr],[r['semantic_signature'] for r in tr],c);m,l,s,search=fit_cluster_search(v,c);tm=candidate_metrics(v,l,c.seed);tm['mean_strength']=float(np.mean(s[l!=-1])) if np.any(l!=-1) else np.nan;vm=validation_metrics(m,latent,val,c);return PolicyResult(policy,latent,m,v,l,s,tm,vm,search,policy_quality_score(tm,vm)),records
+def build_policy_table(results):
+ rows=[]
+ for r in results:rows.append({'policy':r.policy,'score':r.score,'train_silhouette':r.train_metrics.get('silhouette'),'validation_silhouette':r.validation_metrics.get('silhouette'),'validation_assigned_fraction':r.validation_metrics.get('assigned_fraction'),'validation_noise_rate':r.validation_metrics.get('noise_rate'),'validation_balance_entropy':r.validation_metrics.get('balance_entropy'),'validation_largest_cluster_share':r.validation_metrics.get('largest_cluster_share'),'cluster_method':r.cluster_model.method})
+ return pd.DataFrame(rows).sort_values('score',ascending=False).reset_index(drop=True)
+def choose_policy(results):
+ best=sorted(results,key=lambda r:r.score,reverse=True)[0];raw=next((r for r in results if r.policy=='raw'),None);clean=next((r for r in results if r.policy=='learned_clean'),None)
+ if raw and clean and best.policy=='learned_clean':
+  rs=safe_float(raw.validation_metrics.get('silhouette'),-1);cs=safe_float(clean.validation_metrics.get('silhouette'),-1);ra=safe_float(raw.validation_metrics.get('assigned_fraction'),0);ca=safe_float(clean.validation_metrics.get('assigned_fraction'),0)
+  if cs<rs-.015 or ca<max(.35,ra-.12):return raw
+ return best
+def descriptor_allowed(term,noise):
+ n=normalize_term(term)
+ if not n or n in noise.descriptor_blocklist:return False
+ toks=n.split()
+ if any(z in STRUCTURAL_TOKENS or z.startswith('redacted') for z in toks):return False
+ content=[z for z in toks if z not in SAFE_ENGLISH_STOPWORDS and z not in GENERIC_INTERACTION_PRIOR and z not in noise.learned_stopwords];return len(content)>=(1 if len(toks)==1 else 2)
+def cluster_descriptions(sigs,texts,labels,noise,topn):
+ ids=sorted(set(int(x) for x in labels.tolist() if int(x)!=-1))
+ if not ids:return {}
+ docs=[' '.join([y for s,t,l in zip(sigs,texts,labels) if int(l)==cid for y in (str(s),str(t))]) for cid in ids];v=CountVectorizer(ngram_range=(1,3),min_df=1,max_features=60000,token_pattern=r"(?u)\b[a-zA-Z][a-zA-Z0-9_'\-]{1,}\b");x=v.fit_transform(docs).astype(float);terms=np.asarray(v.get_feature_names_out());rs=np.asarray(x.sum(axis=1)).ravel();rs[rs==0]=1;tf=x.multiply(1/rs[:,None]);cdf=np.asarray((x>0).sum(axis=0)).ravel();score=tf.multiply(np.log((1+len(ids))/(1+cdf))+1).toarray();out={}
+ for i,cid in enumerate(ids):
+  cand=[j for j in np.argsort(score[i])[::-1] if score[i,j]>0 and descriptor_allowed(str(terms[j]),noise)];chosen=[]
+  for j in cand:
+   tok=set(str(terms[j]).split())
+   if any(len(tok&set(str(terms[k]).split()))/max(len(tok|set(str(terms[k]).split())),1)>.7 for k in chosen):continue
+   chosen.append(int(j))
+   if len(chosen)>=topn:break
+  kws=[{'term':str(terms[j]),'weight':float(score[i,j])} for j in chosen];out[cid]={'descriptor':' | '.join(x['term'] for x in kws[:5]) or f'cluster_{cid}','keywords':kws}
+ return out
+def cluster_catalog(records,v,l,s,desc,c):
+ rows=[];assigned=max(int(np.sum(l!=-1)),1)
+ for cid in sorted(set(int(x) for x in l.tolist() if int(x)!=-1)):
+  idx=np.flatnonzero(l==cid);cent=v[idx].mean(axis=0);n=float(np.linalg.norm(cent));cent=cent/n if n>0 else cent;coh=float(np.mean(v[idx]@cent)) if len(idx) else np.nan;order=idx[np.argsort(v[idx]@cent)[::-1][:c.representative_examples]];examples=[{'interaction_ref':records[p]['interaction_ref'],'entities':[e['canonical_name'] for e in records[p]['entities'][:8]],'context_types':sorted(set(x['context_type'] for x in records[p]['context']))} for p in order.tolist()];rows.append({'cluster_id':cid,'count':len(idx),'share_of_assigned_pct':100*len(idx)/assigned,'mean_strength':float(np.mean(s[idx])) if len(idx) else np.nan,'cohesion':coh,'descriptor':desc.get(cid,{}).get('descriptor',f'cluster_{cid}'),'top_terms':'; '.join(x['term'] for x in desc.get(cid,{}).get('keywords',[])[:c.top_cluster_terms]),'representative_structures':json.dumps(examples,ensure_ascii=False)})
+ return pd.DataFrame(rows).sort_values('count',ascending=False).reset_index(drop=True) if rows else pd.DataFrame()
+def cluster_similarity_table(v,l,desc):
+ ids=sorted(set(int(x) for x in l.tolist() if int(x)!=-1));cent={}
+ for cid in ids:
+  c=v[l==cid].mean(axis=0);n=float(np.linalg.norm(c));cent[cid]=c/n if n>0 else c
+ rows=[{'cluster_a':a,'cluster_b':b,'cosine_similarity':float(cent[a]@cent[b]),'descriptor_a':desc.get(a,{}).get('descriptor',f'cluster_{a}'),'descriptor_b':desc.get(b,{}).get('descriptor',f'cluster_{b}')} for i,a in enumerate(ids) for b in ids[i+1:]];return pd.DataFrame(rows).sort_values('cosine_similarity',ascending=False).reset_index(drop=True) if rows else pd.DataFrame()
+def descriptor_contamination(desc,noise):
+ terms=[str(x['term']) for p in desc.values() for x in p.get('keywords',[])];return float('nan') if not terms else float(sum(1 for t in terms if not descriptor_allowed(t,noise))/len(terms))
+def save_cluster_heatmap(v,l,desc,path,topn):
+ ids=sorted(set(int(x) for x in l.tolist() if int(x)!=-1))
+ if len(ids)<2:return
+ counts={cid:int(np.sum(l==cid)) for cid in ids};ids=sorted(ids,key=lambda x:counts[x],reverse=True)[:max(2,topn)];cents=[]
+ for cid in ids:
+  c=v[l==cid].mean(axis=0);n=float(np.linalg.norm(c));cents.append(c/n if n>0 else c)
+ mat=np.clip(np.vstack(cents)@np.vstack(cents).T,-1,1)
+ if len(ids)>=3:
+  d=np.clip(1-mat,0,2);np.fill_diagonal(d,0);o=leaves_list(linkage(squareform(d,checks=False),method='average')).tolist();ids=[ids[i] for i in o];mat=mat[np.ix_(o,o)]
+ labels=[f"{cid}: {desc.get(cid,{}).get('descriptor',f'cluster_{cid}').split(' | ')[0][:28]}" for cid in ids];size=max(9,min(18,.58*len(ids)+5));fig,ax=plt.subplots(figsize=(size,size));im=ax.imshow(mat,vmin=-1,vmax=1,aspect='auto');ax.set_title('NORA 4.1.1 semantic cluster centroid similarity');ax.set_xticks(np.arange(len(ids)));ax.set_yticks(np.arange(len(ids)));ax.set_xticklabels(labels,rotation=90,fontsize=8);ax.set_yticklabels(labels,fontsize=8)
+ if len(ids)<=24:
+  for i in range(len(ids)):
+   for j in range(len(ids)):ax.text(j,i,f'{mat[i,j]:.2f}',ha='center',va='center',fontsize=6)
+ fig.colorbar(im,ax=ax,fraction=.046,pad=.04,label='Centroid cosine similarity');fig.tight_layout();fig.savefig(path,dpi=180,bbox_inches='tight');plt.close(fig)
+def save_entity_type_heatmap(records,path):
+ types=sorted(set(e['entity_type'] for r in records for e in r['entities']))
+ if len(types)<2:return
+ idx={t:i for i,t in enumerate(types)};mat=np.zeros((len(types),len(types)))
+ for r in records:
+  p=sorted(set(e['entity_type'] for e in r['entities']))
+  for a in p:mat[idx[a],idx[a]]+=1
+  for i,a in enumerate(p):
+   for b in p[i+1:]:mat[idx[a],idx[b]]+=1;mat[idx[b],idx[a]]+=1
+ d=np.maximum(np.diag(mat),1);m=mat/np.sqrt(d[:,None]*d[None,:]);fig,ax=plt.subplots(figsize=(max(9,len(types)*.5),max(8,len(types)*.45)));im=ax.imshow(m,vmin=0,vmax=1,aspect='auto');ax.set_title('Entity-type interaction co-occurrence');ax.set_xticks(np.arange(len(types)));ax.set_yticks(np.arange(len(types)));ax.set_xticklabels(types,rotation=90,fontsize=8);ax.set_yticklabels(types,fontsize=8);fig.colorbar(im,ax=ax,fraction=.046,pad=.04,label='Normalized co-occurrence');fig.tight_layout();fig.savefig(path,dpi=180,bbox_inches='tight');plt.close(fig)
+def save_cluster_projection(v,l,path,seed,sample_n):
+ if len(v)<5:return
+ rng=np.random.default_rng(seed);idx=np.sort(rng.choice(len(v),sample_n,replace=False)) if sample_n>0 and len(v)>sample_n else np.arange(len(v));vv=v[idx];ll=l[idx];method='t-SNE'
+ try:
+  from umap import UMAP
+  coords=UMAP(n_components=2,n_neighbors=min(30,max(5,int(math.sqrt(len(vv))))),min_dist=.05,metric='cosine',random_state=seed,transform_seed=seed).fit_transform(vv);method='UMAP'
+ except Exception:
+  per=min(30,max(5,(len(vv)-1)//4));coords=TSNE(n_components=2,perplexity=per,init='pca',learning_rate='auto',random_state=seed,metric='cosine').fit_transform(vv)
+ fig,ax=plt.subplots(figsize=(12,9));uniq=sorted(set(int(x) for x in ll.tolist()))
+ for cid in uniq:
+  m=ll==cid;ax.scatter(coords[m,0],coords[m,1],s=12,alpha=.72,label='outlier' if cid==-1 else f'cluster {cid} (n={int(m.sum())})')
+ ax.set_title(f'Entity-context semantic clusters ({method} projection)');ax.set_xlabel(f'{method} component 1');ax.set_ylabel(f'{method} component 2')
+ if len(uniq)<=24:ax.legend(fontsize=7,loc='best')
+ fig.tight_layout();fig.savefig(path,dpi=180,bbox_inches='tight');plt.close(fig)
+def save_cluster_upstream_contingency(records,l,csv_path,png_path,top):
+ pairs=[]
+ for r,cid in zip(records,l.tolist()):
+  up=r.get('upstream_labels_passthrough',{}) or {}
+  if up:
+   lab=max(up.items(),key=lambda x:x[1])[0]
+   if lab:pairs.append((int(cid),str(lab)))
+ if len(pairs)<10:return {'generated':False,'reason':'insufficient_upstream_label_coverage'}
+ df=pd.DataFrame(pairs,columns=['cluster_id','upstream_label']);keep=df.upstream_label.value_counts().head(max(2,top)).index;df=df[df.upstream_label.isin(keep)];m=pd.crosstab(df.cluster_id,df.upstream_label);m.to_csv(csv_path);fig,ax=plt.subplots(figsize=(max(10,.55*m.shape[1]+6),max(8,.42*m.shape[0]+5)));im=ax.imshow(m.to_numpy(float),aspect='auto');ax.set_title('Semantic cluster vs upstream-label contingency (diagnostic only)');ax.set_xlabel('Upstream label');ax.set_ylabel('Semantic cluster');ax.set_xticks(np.arange(m.shape[1]));ax.set_xticklabels(m.columns.astype(str),rotation=90,fontsize=7);ax.set_yticks(np.arange(m.shape[0]));ax.set_yticklabels(m.index.astype(str),fontsize=8);fig.colorbar(im,ax=ax,fraction=.046,pad=.04,label='Count');fig.tight_layout();fig.savefig(png_path,dpi=180,bbox_inches='tight');plt.close(fig);return {'generated':True,'kind':'contingency_matrix_not_classifier_accuracy','rows_used':int(len(df)),'clusters':int(m.shape[0]),'upstream_labels':int(m.shape[1])}
+def flatten_field(records,name):
+ rows=[]
+ for r in records:
+  for item in r[name]:
+   z={'interaction_ref':r['interaction_ref'],**item}
+   for k,v in list(z.items()):
+    if isinstance(v,(list,dict)):z[k]=json.dumps(v,ensure_ascii=False)
+   rows.append(z)
+ return pd.DataFrame(rows)
+def public_dictionary_record(r,cid,strength,desc):
+ out={k:v for k,v in r.items() if not k.startswith('_')};out['semantic_cluster']={'cluster_id':int(cid),'cluster_strength':float(strength),'descriptor':desc};return out
+
+def write_html_summary(outdir,report,catalog,stopwords,phrases,entity_df,context_df,sim,policy):
+ ex=outdir/'executive';ex.mkdir(parents=True,exist_ok=True);q=report['quality'];counts=report['counts'];metrics=pd.DataFrame([{'split':s,**{k:(q.get(s,{}) or {}).get(k) for k in ('silhouette','assigned_fraction','noise_rate','balance_entropy','n_clusters','largest_cluster_share','mean_strength')}} for s in ('train','validation','locked_test')]);et=entity_df.entity_type.value_counts().head(30).rename_axis('entity_type').reset_index(name='count') if not entity_df.empty and 'entity_type' in entity_df else pd.DataFrame();ct=context_df.context_type.value_counts().rename_axis('context_type').reset_index(name='count') if not context_df.empty and 'context_type' in context_df else pd.DataFrame();parts=["<!doctype html><html><head><meta charset='utf-8'><title>NORA Entity-Context 4.1.1</title><style>body{font-family:Arial;margin:28px;color:#222}table{border-collapse:collapse;width:100%;margin:12px 0}th,td{border:1px solid #ccc;padding:7px;font-size:13px}th{background:#111;color:white}.card{background:#f4f4f4;padding:14px;border-radius:8px;margin:12px 0}img{max-width:100%}</style></head><body><h1>NORA Entity-Context 4.1.1</h1>",f"<div class='card'><b>Status:</b> {report['status']}<br><b>Selected noise policy:</b> {report['noise_policy']['selected']}<br><b>Interactions:</b> {counts['interactions']}<br><b>Entities:</b> {counts['entities']}<br><b>Context records:</b> {counts['context_records']}<br><b>Key-values:</b> {counts['key_values']}<br><b>Diagnostic evidence:</b> {counts['diagnostic_evidence']}<br><b>Root-cause records:</b> {counts['root_cause_records']}<br><b>Remediation records:</b> {counts['remediation_records']}<br><b>Relationships:</b> {counts['relationships']}<br><b>Semantic clusters:</b> {counts['semantic_clusters']}<br><b>Learned stopwords:</b> {counts['learned_stopwords']}<br><b>Protected domain signals:</b> {counts['protected_domain_signals']}<br><b>Descriptor contamination:</b> {q['descriptor_contamination_rate']:.4f}</div>","<h2>Boundary</h2><p>This stage extracts and structures entities, context, evidence, root cause, remediation and relationships. Upstream intent labels are pass-through metadata and are not used as training features.</p>","<h2>Noise strategy</h2><p>The final stopword set is learned from the training partition only. Frequency alone is insufficient: dispersion, template position and low discriminative value are required. Structured keys, negation, measurements and discriminative multiword phrases are protected. Raw and learned-clean policies are compared on validation before the clustering path is locked.</p>",'<h2>Noise-policy ablation</h2>',policy.to_html(index=False,float_format=lambda x:f'{x:.4f}' if pd.notna(x) else ''),'<h2>Train / validation / locked-test diagnostics</h2>',metrics.to_html(index=False,float_format=lambda x:f'{x:.4f}' if pd.notna(x) else '')]
+ if not et.empty:parts+=['<h2>Entity types</h2>',et.to_html(index=False)]
+ if not ct.empty:parts+=['<h2>Context types</h2>',ct.to_html(index=False)]
+ if not catalog.empty:parts+=['<h2>Entity-context semantic clusters</h2>',catalog.head(30)[['cluster_id','count','share_of_assigned_pct','mean_strength','cohesion','descriptor']].to_html(index=False,float_format=lambda x:f'{x:.4f}')]
+ if not stopwords.empty:parts+=['<h2>Learned stopwords</h2>',stopwords.head(35)[[c for c in ['term','document_frequency_ratio','cluster_entropy','max_regularized_log_odds_z','stopword_score','reason'] if c in stopwords.columns]].to_html(index=False,float_format=lambda x:f'{x:.4f}')]
+ if not phrases.empty:
+  view=phrases[phrases.selected_as_domain_signal==True].head(35);parts+=['<h2>Protected domain signals</h2>',view[[c for c in ['phrase','document_frequency','specificity','association_npmi','log_odds_z','phrase_score'] if c in view.columns]].to_html(index=False,float_format=lambda x:f'{x:.4f}')]
+ if not sim.empty:parts+=['<h2>Most similar cluster pairs</h2>',sim.head(20).to_html(index=False,float_format=lambda x:f'{x:.4f}')]
+ for img,title in [('semantic_cluster_similarity_heatmap.png','Semantic cluster similarity'),('entity_type_cooccurrence_heatmap.png','Entity-type co-occurrence'),('semantic_cluster_projection.png','2D semantic cluster projection'),('cluster_upstream_contingency_heatmap.png','Cluster/upstream-label diagnostic contingency')]:
+  if (outdir/img).exists():parts+=[f'<h2>{title}</h2>',f"<img src='../{img}'>"]
+ parts+=["<h2>Structured dictionary output</h2><p><code>nora_entity_context_dictionary.jsonl</code> is streaming-friendly and <code>nora_entity_context_dictionary.json</code> is consolidated.</p>","<h2>Classification-style matrix</h2><p>A true confusion matrix is not valid for unsupervised clusters without supervised ground truth. When upstream labels exist, a post-hoc cluster/upstream-label contingency matrix is generated for diagnostics only.</p></body></html>"];p=ex/'nora_entity_context_v4_1_1_summary.html';p.write_text(''.join(parts),encoding='utf-8');return p
+def cache_signature(frame,c,ontology_entries,seed_terms):
+ h=hashlib.sha256();h.update(PIPELINE_VERSION.encode());payload={k:v for k,v in asdict(c).items() if k not in {'outdir','model_dir','persist_model','enable_cache'}};h.update(json.dumps(payload,sort_keys=True,default=str).encode());h.update(json.dumps([asdict(x) for x in ontology_entries],sort_keys=True).encode());h.update(json.dumps(sorted(seed_terms)).encode())
+ for row in frame[['_group','data_split','_role','_sanitized_text']].astype(str).itertuples(index=False,name=None):h.update('\x1f'.join(row).encode('utf-8',errors='ignore'));h.update(b'\n')
+ return h.hexdigest()
+def run_train(c):
+ np.random.seed(c.seed);outdir=Path(c.outdir);outdir.mkdir(parents=True,exist_ok=True);(outdir/'executive').mkdir(parents=True,exist_ok=True);stages=[];started=utc_now_iso();t0=time.perf_counter();frame,schema=load_and_prepare(c);frame,split_audit=assign_splits(frame,c);key,key_source=resolve_pseudonym_key(c);frame['_row_ref']=[pseudonymize(f'{g}|{rid}',key) for g,rid in zip(frame['_group'].astype(str),frame['_row_id'].astype(str))];stages.append({'stage':'load_split_privacy','seconds':time.perf_counter()-t0,'cache_hit':False})
+ t0=time.perf_counter();ontology_entries=load_ontology(c.ontology_path);ontology=OntologyMatcher(ontology_entries,c.ontology_match_threshold);seed_terms=load_stopword_seed(c.stopword_seed_path);pd.DataFrame(ONTOLOGY_ALIGNMENT_ROWS).to_csv(outdir/'ontology_alignment_reference.csv',index=False);pd.DataFrame(columns=['canonical_name','entity_type','synonyms','parent','source','source_ref']).to_csv(outdir/'ontology_lexicon_template.csv',index=False);pd.DataFrame({'term':sorted(seed_terms)}).to_csv(outdir/'stopword_seed_used.csv',index=False);stages.append({'stage':'ontology_and_seed_load','seconds':time.perf_counter()-t0,'cache_hit':False})
+ cache_dir=outdir/c.cache_dir_name;cache_dir.mkdir(parents=True,exist_ok=True);cache_path=cache_dir/f'train_core_{cache_signature(frame,c,ontology_entries,seed_terms)}.joblib';core=None;cache_hit=False
+ if c.enable_cache and cache_path.exists():
+  try:
+   p=joblib.load(cache_path)
+   if p.get('pipeline_version')==PIPELINE_VERSION:core=p['core'];cache_hit=True;LOGGER.info('CACHE HIT: %s',cache_path.name)
+  except Exception as e:LOGGER.warning('Ignoring unreadable cache: %s',e)
+ if core is None:
+  trf=frame[frame.data_split=='train'].copy();texts=trf['_sanitized_text'].astype(str).tolist();t0=time.perf_counter();prov=fit_preliminary_partition(texts,c.seed);structured=derive_structured_protected_terms(trf);phrases=mine_protected_phrases(texts,prov,seed_terms,c);noise,audit,stopwords=learn_noise_model(texts,prov,structured,phrases,seed_terms,c);stages.append({'stage':'learned_stopwords_and_phrase_protection','seconds':time.perf_counter()-t0,'cache_hit':False})
+  t0=time.perf_counter();results=[];recordsets={}
+  for policy in ('raw','learned_clean'):
+   LOGGER.info('Fitting clustering policy: %s',policy);res,recs=fit_policy(policy,frame,phrases,ontology,noise,key,c);results.append(res);recordsets[policy]=recs
+  selected=choose_policy(results);records=recordsets[selected.policy];policy_table=build_policy_table(results);stages.append({'stage':'noise_policy_ablation_and_clustering','seconds':time.perf_counter()-t0,'cache_hit':False});t0=time.perf_counter();train_records=[r for r in records if r['data_split']=='train'];val_records=[r for r in records if r['data_split']=='validation'];test_records=[r for r in records if r['data_split']=='locked_test'];desc=cluster_descriptions([r['_descriptor_text'] for r in train_records],[r['_clean_text'] for r in train_records],selected.train_labels,noise,c.top_cluster_terms);test_metrics=validation_metrics(selected.cluster_model,selected.latent,test_records,c);contam=descriptor_contamination(desc,noise);stages.append({'stage':'locked_test_and_descriptors','seconds':time.perf_counter()-t0,'cache_hit':False});core={'noise_model':noise,'noise_audit':audit,'stopwords_export':stopwords,'phrase_table':phrases,'policy_table':policy_table,'selected_policy':selected.policy,'records':records,'train_records':train_records,'val_records':val_records,'test_records':test_records,'latent':selected.latent,'cluster_model':selected.cluster_model,'train_vectors':selected.train_vectors,'train_labels':selected.train_labels,'train_strengths':selected.train_strengths,'search':selected.search_table,'descriptions':desc,'train_metrics':selected.train_metrics,'val_metrics':selected.validation_metrics,'test_metrics':test_metrics,'descriptor_contamination_rate':contam}
+  if c.enable_cache:
+   tmp=cache_path.with_suffix('.tmp.joblib');joblib.dump({'pipeline_version':PIPELINE_VERSION,'core':core},tmp,compress=3);os.replace(tmp,cache_path)
+ else:stages.append({'stage':'train_core_cache','seconds':0.0,'cache_hit':True})
+ noise=core['noise_model'];audit=core['noise_audit'];stopwords=core['stopwords_export'];phrases=core['phrase_table'];policy_table=core['policy_table'];records=core['records'];latent=core['latent'];cluster_model=core['cluster_model'];train_labels=core['train_labels'];train_strengths=core['train_strengths'];desc=core['descriptions'];search=core['search'];t0=time.perf_counter();all_v=latent.transform([r['_clean_text'] for r in records],[r['semantic_signature'] for r in records]);all_l,all_s=predict_cluster(cluster_model,all_v);tp=[i for i,r in enumerate(records) if r['data_split']=='train']
+ if len(tp)==len(train_labels):
+  for pos,lab,st in zip(tp,train_labels.tolist(),train_strengths.tolist()):all_l[pos]=int(lab);all_s[pos]=float(st)
+ catalog=cluster_catalog(records,all_v,all_l,all_s,desc,c);sim=cluster_similarity_table(all_v,all_l,desc);stages.append({'stage':'all_split_transform_catalog','seconds':time.perf_counter()-t0,'cache_hit':False});t0=time.perf_counter();public=[public_dictionary_record(r,int(all_l[i]),float(all_s[i]),'unassigned' if int(all_l[i])==-1 else desc.get(int(all_l[i]),{}).get('descriptor',f'cluster_{int(all_l[i])}')) for i,r in enumerate(records)];jsonl=outdir/'nora_entity_context_dictionary.jsonl'
+ with jsonl.open('w',encoding='utf-8') as h:
+  for r in public:h.write(json.dumps(to_plain(r),ensure_ascii=False)+'\n')
+ jsonp=outdir/'nora_entity_context_dictionary.json';jsonp.write_text(json.dumps(to_plain({'pipeline':PIPELINE_NAME,'pipeline_version':PIPELINE_VERSION,'scope_lock':SCOPE_LOCK,'records':public}),indent=2,ensure_ascii=False),encoding='utf-8');entity_df=flatten_field(public,'entities');context_df=flatten_field(public,'context');kv_df=flatten_field(public,'key_values');evidence_df=flatten_field(public,'diagnostic_evidence');cause_df=flatten_field(public,'root_cause');rem_df=flatten_field(public,'remediation');rel_df=flatten_field(public,'relationships')
+ for df,name in [(entity_df,'entities.csv'),(context_df,'context.csv'),(kv_df,'key_values.csv'),(evidence_df,'diagnostic_evidence.csv'),(cause_df,'root_cause.csv'),(rem_df,'remediation.csv'),(rel_df,'relationships.csv'),(audit,'noise_learning_audit.csv'),(stopwords,'learned_stopwords.csv'),(phrases,'protected_domain_signals.csv'),(policy_table,'noise_policy_ablation.csv'),(search,'cluster_model_search.csv'),(catalog,'semantic_cluster_catalog.csv'),(sim,'similar_cluster_pairs.csv')]:df.to_csv(outdir/name,index=False)
+ save_cluster_heatmap(all_v,all_l,desc,outdir/'semantic_cluster_similarity_heatmap.png',c.heatmap_top_n);save_entity_type_heatmap(public,outdir/'entity_type_cooccurrence_heatmap.png');save_cluster_projection(all_v,all_l,outdir/'semantic_cluster_projection.png',c.seed,c.projection_sample);cont_info=save_cluster_upstream_contingency(public,all_l,outdir/'cluster_upstream_contingency_matrix.csv',outdir/'cluster_upstream_contingency_heatmap.png',c.contingency_top_labels);stages.append({'stage':'exports_and_visuals','seconds':time.perf_counter()-t0,'cache_hit':False});model_info={}
+ if c.persist_model:
+  t0=time.perf_counter();bundle=PipelineBundle(PIPELINE_NAME,PIPELINE_VERSION,[asdict(x) for x in ontology_entries],noise,phrases.to_dict('records'),str(core['selected_policy']),latent,cluster_model,desc,{k:v for k,v in asdict(c).items() if k not in {'input_path','outdir','model_dir'}});mp=outdir/'nora_entity_context_v4_1_1_model.joblib';joblib.dump({'artifact_format':ARTIFACT_FORMAT_VERSION,'runtime_versions':package_versions(),'bundle':bundle},mp,compress=3);model_info={'model_file':mp.name,'model_sha256':sha256_file(mp)};stages.append({'stage':'model_persistence','seconds':time.perf_counter()-t0,'cache_hit':False})
+ counts={
+  'interactions':len(public),'entities':len(entity_df),'context_records':len(context_df),'key_values':len(kv_df),
+  'diagnostic_evidence':len(evidence_df),'root_cause_records':len(cause_df),'remediation_records':len(rem_df),
+  'relationships':len(rel_df),'learned_stopwords':len(noise.learned_stopwords),'template_phrases':len(noise.template_phrases),
+  'protected_domain_signals':int(phrases.selected_as_domain_signal.sum()) if not phrases.empty else 0,
+  'semantic_clusters':len(set(int(x) for x in all_l.tolist() if int(x)!=-1))}
+ quality={'train':core['train_metrics'],'validation':core['val_metrics'],'locked_test':core['test_metrics'],
+  'descriptor_contamination_rate':core['descriptor_contamination_rate'],'cluster_method':cluster_model.method,
+  'cluster_parameters':cluster_model.parameters,'stability_ari':cluster_model.stability_ari,'outlier_jaccard':cluster_model.outlier_jaccard}
+ report={'pipeline':PIPELINE_NAME,'pipeline_version':PIPELINE_VERSION,'status':'SUCCESS','started_at_utc':started,
+  'completed_at_utc':utc_now_iso(),'cache_hit':cache_hit,'runtime_versions':package_versions(),'schema':schema,
+  'split_audit':split_audit,'scope_lock':SCOPE_LOCK,
+  'noise_policy':{'selected':core['selected_policy'],'ablation_file':'noise_policy_ablation.csv',
+                  'learned_stopword_file':'learned_stopwords.csv','protected_signal_file':'protected_domain_signals.csv'},
+  'counts':counts,'quality':quality,
+  'ontology':{'external_entries_loaded':len(ontology_entries),'alignment_reference':'ontology_alignment_reference.csv',
+              'alignment_families':['TR290/TR290V','TR292','TR292A','TR292C','TR292D','TR292G']},
+  'dictionary_outputs':{'jsonl':jsonl.name,'json':jsonp.name},'cluster_label_matrix':cont_info,
+  'privacy':{'raw_identifiers_exported':False,'pseudonym_key_source':key_source},'model':model_info,'stage_metrics':stages}
+ rp=outdir/'nora_entity_context_v4_1_1_report.json';rp.write_text(json.dumps(to_plain(report),indent=2,ensure_ascii=False),encoding='utf-8')
+ pd.DataFrame(stages).to_csv(outdir/'stage_metrics.csv',index=False)
+ html=write_html_summary(outdir,report,catalog,stopwords,phrases,entity_df,context_df,sim,policy_table)
+ manifest={'artifact_format':ARTIFACT_FORMAT_VERSION,'pipeline':PIPELINE_NAME,'pipeline_version':PIPELINE_VERSION,
+  'created_at_utc':utc_now_iso(),'runtime_versions':package_versions(),
+  'artifacts':{'model':model_info,'report':{'file':rp.name,'sha256':sha256_file(rp)},
+               'dictionary_json':{'file':jsonp.name,'sha256':sha256_file(jsonp)},
+               'dictionary_jsonl':{'file':jsonl.name,'sha256':sha256_file(jsonl)},
+               'html':{'file':str(html.relative_to(outdir)),'sha256':sha256_file(html)}}}
+ (outdir/'model_manifest.json').write_text(json.dumps(to_plain(manifest),indent=2,ensure_ascii=False),encoding='utf-8')
+ LOGGER.info('COMPLETE: %s',outdir.resolve());return report
+
+def run_inference(c):
+ outdir=Path(c.outdir);outdir.mkdir(parents=True,exist_ok=True);md=Path(c.model_dir or '');mf=md/'model_manifest.json'
+ if not mf.exists():raise FileNotFoundError(f'Model manifest not found: {mf}')
+ manifest=json.loads(mf.read_text(encoding='utf-8'));meta=manifest.get('artifacts',{}).get('model',{});model_file=meta.get('model_file')
+ if not model_file:raise RuntimeError('Model file is not recorded in the manifest.')
+ mp=md/model_file
+ if meta.get('model_sha256') and sha256_file(mp)!=meta['model_sha256']:raise RuntimeError('Model checksum mismatch.')
+ payload=joblib.load(mp)
+ if payload.get('artifact_format')!=ARTIFACT_FORMAT_VERSION:raise RuntimeError('Artifact format mismatch; retrain with NORA Entity-Context 4.1.1.')
+ bundle=payload['bundle'];frame,schema=load_and_prepare(c);key,key_source=resolve_pseudonym_key(c);frame['data_split']='inference';frame['_row_ref']=[pseudonymize(f'{g}|{rid}',key) for g,rid in zip(frame['_group'].astype(str),frame['_row_id'].astype(str))];ontology=OntologyMatcher([OntologyEntry(**x) for x in bundle.ontology_entries],c.ontology_match_threshold);pt=pd.DataFrame(bundle.domain_phrases);records=build_interaction_records(frame,pt,ontology,bundle.noise_model,key,bundle.selected_noise_policy);v=bundle.latent_model.transform([r['_clean_text'] for r in records],[r['semantic_signature'] for r in records]);l,s=predict_cluster(bundle.cluster_model,v);public=[public_dictionary_record(r,int(l[i]),float(s[i]),'unassigned' if int(l[i])==-1 else bundle.cluster_descriptions.get(int(l[i]),{}).get('descriptor',f'cluster_{int(l[i])}')) for i,r in enumerate(records)];out=outdir/'nora_entity_context_inference.jsonl'
+ with out.open('w',encoding='utf-8') as h:
+  for r in public:h.write(json.dumps(to_plain(r),ensure_ascii=False)+'\n')
+ rep={'pipeline':PIPELINE_NAME,'pipeline_version':PIPELINE_VERSION,'mode':'infer','input_rows':len(frame),'interaction_records':len(public),'assigned_fraction':float(np.mean(l!=-1)) if len(l) else 0,'pseudonym_key_source':key_source,'schema':schema,'noise_policy':bundle.selected_noise_policy,'output':out.name};(outdir/'nora_entity_context_inference_report.json').write_text(json.dumps(to_plain(rep),indent=2),encoding='utf-8');return rep
+
+def parse_args(argv=None):
+ p=argparse.ArgumentParser(description=PIPELINE_NAME);p.add_argument('--mode',choices=['train','infer'],default='train');p.add_argument('--profile',choices=['fast_dev','production'],default='production');p.add_argument('--input',required=True,dest='input_path');p.add_argument('--outdir',default='nora_entity_context_v411_out');p.add_argument('--model-dir');p.add_argument('--ontology',dest='ontology_path');p.add_argument('--stopword-seed',dest='stopword_seed_path');p.add_argument('--seed',type=int,default=42);p.add_argument('--sample',type=int,default=0,dest='sample_rows');p.add_argument('--test-size',type=float,default=.20);p.add_argument('--validation-within-development',type=float,default=.15);p.add_argument('--split-trials',type=int,default=64);p.add_argument('--max-word-features',type=int,default=70000);p.add_argument('--max-char-features',type=int,default=90000);p.add_argument('--max-semantic-features',type=int,default=50000);p.add_argument('--svd-components',type=int,default=192);p.add_argument('--candidate-noise-features',type=int,default=70000);p.add_argument('--noise-ngram-max',type=int,default=3);p.add_argument('--model-search-trials',type=int,default=20);p.add_argument('--stability-repeats',type=int,default=4);p.add_argument('--search-sample-rows',type=int,default=8000);p.add_argument('--transform-batch-size',type=int,default=4096);p.add_argument('--representative-examples',type=int,default=4);p.add_argument('--ontology-match-threshold',type=float,default=.82);p.add_argument('--phrase-min-df',type=int,default=3);p.add_argument('--phrase-top-candidates',type=int,default=5000);p.add_argument('--semantic-weight',type=float,default=2.10);p.add_argument('--word-weight',type=float,default=.75);p.add_argument('--char-weight',type=float,default=.30);p.add_argument('--no-persist-model',action='store_true');p.add_argument('--no-cache',action='store_true');p.add_argument('--pseudonym-key-env',default='NORA_PSEUDONYM_KEY');p.add_argument('--heatmap-top-n',type=int,default=24);p.add_argument('--top-cluster-terms',type=int,default=10);p.add_argument('--projection-sample',type=int,default=3000);p.add_argument('--contingency-top-labels',type=int,default=25);a=p.parse_args(argv)
+ if not .05<=a.test_size<=.40:p.error('--test-size must be between 0.05 and 0.40')
+ if not .05<=a.validation_within_development<=.35:p.error('--validation-within-development must be between 0.05 and 0.35')
+ if a.mode=='infer' and not a.model_dir:p.error('--model-dir is required for inference')
+ if a.profile=='fast_dev':a.model_search_trials=min(a.model_search_trials,8);a.stability_repeats=min(a.stability_repeats,3);a.search_sample_rows=min(a.search_sample_rows,4000);a.phrase_top_candidates=min(a.phrase_top_candidates,2500);a.svd_components=min(a.svd_components,128);a.projection_sample=min(a.projection_sample,1500)
+ return Config(input_path=a.input_path,outdir=a.outdir,mode=a.mode,model_dir=a.model_dir,ontology_path=a.ontology_path,stopword_seed_path=a.stopword_seed_path,profile=a.profile,seed=a.seed,sample_rows=a.sample_rows,test_size=a.test_size,validation_within_development=a.validation_within_development,split_trials=a.split_trials,max_word_features=a.max_word_features,max_char_features=a.max_char_features,max_semantic_features=a.max_semantic_features,svd_components=a.svd_components,candidate_noise_features=a.candidate_noise_features,noise_ngram_max=a.noise_ngram_max,model_search_trials=a.model_search_trials,stability_repeats=a.stability_repeats,search_sample_rows=a.search_sample_rows,transform_batch_size=a.transform_batch_size,representative_examples=a.representative_examples,ontology_match_threshold=a.ontology_match_threshold,phrase_min_df=a.phrase_min_df,phrase_top_candidates=a.phrase_top_candidates,semantic_weight=a.semantic_weight,word_weight=a.word_weight,char_weight=a.char_weight,persist_model=not a.no_persist_model,enable_cache=not a.no_cache,pseudonym_key_env=a.pseudonym_key_env,heatmap_top_n=a.heatmap_top_n,top_cluster_terms=a.top_cluster_terms,projection_sample=a.projection_sample,contingency_top_labels=a.contingency_top_labels)
+def main(argv=None):
+ configure_logging()
+ try:
+  c=parse_args(argv);run_train(c) if c.mode=='train' else run_inference(c);return 0
+ except KeyboardInterrupt:LOGGER.error('Interrupted by user.');return 130
+ except Exception as e:LOGGER.exception('Pipeline failed: %s',e);return 1
+if __name__=='__main__':sys.exit(main())

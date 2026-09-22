@@ -1,0 +1,1725 @@
+#!/usr/bin/env python3
+"""
+NORA V5.7.2 Interactive Knowledge Graph Builder
+================================================
+
+Builds a browser-ready, evidence-aware graph from the CSV artifacts produced by
+NORA Entity-Context v5.7.2. This is a downstream visualization/export layer; it
+does not modify the V5.7.2 analytics pipeline or reinterpret intent labels.
+
+Primary hierarchy
+-----------------
+Context Family -> Context Pattern -> Context Leaf -> Interaction (optional)
+
+Semantic layers
+---------------
+Participant, Entity, Context Fact, Tool, Root Cause, Remediation, Relation
+Motif/Fingerprint, Diagnostic Evidence, and evidence-grounded typed relations.
+
+Edge contract
+-------------
+* aggregation: navigation / membership / cluster containment edges created by
+  this graph builder (HAS_PATTERN, HAS_LEAF, HAS_ENTITY, ...).
+* semantic: typed, evidence-grounded relations copied from
+  grounded_relationships.csv.
+
+Production hardening
+--------------------
+* Missing/empty OPTIONAL CSVs do not crash graph generation.
+* The required context_pattern_assignments.csv is validated strictly.
+* UTF-8 BOM and common Windows encodings are handled.
+* Parser fallback is attempted and every load decision is written to
+  artifact_load_audit.csv + graph_build_report.json.
+* Stable deterministic node/edge IDs are used across reruns.
+* Graph integrity is validated before files are committed.
+* If viewer.html is beside this script, it is copied automatically to the
+  output directory unless --no-viewer-copy is supplied.
+
+Typical Windows PowerShell usage
+--------------------------------
+python .\nora_v572_graph_builder.py `
+  --input-dir ".\nora_v572_full" `
+  --output-dir ".\nnora_v572_graph" `
+  --include-interactions `
+  --include-fingerprints
+
+Then:
+python -m http.server 8000 --directory ".\nora_v572_graph"
+Open: http://127.0.0.1:8000/viewer.html
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import logging
+import math
+import re
+import shutil
+import sys
+from collections import Counter, defaultdict
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Any, Dict, Iterable, Mapping, MutableMapping, Optional, Sequence, Tuple
+
+import numpy as np
+import pandas as pd
+
+PIPELINE = "NORA Entity-Context v5.7.2"
+GRAPH_BUILDER_VERSION = "2.0.0"
+GRAPH_SCHEMA_VERSION = "nora-v572-knowledge-graph-2"
+LOGGER = logging.getLogger("nora_v572_graph_builder")
+
+# V5.7.2 artifacts. Only assignments is required. Every other layer is
+# optional because a valid run may legitimately produce zero rows for a layer.
+FILES: Dict[str, str] = {
+    "assignments": "context_pattern_assignments.csv",
+    "patterns": "context_pattern_cluster_catalog.csv",
+    "families": "context_family_catalog.csv",
+    "leaves": "hierarchical_context_pattern_leaf_catalog.csv",
+    "participants": "participants.csv",
+    "entities": "entities.csv",
+    "context_facts": "context_facts.csv",
+    "root_cause": "root_cause.csv",
+    "remediation": "remediation.csv",
+    "relationships": "grounded_relationships.csv",
+    "motifs": "relation_motif_cluster_catalog.csv",
+    "fingerprints": "interaction_fingerprints.csv",
+    "diagnostics": "diagnostic_evidence.csv",
+    "attributes": "attributes.csv",
+    "measurements": "measurements.csv",
+}
+
+TOOL_FILE_CANDIDATES = (
+    "tools.csv",
+    "tool_history.csv",
+    "tool_usage.csv",
+    "tool-history.csv",
+    "tool-history-uat.csv",
+)
+
+NODE_STYLE: Dict[str, Dict[str, Any]] = {
+    "CONTEXT_FAMILY": {"color": "#e74c3c", "shape": "dot", "size": 30},
+    "CONTEXT_PATTERN": {"color": "#f39c12", "shape": "dot", "size": 26},
+    "CONTEXT_LEAF": {"color": "#f1c40f", "shape": "dot", "size": 22},
+    "INTERACTION": {"color": "#8e44ad", "shape": "dot", "size": 10},
+    "PARTICIPANT": {"color": "#3498db", "shape": "dot", "size": 15},
+    "ENTITY": {"color": "#1abc9c", "shape": "dot", "size": 14},
+    "CONTEXT_FACT": {"color": "#2ecc71", "shape": "dot", "size": 13},
+    "TOOL": {"color": "#16a085", "shape": "diamond", "size": 16},
+    "ROOT_CAUSE": {"color": "#c0392b", "shape": "triangle", "size": 16},
+    "REMEDIATION": {"color": "#27ae60", "shape": "box", "size": 16},
+    "RELATION_MOTIF": {"color": "#9b59b6", "shape": "hexagon", "size": 16},
+    "FINGERPRINT": {"color": "#6c5ce7", "shape": "hexagon", "size": 13},
+    "EVIDENCE": {"color": "#95a5a6", "shape": "dot", "size": 9},
+    "ATTRIBUTE": {"color": "#7f8c8d", "shape": "dot", "size": 10},
+    "MEASUREMENT": {"color": "#34495e", "shape": "dot", "size": 11},
+    "CUSTOMER_PROBLEM": {"color": "#d35400", "shape": "ellipse", "size": 18},
+    "DIAGNOSTIC": {"color": "#2980b9", "shape": "dot", "size": 13},
+    "STATE": {"color": "#2c3e50", "shape": "dot", "size": 12},
+    "SYMPTOM_OR_IMPACT": {"color": "#e67e22", "shape": "dot", "size": 13},
+    "TEMPORAL": {"color": "#bdc3c7", "shape": "dot", "size": 10},
+}
+
+ENTITY_SEMANTIC_TYPES = {
+    "SERVICE",
+    "DEVICE_MODEL",
+    "DEVICE_TYPE",
+    "NETWORK_TECHNOLOGY",
+    "NETWORK_PROTOCOL",
+    "NETWORK_CONFIGURATION",
+    "NETWORK_RESOURCE",
+    "PRODUCT",
+    "PLAN_OR_SOC",
+    "METRIC",
+    "ORGANIZATION",
+}
+
+CONTEXT_SEMANTIC_TYPES = {
+    "CUSTOMER_PROBLEM",
+    "SYMPTOM_OR_IMPACT",
+    "DIAGNOSTIC",
+    "STATE",
+    "TEMPORAL",
+}
+
+EMPTY_VALUES = {"", "nan", "none", "null"}
+METADATA_FIELD_LIMIT = 24
+METADATA_STRING_LIMIT = 1200
+METADATA_SAMPLE_LIMIT = 10
+
+
+def configure_logging(verbose: bool = False) -> None:
+    logging.basicConfig(
+        level=logging.DEBUG if verbose else logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+
+def norm_text(v: Any) -> str:
+    if v is None:
+        return ""
+    try:
+        if pd.isna(v):
+            return ""
+    except Exception:
+        pass
+    s = str(v)
+    if s.strip().lower() in EMPTY_VALUES:
+        return ""
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def norm_key(v: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", norm_text(v).lower()).strip("_")
+
+
+def norm_label(v: Any) -> str:
+    return norm_text(v).casefold()
+
+
+def safe_float(v: Any, default: Optional[float] = None) -> Optional[float]:
+    try:
+        x = float(v)
+        return x if math.isfinite(x) else default
+    except Exception:
+        return default
+
+
+def safe_int(v: Any, default: int = 0) -> int:
+    try:
+        x = int(float(v))
+        return x
+    except Exception:
+        return default
+
+
+def stable_id(namespace: str, *parts: Any, length: int = 20) -> str:
+    payload = "|".join([namespace] + [norm_text(x) for x in parts]).encode("utf-8", errors="ignore")
+    prefix = re.sub(r"[^A-Za-z0-9]", "", namespace.upper())[:4] or "NODE"
+    return f"{prefix}_{hashlib.sha256(payload).hexdigest()[:length]}"
+
+
+def _json_scalar(v: Any) -> Any:
+    if isinstance(v, np.generic):
+        return v.item()
+    if isinstance(v, pd.Timestamp):
+        return v.isoformat()
+    if isinstance(v, Path):
+        return str(v)
+    if isinstance(v, (str, int, float, bool)) or v is None:
+        return v
+    return str(v)
+
+
+def compact_value(v: Any) -> Any:
+    if isinstance(v, Mapping):
+        return {str(k): compact_value(x) for k, x in list(v.items())[:METADATA_FIELD_LIMIT]}
+    if isinstance(v, (list, tuple, set)):
+        return [compact_value(x) for x in list(v)[:METADATA_SAMPLE_LIMIT]]
+    v = _json_scalar(v)
+    if isinstance(v, str) and len(v) > METADATA_STRING_LIMIT:
+        return v[:METADATA_STRING_LIMIT] + "…"
+    return v
+
+
+def compact_meta(row: Mapping[str, Any], limit: int = METADATA_FIELD_LIMIT) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for k, v in dict(row or {}).items():
+        if str(k).startswith("_"):
+            continue
+        text = norm_text(v)
+        if not text:
+            continue
+        if len(out) >= limit:
+            break
+        out[str(k)] = compact_value(v)
+    return out
+
+
+def merge_metadata(target: MutableMapping[str, Any], incoming: Optional[Mapping[str, Any]]) -> None:
+    """Merge metadata without losing conflicting values.
+
+    The first scalar is retained as the primary value. If later rows carry a
+    different scalar for the same key, a `<key>_samples` list is maintained so
+    aggregated graph edges/nodes preserve representative provenance.
+    """
+    if not incoming:
+        return
+    for k, raw in incoming.items():
+        v = compact_value(raw)
+        if v in ("", None, [], {}):
+            continue
+        if k not in target:
+            target[k] = v
+            continue
+        if target[k] == v:
+            continue
+        sample_key = f"{k}_samples"
+        vals = list(target.get(sample_key, [])) if isinstance(target.get(sample_key), list) else []
+        if target[k] not in vals:
+            vals.append(target[k])
+        if v not in vals and len(vals) < METADATA_SAMPLE_LIMIT:
+            vals.append(v)
+        target[sample_key] = vals[:METADATA_SAMPLE_LIMIT]
+
+
+@dataclass
+class ArtifactLoadAudit:
+    key: str
+    file: str
+    required: bool
+    exists: bool
+    size_bytes: int
+    status: str
+    rows: int = 0
+    columns: int = 0
+    encoding: str = ""
+    parser: str = ""
+    error: str = ""
+
+
+class CsvLoader:
+    """Resilient CSV loader with explicit audit trail."""
+
+    def __init__(self, strict_optional: bool = False) -> None:
+        self.strict_optional = strict_optional
+        self.audit: list[ArtifactLoadAudit] = []
+
+    def _record(self, audit: ArtifactLoadAudit) -> None:
+        self.audit.append(audit)
+        if audit.status.startswith("LOADED"):
+            LOGGER.info("Loaded %-38s rows=%-7d cols=%-3d", audit.file, audit.rows, audit.columns)
+        elif audit.required:
+            LOGGER.error("Required artifact %s: %s", audit.file, audit.status)
+        else:
+            LOGGER.warning("Optional artifact %s: %s", audit.file, audit.status)
+
+    def read(self, path: Path, *, key: str, required: bool = False) -> pd.DataFrame:
+        path = Path(path)
+        exists = path.exists() and path.is_file()
+        size = int(path.stat().st_size) if exists else 0
+        base = ArtifactLoadAudit(key=key, file=path.name, required=required, exists=exists, size_bytes=size, status="")
+
+        if not exists:
+            base.status = "MISSING_REQUIRED" if required else "MISSING_OPTIONAL"
+            self._record(base)
+            if required or self.strict_optional:
+                raise FileNotFoundError(f"CSV artifact not found: {path}")
+            return pd.DataFrame()
+
+        if size == 0:
+            base.status = "EMPTY_REQUIRED" if required else "EMPTY_OPTIONAL"
+            self._record(base)
+            if required or self.strict_optional:
+                raise pd.errors.EmptyDataError(f"CSV artifact is zero bytes: {path}")
+            return pd.DataFrame()
+
+        attempts = (
+            ("utf-8-sig", "c", "error"),
+            ("utf-8", "python", "warn"),
+            ("cp1252", "python", "warn"),
+        )
+        errors: list[str] = []
+        for encoding, engine, on_bad_lines in attempts:
+            try:
+                df = pd.read_csv(
+                    path,
+                    low_memory=False if engine == "c" else None,
+                    encoding=encoding,
+                    engine=engine,
+                    on_bad_lines=on_bad_lines,
+                ).fillna("")
+                base.rows = int(len(df))
+                base.columns = int(len(df.columns))
+                base.encoding = encoding
+                base.parser = engine
+                base.status = "LOADED" if engine == "c" else "LOADED_FALLBACK"
+                if df.shape[1] == 0:
+                    base.status = "NO_COLUMNS_REQUIRED" if required else "NO_COLUMNS_OPTIONAL"
+                    self._record(base)
+                    if required or self.strict_optional:
+                        raise ValueError(f"CSV has no columns: {path}")
+                    return pd.DataFrame()
+                if df.empty:
+                    # Header-only files are valid optional artifacts.
+                    base.status = "HEADER_ONLY_REQUIRED" if required else "HEADER_ONLY_OPTIONAL"
+                    self._record(base)
+                    if required:
+                        raise ValueError(f"Required CSV contains headers but no rows: {path}")
+                    return df
+                self._record(base)
+                return df
+            except pd.errors.EmptyDataError as exc:
+                errors.append(f"{encoding}/{engine}: EmptyDataError: {exc}")
+                break
+            except (UnicodeDecodeError, pd.errors.ParserError) as exc:
+                errors.append(f"{encoding}/{engine}: {type(exc).__name__}: {exc}")
+                continue
+            except Exception as exc:
+                errors.append(f"{encoding}/{engine}: {type(exc).__name__}: {exc}")
+                continue
+
+        base.error = " | ".join(errors)[-2500:]
+        if any("EmptyDataError" in x for x in errors):
+            base.status = "EMPTY_REQUIRED" if required else "EMPTY_OPTIONAL"
+        else:
+            base.status = "READ_ERROR_REQUIRED" if required else "READ_ERROR_OPTIONAL"
+        self._record(base)
+        if required or self.strict_optional:
+            raise RuntimeError(f"Unable to read CSV {path}: {base.error}")
+        return pd.DataFrame()
+
+
+def first_col(df: pd.DataFrame, candidates: Sequence[str]) -> Optional[str]:
+    if df is None or df.shape[1] == 0:
+        return None
+    exact = {str(c).casefold(): c for c in df.columns}
+    for x in candidates:
+        if x.casefold() in exact:
+            return exact[x.casefold()]
+    normalized = {norm_key(c): c for c in df.columns}
+    for x in candidates:
+        if norm_key(x) in normalized:
+            return normalized[norm_key(x)]
+    return None
+
+
+def catalog_map(
+    df: pd.DataFrame,
+    id_candidates: Sequence[str],
+    meaning_candidates: Sequence[str],
+) -> Dict[str, Dict[str, Any]]:
+    if df.empty:
+        return {}
+    id_col = first_col(df, id_candidates)
+    meaning_col = first_col(df, meaning_candidates)
+    if not id_col:
+        return {}
+    out: Dict[str, Dict[str, Any]] = {}
+    for _, r in df.iterrows():
+        rid = norm_text(r.get(id_col))
+        if not rid:
+            continue
+        row = r.to_dict()
+        row["_meaning"] = norm_text(r.get(meaning_col)) if meaning_col else rid
+        out[rid] = row
+    return out
+
+
+@dataclass
+class Node:
+    id: str
+    type: str
+    label: str
+    parent_id: Optional[str] = None
+    level: int = 0
+    count: int = 0
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    source_artifacts: set[str] = field(default_factory=set)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "type": self.type,
+            "label": self.label,
+            "parent_id": self.parent_id,
+            "level": int(self.level),
+            "count": int(self.count),
+            "metadata": self.metadata,
+            "source_artifacts": sorted(self.source_artifacts),
+            "style": NODE_STYLE.get(self.type, {"color": "#7f8c8d", "shape": "dot", "size": 11}),
+        }
+
+
+@dataclass
+class Edge:
+    id: str
+    source: str
+    target: str
+    predicate: str
+    kind: str
+    count: int = 0
+    confidence_sum: float = 0.0
+    confidence_n: int = 0
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    source_artifacts: set[str] = field(default_factory=set)
+
+    def add_conf(self, value: Any) -> None:
+        x = safe_float(value)
+        if x is not None:
+            self.confidence_sum += x
+            self.confidence_n += 1
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "source": self.source,
+            "target": self.target,
+            "predicate": self.predicate,
+            "kind": self.kind,
+            "count": int(self.count),
+            "mean_confidence": self.confidence_sum / self.confidence_n if self.confidence_n else None,
+            "metadata": self.metadata,
+            "source_artifacts": sorted(self.source_artifacts),
+        }
+
+
+class GraphStore:
+    def __init__(self) -> None:
+        self.nodes: Dict[str, Node] = {}
+        self.edges: Dict[Tuple[str, str, str, str], Edge] = {}
+
+    def add_node(
+        self,
+        node_id: str,
+        node_type: str,
+        label: str,
+        *,
+        parent_id: Optional[str] = None,
+        level: int = 0,
+        count: int = 0,
+        metadata: Optional[Mapping[str, Any]] = None,
+        source_artifact: Optional[str] = None,
+    ) -> str:
+        if not node_id:
+            return ""
+        clean_label = norm_text(label) or node_id
+        if node_id not in self.nodes:
+            self.nodes[node_id] = Node(
+                id=node_id,
+                type=node_type,
+                label=clean_label,
+                parent_id=parent_id,
+                level=int(level),
+                count=max(0, int(count)),
+                metadata={},
+            )
+            merge_metadata(self.nodes[node_id].metadata, metadata)
+        else:
+            n = self.nodes[node_id]
+            n.count += max(0, int(count))
+            if parent_id and not n.parent_id:
+                n.parent_id = parent_id
+            n.level = min(n.level, int(level)) if n.level is not None else int(level)
+            if len(clean_label) > len(n.label) and n.label.startswith(("Context ", "Interaction ")):
+                n.label = clean_label
+            merge_metadata(n.metadata, metadata)
+        if source_artifact:
+            self.nodes[node_id].source_artifacts.add(source_artifact)
+        return node_id
+
+    def add_edge(
+        self,
+        source: str,
+        target: str,
+        predicate: str,
+        *,
+        kind: str,
+        count: int = 1,
+        confidence: Any = None,
+        metadata: Optional[Mapping[str, Any]] = None,
+        source_artifact: Optional[str] = None,
+    ) -> str:
+        if not source or not target or source == target:
+            return ""
+        pred = norm_text(predicate) or "RELATED_TO"
+        key = (source, target, pred, kind)
+        if key not in self.edges:
+            self.edges[key] = Edge(
+                id=stable_id("edge", source, pred, target, kind, length=24),
+                source=source,
+                target=target,
+                predicate=pred,
+                kind=kind,
+                metadata={},
+            )
+        e = self.edges[key]
+        e.count += max(1, int(count))
+        e.add_conf(confidence)
+        merge_metadata(e.metadata, metadata)
+        if source_artifact:
+            e.source_artifacts.add(source_artifact)
+        return e.id
+
+
+def relation_visual_type(t: str) -> str:
+    t = norm_text(t).upper()
+    if t in NODE_STYLE:
+        return t
+    if t in ENTITY_SEMANTIC_TYPES:
+        return "ENTITY"
+    if t in CONTEXT_SEMANTIC_TYPES:
+        return t if t in NODE_STYLE else "CONTEXT_FACT"
+    if t in {"ROOT_CAUSE", "REMEDIATION", "ATTRIBUTE", "MEASUREMENT", "PARTICIPANT"}:
+        return t
+    return "EVIDENCE"
+
+
+class NoraGraphBuilder:
+    def __init__(
+        self,
+        input_dir: Path,
+        *,
+        include_interactions: bool,
+        include_fingerprints: bool,
+        include_evidence: bool,
+        strict_optional_inputs: bool,
+    ) -> None:
+        self.input_dir = Path(input_dir)
+        if not self.input_dir.exists() or not self.input_dir.is_dir():
+            raise NotADirectoryError(f"Input directory does not exist: {self.input_dir}")
+
+        self.include_interactions = bool(include_interactions)
+        self.include_fingerprints = bool(include_fingerprints)
+        self.include_evidence = bool(include_evidence)
+        self.g = GraphStore()
+        self.loader = CsvLoader(strict_optional=strict_optional_inputs)
+        self.warnings: list[str] = []
+        self.metrics: Dict[str, Any] = {}
+
+        self.frames: Dict[str, pd.DataFrame] = {}
+        for key, filename in FILES.items():
+            self.frames[key] = self.loader.read(
+                self.input_dir / filename,
+                key=key,
+                required=(key == "assignments"),
+            )
+
+        self.assign = self.frames["assignments"]
+        self.interaction_col = first_col(self.assign, ["interaction_ref"])
+        self.pattern_col = first_col(self.assign, ["context_pattern_cluster_id", "cluster_id"])
+        self.family_col = first_col(self.assign, ["context_family_id"])
+        self.leaf_col = first_col(self.assign, ["context_leaf_id"])
+        self.motif_col = first_col(self.assign, ["relation_motif_cluster_id"])
+        self.problem_col = first_col(self.assign, ["customer_problem_normalized"])
+        self.confidence_band_col = first_col(self.assign, ["confidence_band"])
+        self.cluster_strength_col = first_col(self.assign, ["cluster_strength"])
+
+        missing = []
+        if not self.interaction_col:
+            missing.append("interaction_ref")
+        if not self.pattern_col:
+            missing.append("context_pattern_cluster_id")
+        if missing:
+            raise ValueError(
+                f"{FILES['assignments']} is missing required columns: {', '.join(missing)}. "
+                f"Columns found: {list(self.assign.columns)}"
+            )
+
+        self.pattern_catalog = catalog_map(
+            self.frames["patterns"],
+            ["context_pattern_cluster_id", "cluster_id"],
+            ["meaning", "context_pattern_meaning", "descriptor"],
+        )
+        self.family_catalog = catalog_map(
+            self.frames["families"],
+            ["context_family_id", "cluster_id"],
+            ["meaning", "context_family_meaning", "descriptor"],
+        )
+        self.leaf_catalog = catalog_map(
+            self.frames["leaves"],
+            ["context_leaf_id"],
+            ["meaning", "local_context_refinement_meaning", "descriptor"],
+        )
+        self.motif_catalog = catalog_map(
+            self.frames["motifs"],
+            ["cluster_id", "relation_motif_cluster_id"],
+            ["meaning", "descriptor"],
+        )
+
+        # Interaction -> hierarchy assignment, deduplicated deterministically.
+        self.by_interaction: Dict[str, Dict[str, str]] = {}
+        duplicate_refs = Counter()
+        conflict_refs = set()
+        for _, r in self.assign.iterrows():
+            ref = norm_text(r.get(self.interaction_col))
+            if not ref:
+                continue
+            current = {
+                "pattern": norm_text(r.get(self.pattern_col)),
+                "family": norm_text(r.get(self.family_col)) if self.family_col else "",
+                "leaf": norm_text(r.get(self.leaf_col)) if self.leaf_col else "",
+                "motif": norm_text(r.get(self.motif_col)) if self.motif_col else "",
+                "problem": norm_text(r.get(self.problem_col)) if self.problem_col else "",
+                "confidence_band": norm_text(r.get(self.confidence_band_col)) if self.confidence_band_col else "",
+                "cluster_strength": norm_text(r.get(self.cluster_strength_col)) if self.cluster_strength_col else "",
+            }
+            if ref in self.by_interaction:
+                duplicate_refs[ref] += 1
+                previous = self.by_interaction[ref]
+                if any(previous.get(k, "") != current.get(k, "") for k in ("pattern", "family", "leaf", "motif")):
+                    conflict_refs.add(ref)
+                    # Keep the first assignment. A V5.7.2 interaction should not
+                    # drift across multiple hierarchy IDs in the same artifact.
+                continue
+            self.by_interaction[ref] = current
+
+        if conflict_refs:
+            self.warnings.append(
+                f"{len(conflict_refs)} interaction_ref values had conflicting hierarchy assignments; first occurrence retained."
+            )
+        self.metrics["duplicate_assignment_rows"] = int(sum(duplicate_refs.values()))
+        self.metrics["conflicting_assignment_interactions"] = int(len(conflict_refs))
+        self.metrics["unique_interactions"] = int(len(self.by_interaction))
+
+        # Node caches / semantic reuse indexes.
+        self.family_nodes: Dict[str, str] = {}
+        self.pattern_nodes: Dict[str, str] = {}
+        self.leaf_nodes: Dict[str, str] = {}
+        self.interaction_nodes: Dict[str, str] = {}
+        self.motif_nodes: Dict[str, str] = {}
+        self.hierarchy_anchor_by_interaction: Dict[str, str] = {}
+        self.semantic_anchor_by_interaction: Dict[str, str] = {}
+
+        self.participant_nodes: Dict[str, str] = {}
+        self.entity_nodes: Dict[Tuple[str, str], str] = {}
+        self.context_nodes: Dict[Tuple[str, str], str] = {}
+        self.rca_nodes: Dict[str, str] = {}
+        self.remediation_nodes: Dict[str, str] = {}
+        self.attribute_nodes: Dict[Tuple[str, str], str] = {}
+        self.measurement_nodes: Dict[str, str] = {}
+
+    # ------------------------------------------------------------------
+    # Hierarchy
+    # ------------------------------------------------------------------
+    def _ensure_family(self, family: str, *, occurrence: int = 0) -> Optional[str]:
+        family = norm_text(family)
+        if not family or family in {"-1"}:
+            return None
+        if family in self.family_nodes:
+            if occurrence:
+                self.g.add_node(self.family_nodes[family], "CONTEXT_FAMILY", self.g.nodes[self.family_nodes[family]].label, count=occurrence)
+            return self.family_nodes[family]
+        meta = self.family_catalog.get(family, {})
+        nid = self.g.add_node(
+            stable_id("family", family),
+            "CONTEXT_FAMILY",
+            norm_text(meta.get("_meaning")) or f"Context Family {family}",
+            level=0,
+            count=occurrence,
+            metadata={"context_family_id": family, **compact_meta(meta)},
+            source_artifact=FILES["families"] if not self.frames["families"].empty else FILES["assignments"],
+        )
+        self.family_nodes[family] = nid
+        return nid
+
+    def _ensure_pattern(self, pattern: str, family: str = "", *, occurrence: int = 0) -> Optional[str]:
+        pattern = norm_text(pattern)
+        if not pattern or pattern in {"-1"}:
+            return None
+        parent = self._ensure_family(family, occurrence=0)
+        if pattern in self.pattern_nodes:
+            nid = self.pattern_nodes[pattern]
+            if occurrence:
+                self.g.add_node(nid, "CONTEXT_PATTERN", self.g.nodes[nid].label, count=occurrence)
+            if parent and self.g.nodes[nid].parent_id and self.g.nodes[nid].parent_id != parent:
+                self.warnings.append(f"Context pattern {pattern} appeared under multiple context families.")
+            return nid
+        meta = self.pattern_catalog.get(pattern, {})
+        nid = self.g.add_node(
+            stable_id("pattern", pattern),
+            "CONTEXT_PATTERN",
+            norm_text(meta.get("_meaning")) or f"Context Pattern {pattern}",
+            parent_id=parent,
+            level=1 if parent else 0,
+            count=occurrence,
+            metadata={"context_pattern_cluster_id": pattern, **compact_meta(meta)},
+            source_artifact=FILES["patterns"] if not self.frames["patterns"].empty else FILES["assignments"],
+        )
+        self.pattern_nodes[pattern] = nid
+        return nid
+
+    def _ensure_leaf(self, leaf: str, pattern: str, family: str = "", *, occurrence: int = 0) -> Optional[str]:
+        leaf = norm_text(leaf)
+        if not leaf or leaf in {"-1", "NOT_CLUSTERABLE"}:
+            return None
+        parent = self._ensure_pattern(pattern, family, occurrence=0)
+        if leaf in self.leaf_nodes:
+            nid = self.leaf_nodes[leaf]
+            if occurrence:
+                self.g.add_node(nid, "CONTEXT_LEAF", self.g.nodes[nid].label, count=occurrence)
+            if parent and self.g.nodes[nid].parent_id and self.g.nodes[nid].parent_id != parent:
+                self.warnings.append(f"Context leaf {leaf} appeared under multiple context patterns.")
+            return nid
+        meta = self.leaf_catalog.get(leaf, {})
+        nid = self.g.add_node(
+            stable_id("leaf", leaf),
+            "CONTEXT_LEAF",
+            norm_text(meta.get("_meaning")) or leaf,
+            parent_id=parent,
+            level=2 if parent else 1,
+            count=occurrence,
+            metadata={"context_leaf_id": leaf, "context_pattern_cluster_id": pattern, **compact_meta(meta)},
+            source_artifact=FILES["leaves"] if not self.frames["leaves"].empty else FILES["assignments"],
+        )
+        self.leaf_nodes[leaf] = nid
+        return nid
+
+    def hierarchy_anchor(self, interaction_ref: str) -> Optional[str]:
+        return self.hierarchy_anchor_by_interaction.get(norm_text(interaction_ref))
+
+    def semantic_anchor(self, interaction_ref: str) -> Optional[str]:
+        ref = norm_text(interaction_ref)
+        return self.semantic_anchor_by_interaction.get(ref) or self.hierarchy_anchor_by_interaction.get(ref)
+
+    def build_hierarchy(self) -> None:
+        seen_family_pattern: Counter[Tuple[str, str]] = Counter()
+        seen_pattern_leaf: Counter[Tuple[str, str]] = Counter()
+
+        # First pass: ensure hierarchy nodes and cache anchors.
+        for ref, a in self.by_interaction.items():
+            family = a.get("family", "")
+            pattern = a.get("pattern", "")
+            leaf = a.get("leaf", "")
+
+            family_id = self._ensure_family(family, occurrence=1) if family else None
+            pattern_id = self._ensure_pattern(pattern, family, occurrence=1)
+            leaf_id = self._ensure_leaf(leaf, pattern, family, occurrence=1) if leaf else None
+            hierarchy_anchor = leaf_id or pattern_id
+            if not hierarchy_anchor:
+                continue
+            self.hierarchy_anchor_by_interaction[ref] = hierarchy_anchor
+
+            if family_id and pattern_id:
+                seen_family_pattern[(family_id, pattern_id)] += 1
+            if pattern_id and leaf_id:
+                seen_pattern_leaf[(pattern_id, leaf_id)] += 1
+
+            if self.include_interactions:
+                meta = {
+                    "interaction_ref": ref,
+                    "context_family_id": family,
+                    "context_pattern_cluster_id": pattern,
+                    "context_leaf_id": leaf,
+                    "confidence_band": a.get("confidence_band", ""),
+                    "cluster_strength": a.get("cluster_strength", ""),
+                    "customer_problem_normalized": a.get("problem", ""),
+                }
+                iid = self.g.add_node(
+                    stable_id("interaction", ref),
+                    "INTERACTION",
+                    f"Interaction {ref[:12]}…" if len(ref) > 12 else f"Interaction {ref}",
+                    parent_id=hierarchy_anchor,
+                    level=3,
+                    count=1,
+                    metadata=meta,
+                    source_artifact=FILES["assignments"],
+                )
+                self.interaction_nodes[ref] = iid
+                self.semantic_anchor_by_interaction[ref] = iid
+                self.g.add_edge(
+                    hierarchy_anchor,
+                    iid,
+                    "HAS_INTERACTION",
+                    kind="aggregation",
+                    source_artifact=FILES["assignments"],
+                )
+            else:
+                self.semantic_anchor_by_interaction[ref] = hierarchy_anchor
+
+            motif = norm_text(a.get("motif"))
+            if motif and motif != "-1":
+                meta = self.motif_catalog.get(motif, {})
+                mid = self.motif_nodes.get(motif)
+                if not mid:
+                    mid = self.g.add_node(
+                        stable_id("motif", motif),
+                        "RELATION_MOTIF",
+                        norm_text(meta.get("_meaning")) or f"Relation Motif {motif}",
+                        level=4 if self.include_interactions else 3,
+                        metadata={"relation_motif_cluster_id": motif, **compact_meta(meta)},
+                        source_artifact=FILES["motifs"] if not self.frames["motifs"].empty else FILES["assignments"],
+                    )
+                    self.motif_nodes[motif] = mid
+                else:
+                    self.g.add_node(mid, "RELATION_MOTIF", self.g.nodes[mid].label, count=1)
+                self.g.add_edge(
+                    self.semantic_anchor_by_interaction[ref],
+                    mid,
+                    "HAS_RELATION_MOTIF",
+                    kind="aggregation",
+                    source_artifact=FILES["assignments"],
+                )
+
+        # Add cluster hierarchy edges once, carrying interaction support counts.
+        for (source, target), count in seen_family_pattern.items():
+            self.g.add_edge(
+                source,
+                target,
+                "HAS_PATTERN",
+                kind="aggregation",
+                count=count,
+                source_artifact=FILES["assignments"],
+            )
+        for (source, target), count in seen_pattern_leaf.items():
+            self.g.add_edge(
+                source,
+                target,
+                "HAS_LEAF",
+                kind="aggregation",
+                count=count,
+                source_artifact=FILES["assignments"],
+            )
+
+    # ------------------------------------------------------------------
+    # Structured semantic layers
+    # ------------------------------------------------------------------
+    def add_participants(self) -> None:
+        df = self.frames["participants"]
+        ref_col = first_col(df, ["interaction_ref"])
+        p_col = first_col(df, ["participant"])
+        if df.empty or not ref_col or not p_col:
+            return
+        sem_col = first_col(df, ["participant_semantics"])
+        conf_col = first_col(df, ["evidence_strength"])
+        method_col = first_col(df, ["method"])
+        for _, r in df.iterrows():
+            ref = norm_text(r.get(ref_col))
+            participant = norm_text(r.get(p_col)).lower()
+            anchor = self.semantic_anchor(ref)
+            if not anchor or not participant:
+                continue
+            key = norm_label(participant)
+            nid = self.participant_nodes.get(key)
+            metadata = {
+                "participant": participant,
+                "participant_semantics": norm_text(r.get(sem_col)) if sem_col else "",
+                "method": norm_text(r.get(method_col)) if method_col else "",
+            }
+            if not nid:
+                nid = self.g.add_node(
+                    stable_id("participant", key),
+                    "PARTICIPANT",
+                    participant,
+                    level=4 if self.include_interactions else 3,
+                    count=1,
+                    metadata=metadata,
+                    source_artifact=FILES["participants"],
+                )
+                self.participant_nodes[key] = nid
+            else:
+                self.g.add_node(nid, "PARTICIPANT", participant, count=1, metadata=metadata, source_artifact=FILES["participants"])
+            self.g.add_edge(
+                anchor,
+                nid,
+                "HAS_PARTICIPANT",
+                kind="aggregation",
+                confidence=r.get(conf_col) if conf_col else None,
+                metadata={"interaction_ref": ref},
+                source_artifact=FILES["participants"],
+            )
+
+    def add_entities(self) -> None:
+        df = self.frames["entities"]
+        ref_col = first_col(df, ["interaction_ref"])
+        type_col = first_col(df, ["entity_type"])
+        name_col = first_col(df, ["canonical_name"])
+        if df.empty or not ref_col or not type_col or not name_col:
+            return
+        key_col = first_col(df, ["canonicalization_key"])
+        conf_col = first_col(df, ["precision_score", "evidence_strength"])
+        method_col = first_col(df, ["method"])
+        status_col = first_col(df, ["entity_status", "acceptance_status"])
+        role_col = first_col(df, ["evidence_role"])
+
+        for _, r in df.iterrows():
+            ref = norm_text(r.get(ref_col))
+            etype = norm_text(r.get(type_col)).upper()
+            name = norm_text(r.get(name_col))
+            anchor = self.semantic_anchor(ref)
+            if not anchor or not etype or not name:
+                continue
+            canonical = norm_text(r.get(key_col)) if key_col else f"{etype}::{norm_label(name)}"
+            lookup = (etype, norm_label(name))
+            nid = self.entity_nodes.get(lookup)
+            metadata = {
+                "entity_type": etype,
+                "canonicalization_key": canonical,
+                "method": norm_text(r.get(method_col)) if method_col else "",
+                "entity_status": norm_text(r.get(status_col)) if status_col else "",
+                "evidence_role": norm_text(r.get(role_col)) if role_col else "",
+            }
+            if not nid:
+                nid = self.g.add_node(
+                    stable_id("entity", etype, canonical),
+                    "ENTITY",
+                    name,
+                    level=4 if self.include_interactions else 3,
+                    count=1,
+                    metadata=metadata,
+                    source_artifact=FILES["entities"],
+                )
+                self.entity_nodes[lookup] = nid
+            else:
+                self.g.add_node(nid, "ENTITY", name, count=1, metadata=metadata, source_artifact=FILES["entities"])
+            self.g.add_edge(
+                anchor,
+                nid,
+                "HAS_ENTITY",
+                kind="aggregation",
+                confidence=r.get(conf_col) if conf_col else None,
+                metadata={"interaction_ref": ref, "entity_type": etype},
+                source_artifact=FILES["entities"],
+            )
+
+    def add_context_facts(self) -> None:
+        df = self.frames["context_facts"]
+        ref_col = first_col(df, ["interaction_ref"])
+        type_col = first_col(df, ["context_type"])
+        fact_col = first_col(df, ["normalized_fact", "summary_phrase"])
+        if df.empty or not ref_col or not type_col or not fact_col:
+            return
+        conf_col = first_col(df, ["context_substantive_score", "max_evidence_strength"])
+        fact_id_col = first_col(df, ["context_fact_id"])
+        role_col = first_col(df, ["roles", "role"])
+        substantive_col = first_col(df, ["is_substantive"])
+        ambiguity_col = first_col(df, ["ambiguity_status"])
+
+        for _, r in df.iterrows():
+            ref = norm_text(r.get(ref_col))
+            ctype = norm_text(r.get(type_col)).upper()
+            fact = norm_text(r.get(fact_col))
+            anchor = self.semantic_anchor(ref)
+            if not anchor or not ctype or not fact:
+                continue
+            lookup = (ctype, norm_label(fact))
+            nid = self.context_nodes.get(lookup)
+            visual_type = ctype if ctype in NODE_STYLE else "CONTEXT_FACT"
+            metadata = {
+                "context_type": ctype,
+                "context_fact_id": norm_text(r.get(fact_id_col)) if fact_id_col else "",
+                "roles": norm_text(r.get(role_col)) if role_col else "",
+                "is_substantive": norm_text(r.get(substantive_col)) if substantive_col else "",
+                "ambiguity_status": norm_text(r.get(ambiguity_col)) if ambiguity_col else "",
+            }
+            if not nid:
+                nid = self.g.add_node(
+                    stable_id("context", ctype, norm_label(fact)),
+                    visual_type,
+                    fact,
+                    level=4 if self.include_interactions else 3,
+                    count=1,
+                    metadata=metadata,
+                    source_artifact=FILES["context_facts"],
+                )
+                self.context_nodes[lookup] = nid
+            else:
+                self.g.add_node(nid, visual_type, fact, count=1, metadata=metadata, source_artifact=FILES["context_facts"])
+            self.g.add_edge(
+                anchor,
+                nid,
+                "HAS_CONTEXT",
+                kind="aggregation",
+                confidence=r.get(conf_col) if conf_col else None,
+                metadata={"interaction_ref": ref, "context_type": ctype},
+                source_artifact=FILES["context_facts"],
+            )
+
+    def add_rca(self) -> None:
+        df = self.frames["root_cause"]
+        ref_col = first_col(df, ["interaction_ref"])
+        phrase_col = first_col(df, ["cause_phrase", "statement"])
+        if df.empty or not ref_col or not phrase_col:
+            return
+        status_col = first_col(df, ["status"])
+        conf_col = first_col(df, ["evidence_strength"])
+        state_col = first_col(df, ["cause_evidence_state"])
+        support_col = first_col(df, ["supporting_evidence_count"])
+
+        for _, r in df.iterrows():
+            ref = norm_text(r.get(ref_col))
+            phrase = norm_text(r.get(phrase_col))
+            status = norm_text(r.get(status_col)).upper() if status_col else "UNKNOWN"
+            anchor = self.semantic_anchor(ref)
+            if not anchor or not phrase:
+                continue
+            key = norm_label(phrase)
+            nid = self.rca_nodes.get(key)
+            metadata = {
+                "status": status,
+                "cause_evidence_state": norm_text(r.get(state_col)) if state_col else "",
+                "supporting_evidence_count": safe_int(r.get(support_col)) if support_col else 0,
+            }
+            if not nid:
+                nid = self.g.add_node(
+                    stable_id("rca", key),
+                    "ROOT_CAUSE",
+                    phrase,
+                    level=4 if self.include_interactions else 3,
+                    count=1,
+                    metadata=metadata,
+                    source_artifact=FILES["root_cause"],
+                )
+                self.rca_nodes[key] = nid
+            else:
+                self.g.add_node(nid, "ROOT_CAUSE", phrase, count=1, metadata=metadata, source_artifact=FILES["root_cause"])
+            predicate = {
+                "CONFIRMED": "HAS_CONFIRMED_CAUSE",
+                "SUSPECTED": "HAS_SUSPECTED_CAUSE",
+                "RULED_OUT": "HAS_RULED_OUT_CAUSE",
+                "NOT_DETERMINED": "CAUSE_NOT_DETERMINED",
+            }.get(status, "HAS_CAUSE_CONTEXT")
+            self.g.add_edge(
+                anchor,
+                nid,
+                predicate,
+                kind="aggregation",
+                confidence=r.get(conf_col) if conf_col else None,
+                metadata={"interaction_ref": ref, "status": status},
+                source_artifact=FILES["root_cause"],
+            )
+
+    def add_remediation(self) -> None:
+        df = self.frames["remediation"]
+        ref_col = first_col(df, ["interaction_ref"])
+        phrase_col = first_col(df, ["action_phrase", "statement"])
+        if df.empty or not ref_col or not phrase_col:
+            return
+        conf_col = first_col(df, ["evidence_strength"])
+        support_col = first_col(df, ["supporting_evidence_count"])
+
+        for _, r in df.iterrows():
+            ref = norm_text(r.get(ref_col))
+            phrase = norm_text(r.get(phrase_col))
+            anchor = self.semantic_anchor(ref)
+            if not anchor or not phrase:
+                continue
+            key = norm_label(phrase)
+            nid = self.remediation_nodes.get(key)
+            metadata = {
+                "action": phrase,
+                "supporting_evidence_count": safe_int(r.get(support_col)) if support_col else 0,
+            }
+            if not nid:
+                nid = self.g.add_node(
+                    stable_id("remediation", key),
+                    "REMEDIATION",
+                    phrase,
+                    level=4 if self.include_interactions else 3,
+                    count=1,
+                    metadata=metadata,
+                    source_artifact=FILES["remediation"],
+                )
+                self.remediation_nodes[key] = nid
+            else:
+                self.g.add_node(nid, "REMEDIATION", phrase, count=1, metadata=metadata, source_artifact=FILES["remediation"])
+            self.g.add_edge(
+                anchor,
+                nid,
+                "HAS_REMEDIATION",
+                kind="aggregation",
+                confidence=r.get(conf_col) if conf_col else None,
+                metadata={"interaction_ref": ref},
+                source_artifact=FILES["remediation"],
+            )
+
+    def add_attributes(self) -> None:
+        df = self.frames["attributes"]
+        ref_col = first_col(df, ["interaction_ref"])
+        key_col = first_col(df, ["normalized_key", "key"])
+        value_col = first_col(df, ["normalized_value", "value"])
+        if df.empty or not ref_col or not key_col or not value_col:
+            return
+        conf_col = first_col(df, ["evidence_strength"])
+        for _, r in df.iterrows():
+            ref = norm_text(r.get(ref_col))
+            key = norm_text(r.get(key_col))
+            value = norm_text(r.get(value_col))
+            anchor = self.semantic_anchor(ref)
+            if not anchor or not key or not value:
+                continue
+            label = f"{key}={value}"
+            lookup = (norm_label(key), norm_label(value))
+            nid = self.attribute_nodes.get(lookup)
+            if not nid:
+                nid = self.g.add_node(
+                    stable_id("attribute", *lookup),
+                    "ATTRIBUTE",
+                    label,
+                    level=4 if self.include_interactions else 3,
+                    count=1,
+                    metadata={"key": key, "value": value},
+                    source_artifact=FILES["attributes"],
+                )
+                self.attribute_nodes[lookup] = nid
+            else:
+                self.g.add_node(nid, "ATTRIBUTE", label, count=1, source_artifact=FILES["attributes"])
+            self.g.add_edge(
+                anchor,
+                nid,
+                "HAS_ATTRIBUTE",
+                kind="aggregation",
+                confidence=r.get(conf_col) if conf_col else None,
+                metadata={"interaction_ref": ref},
+                source_artifact=FILES["attributes"],
+            )
+
+    def add_measurements(self) -> None:
+        df = self.frames["measurements"]
+        ref_col = first_col(df, ["interaction_ref"])
+        key_col = first_col(df, ["normalized_key", "key"])
+        value_col = first_col(df, ["value"])
+        unit_col = first_col(df, ["unit"])
+        if df.empty or not ref_col or not key_col or not value_col:
+            return
+        conf_col = first_col(df, ["evidence_strength"])
+        for _, r in df.iterrows():
+            ref = norm_text(r.get(ref_col))
+            key = norm_text(r.get(key_col))
+            value = norm_text(r.get(value_col))
+            unit = norm_text(r.get(unit_col)) if unit_col else ""
+            anchor = self.semantic_anchor(ref)
+            if not anchor or not key or not value:
+                continue
+            label = f"{key}={value}{(' ' + unit) if unit else ''}"
+            lookup = norm_label(label)
+            nid = self.measurement_nodes.get(lookup)
+            if not nid:
+                nid = self.g.add_node(
+                    stable_id("measurement", lookup),
+                    "MEASUREMENT",
+                    label,
+                    level=4 if self.include_interactions else 3,
+                    count=1,
+                    metadata={"metric": key, "value": value, "unit": unit},
+                    source_artifact=FILES["measurements"],
+                )
+                self.measurement_nodes[lookup] = nid
+            else:
+                self.g.add_node(nid, "MEASUREMENT", label, count=1, source_artifact=FILES["measurements"])
+            self.g.add_edge(
+                anchor,
+                nid,
+                "HAS_MEASUREMENT",
+                kind="aggregation",
+                confidence=r.get(conf_col) if conf_col else None,
+                metadata={"interaction_ref": ref},
+                source_artifact=FILES["measurements"],
+            )
+
+    def add_tools(self) -> None:
+        source: Optional[Path] = None
+        for name in TOOL_FILE_CANDIDATES:
+            p = self.input_dir / name
+            if p.exists() and p.is_file():
+                source = p
+                break
+
+        if source:
+            df = self.loader.read(source, key="tools_dynamic", required=False)
+            source_name = source.name
+        else:
+            df = self.frames["diagnostics"]
+            source_name = FILES["diagnostics"]
+
+        if df.empty:
+            return
+        ref_col = first_col(df, ["interaction_ref"])
+        tool_col = first_col(df, ["tool_name", "function_name", "tool", "tool_type"])
+        if not ref_col or not tool_col:
+            return
+        result_col = first_col(df, ["status", "tool_status", "success", "result"])
+        tool_nodes: Dict[str, str] = {}
+        for _, r in df.iterrows():
+            ref = norm_text(r.get(ref_col))
+            tool = norm_text(r.get(tool_col))
+            anchor = self.semantic_anchor(ref)
+            if not anchor or not tool:
+                continue
+            key = norm_label(tool)
+            tid = tool_nodes.get(key)
+            metadata = {
+                "tool_name": tool,
+                "tool_result": norm_text(r.get(result_col)) if result_col else "",
+                "source": "structured_tool_field",
+            }
+            if not tid:
+                tid = self.g.add_node(
+                    stable_id("tool", key),
+                    "TOOL",
+                    tool,
+                    level=4 if self.include_interactions else 3,
+                    count=1,
+                    metadata=metadata,
+                    source_artifact=source_name,
+                )
+                tool_nodes[key] = tid
+            else:
+                self.g.add_node(tid, "TOOL", tool, count=1, metadata=metadata, source_artifact=source_name)
+            self.g.add_edge(
+                anchor,
+                tid,
+                "USED_TOOL",
+                kind="aggregation",
+                metadata={"interaction_ref": ref},
+                source_artifact=source_name,
+            )
+
+    def add_diagnostic_evidence(self) -> None:
+        if not self.include_evidence:
+            return
+        df = self.frames["diagnostics"]
+        ref_col = first_col(df, ["interaction_ref"])
+        statement_col = first_col(df, ["statement", "evidence", "text"])
+        type_col = first_col(df, ["evidence_type", "context_type", "type"])
+        if df.empty or not ref_col or not statement_col:
+            return
+        conf_col = first_col(df, ["evidence_strength"])
+        for _, r in df.iterrows():
+            ref = norm_text(r.get(ref_col))
+            statement = norm_text(r.get(statement_col))
+            etype = norm_text(r.get(type_col)).upper() if type_col else "EVIDENCE"
+            anchor = self.semantic_anchor(ref)
+            if not anchor or not statement:
+                continue
+            eid = self.g.add_node(
+                stable_id("evidence", ref, etype, norm_label(statement)),
+                "EVIDENCE",
+                statement[:180] + ("…" if len(statement) > 180 else ""),
+                level=5 if self.include_interactions else 4,
+                count=1,
+                metadata={"evidence_type": etype, "statement": statement, "interaction_ref": ref},
+                source_artifact=FILES["diagnostics"],
+            )
+            self.g.add_edge(
+                anchor,
+                eid,
+                "HAS_EVIDENCE",
+                kind="aggregation",
+                confidence=r.get(conf_col) if conf_col else None,
+                metadata={"interaction_ref": ref},
+                source_artifact=FILES["diagnostics"],
+            )
+
+    def add_table_semantics(self) -> None:
+        # Order matters: grounded_relationships can then reuse these node IDs.
+        self.add_participants()
+        self.add_entities()
+        self.add_context_facts()
+        self.add_rca()
+        self.add_remediation()
+        self.add_attributes()
+        self.add_measurements()
+        self.add_tools()
+        self.add_diagnostic_evidence()
+
+    # ------------------------------------------------------------------
+    # Typed grounded relationships
+    # ------------------------------------------------------------------
+    def _resolve_semantic_node(self, semantic_type: str, label: str, interaction_ref: str = "") -> str:
+        st = norm_text(semantic_type).upper() or "EVIDENCE"
+        label = norm_text(label)
+        key = norm_label(label)
+        if not label:
+            return ""
+
+        if st == "PARTICIPANT":
+            existing = self.participant_nodes.get(key)
+            if existing:
+                return existing
+            nid = self.g.add_node(stable_id("participant", key), "PARTICIPANT", label, level=4, metadata={"semantic_type": st}, source_artifact=FILES["relationships"])
+            self.participant_nodes[key] = nid
+            return nid
+
+        if st in ENTITY_SEMANTIC_TYPES:
+            existing = self.entity_nodes.get((st, key))
+            if existing:
+                return existing
+            canonical = f"{st}::{key}"
+            nid = self.g.add_node(stable_id("entity", st, canonical), "ENTITY", label, level=4, metadata={"entity_type": st, "canonicalization_key": canonical, "semantic_type": st}, source_artifact=FILES["relationships"])
+            self.entity_nodes[(st, key)] = nid
+            return nid
+
+        if st == "ROOT_CAUSE":
+            existing = self.rca_nodes.get(key)
+            if existing:
+                return existing
+            nid = self.g.add_node(stable_id("rca", key), "ROOT_CAUSE", label, level=4, metadata={"semantic_type": st}, source_artifact=FILES["relationships"])
+            self.rca_nodes[key] = nid
+            return nid
+
+        if st == "REMEDIATION":
+            existing = self.remediation_nodes.get(key)
+            if existing:
+                return existing
+            nid = self.g.add_node(stable_id("remediation", key), "REMEDIATION", label, level=4, metadata={"semantic_type": st}, source_artifact=FILES["relationships"])
+            self.remediation_nodes[key] = nid
+            return nid
+
+        if st == "ATTRIBUTE":
+            # Relationship export usually carries "key=value" as the label.
+            nid = self.g.add_node(stable_id("attribute_semantic", key), "ATTRIBUTE", label, level=4, metadata={"semantic_type": st}, source_artifact=FILES["relationships"])
+            return nid
+
+        if st == "MEASUREMENT":
+            existing = self.measurement_nodes.get(key)
+            if existing:
+                return existing
+            nid = self.g.add_node(stable_id("measurement", key), "MEASUREMENT", label, level=4, metadata={"semantic_type": st}, source_artifact=FILES["relationships"])
+            self.measurement_nodes[key] = nid
+            return nid
+
+        if st in CONTEXT_SEMANTIC_TYPES:
+            existing = self.context_nodes.get((st, key))
+            if existing:
+                return existing
+            visual_type = st if st in NODE_STYLE else "CONTEXT_FACT"
+            nid = self.g.add_node(stable_id("context", st, key), visual_type, label, level=4, metadata={"context_type": st, "semantic_type": st}, source_artifact=FILES["relationships"])
+            self.context_nodes[(st, key)] = nid
+            return nid
+
+        if st == "INTERACTION" and interaction_ref:
+            existing = self.interaction_nodes.get(interaction_ref)
+            if existing:
+                return existing
+
+        return self.g.add_node(
+            stable_id("semantic", st, key),
+            relation_visual_type(st),
+            label,
+            level=4,
+            metadata={"semantic_type": st},
+            source_artifact=FILES["relationships"],
+        )
+
+    def add_grounded_relationships(self) -> None:
+        df = self.frames["relationships"]
+        if df.empty:
+            return
+        s_type = first_col(df, ["subject_type"])
+        s_label = first_col(df, ["subject"])
+        pred_col = first_col(df, ["predicate"])
+        t_type = first_col(df, ["object_type"])
+        t_label = first_col(df, ["object"])
+        if not all([s_type, s_label, pred_col, t_type, t_label]):
+            self.warnings.append(
+                f"{FILES['relationships']} exists but is missing one or more typed relation columns; semantic edges skipped."
+            )
+            return
+
+        conf_col = first_col(df, ["grounding_score", "relation_confidence", "evidence_strength"])
+        tier_col = first_col(df, ["grounding_tier", "grounding_method"])
+        iref_col = first_col(df, ["interaction_ref"])
+        eref_col = first_col(df, ["evidence_ref"])
+        rule_col = first_col(df, ["source_rule"])
+        status_col = first_col(df, ["status"])
+        grounding_status_col = first_col(df, ["grounding_status"])
+
+        for _, r in df.iterrows():
+            st = norm_text(r.get(s_type)).upper()
+            sl = norm_text(r.get(s_label))
+            predicate = norm_text(r.get(pred_col))
+            ot = norm_text(r.get(t_type)).upper()
+            ol = norm_text(r.get(t_label))
+            iref = norm_text(r.get(iref_col)) if iref_col else ""
+            if not all([st, sl, predicate, ot, ol]):
+                continue
+
+            sid = self._resolve_semantic_node(st, sl, iref)
+            oid = self._resolve_semantic_node(ot, ol, iref)
+            metadata = {
+                "grounding_tier": norm_text(r.get(tier_col)) if tier_col else "",
+                "grounding_status": norm_text(r.get(grounding_status_col)) if grounding_status_col else "",
+                "interaction_ref": iref,
+                "evidence_ref": norm_text(r.get(eref_col)) if eref_col else "",
+                "source_rule": norm_text(r.get(rule_col)) if rule_col else "",
+                "status": norm_text(r.get(status_col)) if status_col else "",
+            }
+            self.g.add_edge(
+                sid,
+                oid,
+                predicate,
+                kind="semantic",
+                confidence=r.get(conf_col) if conf_col else None,
+                metadata=metadata,
+                source_artifact=FILES["relationships"],
+            )
+
+            # Make the semantic subgraph reachable from the hierarchy even when
+            # the source/target node came only from grounded_relationships.csv.
+            anchor = self.semantic_anchor(iref) if iref else None
+            if anchor:
+                self.g.add_edge(
+                    anchor,
+                    sid,
+                    "HAS_SEMANTIC_SUBJECT",
+                    kind="aggregation",
+                    metadata={"interaction_ref": iref},
+                    source_artifact=FILES["relationships"],
+                )
+                self.g.add_edge(
+                    anchor,
+                    oid,
+                    "HAS_SEMANTIC_OBJECT",
+                    kind="aggregation",
+                    metadata={"interaction_ref": iref},
+                    source_artifact=FILES["relationships"],
+                )
+
+    def add_fingerprints(self) -> None:
+        if not self.include_fingerprints:
+            return
+        df = self.frames["fingerprints"]
+        ref_col = first_col(df, ["interaction_ref"])
+        fp_col = first_col(df, ["fingerprint_id"])
+        if df.empty or not ref_col or not fp_col:
+            return
+        for _, r in df.iterrows():
+            ref = norm_text(r.get(ref_col))
+            fingerprint = norm_text(r.get(fp_col))
+            anchor = self.semantic_anchor(ref)
+            if not anchor or not fingerprint:
+                continue
+            fid = self.g.add_node(
+                stable_id("fingerprint", fingerprint),
+                "FINGERPRINT",
+                f"Fingerprint {fingerprint}",
+                level=4 if self.include_interactions else 3,
+                count=1,
+                metadata={"fingerprint_id": fingerprint, **compact_meta(r.to_dict(), limit=12)},
+                source_artifact=FILES["fingerprints"],
+            )
+            self.g.add_edge(
+                anchor,
+                fid,
+                "HAS_FINGERPRINT",
+                kind="aggregation",
+                metadata={"interaction_ref": ref},
+                source_artifact=FILES["fingerprints"],
+            )
+
+    # ------------------------------------------------------------------
+    # Build / quality
+    # ------------------------------------------------------------------
+    def _finalize_degrees(self) -> None:
+        degree = Counter()
+        semantic_degree = Counter()
+        aggregation_degree = Counter()
+        for e in self.g.edges.values():
+            degree[e.source] += 1
+            degree[e.target] += 1
+            target = semantic_degree if e.kind == "semantic" else aggregation_degree
+            target[e.source] += 1
+            target[e.target] += 1
+        for nid, node in self.g.nodes.items():
+            node.metadata["degree"] = int(degree[nid])
+            node.metadata["semantic_degree"] = int(semantic_degree[nid])
+            node.metadata["aggregation_degree"] = int(aggregation_degree[nid])
+
+    def _integrity(self) -> Dict[str, Any]:
+        missing_source = []
+        missing_target = []
+        for e in self.g.edges.values():
+            if e.source not in self.g.nodes:
+                missing_source.append(e.id)
+            if e.target not in self.g.nodes:
+                missing_target.append(e.id)
+        orphan_parent = [n.id for n in self.g.nodes.values() if n.parent_id and n.parent_id not in self.g.nodes]
+        isolated = []
+        degree = Counter()
+        for e in self.g.edges.values():
+            degree[e.source] += 1
+            degree[e.target] += 1
+        for nid in self.g.nodes:
+            if degree[nid] == 0:
+                isolated.append(nid)
+        return {
+            "missing_edge_sources": len(missing_source),
+            "missing_edge_targets": len(missing_target),
+            "orphan_parent_nodes": len(orphan_parent),
+            "isolated_nodes": len(isolated),
+            "is_valid": not missing_source and not missing_target and not orphan_parent,
+        }
+
+    def build(self) -> Dict[str, Any]:
+        self.build_hierarchy()
+        self.add_table_semantics()
+        self.add_grounded_relationships()
+        self.add_fingerprints()
+        self._finalize_degrees()
+        integrity = self._integrity()
+        if not integrity["is_valid"]:
+            raise RuntimeError(f"Graph integrity validation failed: {integrity}")
+
+        counts = {
+            "nodes": len(self.g.nodes),
+            "edges": len(self.g.edges),
+            "node_types": dict(sorted(Counter(n.type for n in self.g.nodes.values()).items())),
+            "edge_kinds": dict(sorted(Counter(e.kind for e in self.g.edges.values()).items())),
+            "edge_predicates": dict(Counter(e.predicate for e in self.g.edges.values()).most_common()),
+        }
+        return {
+            "schema_version": GRAPH_SCHEMA_VERSION,
+            "graph_builder_version": GRAPH_BUILDER_VERSION,
+            "source_pipeline": PIPELINE,
+            "input_dir": str(self.input_dir),
+            "configuration": {
+                "include_interactions": self.include_interactions,
+                "include_fingerprints": self.include_fingerprints,
+                "include_evidence": self.include_evidence,
+            },
+            "counts": counts,
+            "integrity": integrity,
+            "build_metrics": self.metrics,
+            "warnings": sorted(set(self.warnings)),
+            "artifact_load_audit": [asdict(x) for x in self.loader.audit],
+            "node_styles": NODE_STYLE,
+            "nodes": [n.to_dict() for n in self.g.nodes.values()],
+            "edges": [e.to_dict() for e in self.g.edges.values()],
+        }
+
+
+def _atomic_text(path: Path, text: str, encoding: str = "utf-8") -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text, encoding=encoding)
+    tmp.replace(path)
+
+
+def _atomic_csv(df: pd.DataFrame, path: Path) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    df.to_csv(tmp, index=False)
+    tmp.replace(path)
+
+
+def _bundle_node_rows(bundle: Mapping[str, Any]) -> Iterable[Dict[str, Any]]:
+    for n in bundle.get("nodes", []):
+        yield {
+            "id": n["id"],
+            "type": n["type"],
+            "label": n["label"],
+            "parent_id": n.get("parent_id"),
+            "level": n.get("level"),
+            "count": n.get("count"),
+            "metadata_json": json.dumps(n.get("metadata", {}), ensure_ascii=False),
+            "source_artifacts": ";".join(n.get("source_artifacts", [])),
+        }
+
+
+def _bundle_edge_rows(bundle: Mapping[str, Any]) -> Iterable[Dict[str, Any]]:
+    for e in bundle.get("edges", []):
+        yield {
+            "id": e["id"],
+            "source": e["source"],
+            "target": e["target"],
+            "predicate": e["predicate"],
+            "kind": e["kind"],
+            "count": e["count"],
+            "mean_confidence": e.get("mean_confidence"),
+            "metadata_json": json.dumps(e.get("metadata", {}), ensure_ascii=False),
+            "source_artifacts": ";".join(e.get("source_artifacts", [])),
+        }
+
+
+def copy_viewer(output_dir: Path, viewer_path: Optional[Path], no_viewer_copy: bool) -> Optional[Path]:
+    if no_viewer_copy:
+        return None
+    candidate = viewer_path
+    if candidate is None:
+        candidate = Path(__file__).resolve().with_name("viewer.html")
+    if not candidate.exists() or not candidate.is_file():
+        LOGGER.warning("viewer.html not found at %s; graph files will still be generated.", candidate)
+        return None
+    dst = output_dir / "viewer.html"
+    if candidate.resolve() != dst.resolve():
+        shutil.copy2(candidate, dst)
+    return dst
+
+
+def write_outputs(
+    bundle: Dict[str, Any],
+    output_dir: Path,
+    *,
+    viewer_path: Optional[Path],
+    no_viewer_copy: bool,
+) -> Optional[Path]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    _atomic_text(
+        output_dir / "graph_bundle.json",
+        json.dumps(bundle, indent=2, ensure_ascii=False),
+    )
+    _atomic_csv(pd.DataFrame(list(_bundle_node_rows(bundle))), output_dir / "graph_nodes.csv")
+    _atomic_csv(pd.DataFrame(list(_bundle_edge_rows(bundle))), output_dir / "graph_edges.csv")
+    _atomic_csv(pd.DataFrame(bundle.get("artifact_load_audit", [])), output_dir / "artifact_load_audit.csv")
+
+    report = {
+        "schema_version": bundle["schema_version"],
+        "graph_builder_version": bundle["graph_builder_version"],
+        "source_pipeline": bundle["source_pipeline"],
+        "input_dir": bundle.get("input_dir"),
+        "configuration": bundle.get("configuration", {}),
+        "counts": bundle["counts"],
+        "integrity": bundle.get("integrity", {}),
+        "build_metrics": bundle.get("build_metrics", {}),
+        "warnings": bundle.get("warnings", []),
+        "artifact_load_audit": bundle.get("artifact_load_audit", []),
+    }
+    _atomic_text(output_dir / "graph_build_report.json", json.dumps(report, indent=2, ensure_ascii=False))
+    return copy_viewer(output_dir, viewer_path, no_viewer_copy)
+
+
+def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Build the NORA V5.7.2 interactive knowledge graph from V5.7.2 CSV artifacts."
+    )
+    p.add_argument("--input-dir", required=True, help="Directory containing the V5.7.2 CSV outputs.")
+    p.add_argument("--output-dir", default="nora_v572_graph", help="Directory for graph_bundle.json and graph CSVs.")
+    p.add_argument("--include-interactions", action="store_true", help="Add one clickable INTERACTION node per interaction_ref.")
+    p.add_argument("--include-fingerprints", action="store_true", help="Add deterministic V5.7.2 interaction fingerprint nodes.")
+    p.add_argument("--include-evidence", action="store_true", help="Add diagnostic evidence statement nodes (can increase graph size).")
+    p.add_argument("--strict-optional-inputs", action="store_true", help="Fail instead of skipping missing/empty optional CSV artifacts.")
+    p.add_argument("--viewer", help="Optional path to viewer.html. If omitted, viewer.html beside this script is used when present.")
+    p.add_argument("--no-viewer-copy", action="store_true", help="Do not copy viewer.html into the graph output directory.")
+    p.add_argument("--verbose", action="store_true")
+    return p.parse_args(argv)
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    args = parse_args(argv)
+    configure_logging(args.verbose)
+    try:
+        input_dir = Path(args.input_dir).expanduser().resolve()
+        output_dir = Path(args.output_dir).expanduser().resolve()
+        viewer_path = Path(args.viewer).expanduser().resolve() if args.viewer else None
+
+        builder = NoraGraphBuilder(
+            input_dir,
+            include_interactions=bool(args.include_interactions),
+            include_fingerprints=bool(args.include_fingerprints),
+            include_evidence=bool(args.include_evidence),
+            strict_optional_inputs=bool(args.strict_optional_inputs),
+        )
+        bundle = builder.build()
+        copied_viewer = write_outputs(
+            bundle,
+            output_dir,
+            viewer_path=viewer_path,
+            no_viewer_copy=bool(args.no_viewer_copy),
+        )
+
+        print(f"[OK] graph_builder_version={GRAPH_BUILDER_VERSION}")
+        print(f"[OK] nodes={bundle['counts']['nodes']} edges={bundle['counts']['edges']}")
+        print(f"[OK] integrity={bundle['integrity']['is_valid']}")
+        print(f"[OK] output={output_dir}")
+        skipped = [x for x in bundle["artifact_load_audit"] if not str(x.get("status", "")).startswith("LOADED")]
+        if skipped:
+            print(f"[INFO] optional/marginal artifacts skipped_or_empty={len(skipped)}; see artifact_load_audit.csv")
+        if copied_viewer:
+            print(f"[OK] viewer={copied_viewer}")
+            print(f"[RUN] python -m http.server 8000 --directory \"{output_dir}\"")
+            print("[OPEN] http://127.0.0.1:8000/viewer.html")
+        else:
+            print("[INFO] viewer.html was not copied; graph data files are ready.")
+        return 0
+    except KeyboardInterrupt:
+        LOGGER.error("Interrupted by user.")
+        return 130
+    except Exception as exc:
+        LOGGER.exception("Graph build failed: %s", exc)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

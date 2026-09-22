@@ -1,0 +1,2245 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>NORA V5.7.2 Interactive Knowledge Graph</title>
+
+<style>
+:root{
+  --bg:#08111f;
+  --panel:#111827;
+  --line:#334155;
+  --text:#e5e7eb;
+  --muted:#94a3b8;
+}
+
+*{
+  box-sizing:border-box;
+}
+
+html,
+body{
+  margin:0;
+  height:100%;
+  font-family:Segoe UI,Arial,sans-serif;
+  background:var(--bg);
+  color:var(--text);
+}
+
+#app{
+  display:grid;
+  grid-template-columns:300px 1fr 360px;
+  height:100vh;
+  overflow:hidden;
+}
+
+.panel{
+  background:var(--panel);
+  overflow:auto;
+  border-right:1px solid #1e293b;
+}
+
+.right{
+  border-right:0;
+  border-left:1px solid #1e293b;
+}
+
+.pad{
+  padding:16px;
+}
+
+h1{
+  font-size:18px;
+  margin:0 0 10px;
+}
+
+h2{
+  font-size:14px;
+  margin:18px 0 8px;
+  color:#cbd5e1;
+}
+
+.small{
+  font-size:12px;
+  color:var(--muted);
+  line-height:1.45;
+}
+
+input,
+select,
+button{
+  width:100%;
+  padding:9px 10px;
+  margin:5px 0;
+  border-radius:8px;
+  border:1px solid #334155;
+  background:#0b1220;
+  color:var(--text);
+  font-size:13px;
+}
+
+button{
+  cursor:pointer;
+}
+
+.btnrow{
+  display:grid;
+  grid-template-columns:1fr 1fr;
+  gap:8px;
+}
+
+.stat{
+  display:grid;
+  grid-template-columns:1fr 1fr;
+  gap:8px;
+}
+
+.card{
+  background:#0b1220;
+  border:1px solid #243047;
+  border-radius:10px;
+  padding:10px;
+}
+
+.value{
+  font-size:18px;
+  font-weight:700;
+}
+
+.label{
+  font-size:11px;
+  color:var(--muted);
+}
+
+#stage{
+  position:relative;
+  overflow:hidden;
+  background:#07101d;
+}
+
+#canvas{
+  width:100%;
+  height:100%;
+  display:block;
+  cursor:grab;
+}
+
+.legend{
+  display:grid;
+  grid-template-columns:1fr 1fr;
+  gap:5px;
+  font-size:11px;
+}
+
+.dot{
+  width:10px;
+  height:10px;
+  border-radius:50%;
+  display:inline-block;
+}
+
+.kv{
+  font-size:12px;
+  margin:6px 0;
+  word-break:break-word;
+}
+
+.badge{
+  display:inline-block;
+  border:1px solid #334155;
+  border-radius:999px;
+  padding:3px 7px;
+  margin:2px 3px 2px 0;
+  font-size:11px;
+}
+
+.note{
+  background:#0b1220;
+  border-left:3px solid #38bdf8;
+  padding:9px;
+  border-radius:6px;
+  font-size:12px;
+  color:#cbd5e1;
+}
+
+#status,
+#crumbs{
+  position:absolute;
+  left:12px;
+  background:rgba(11,18,32,.92);
+  border:1px solid #334155;
+  border-radius:8px;
+  padding:8px 10px;
+  font-size:12px;
+}
+
+#status{
+  bottom:12px;
+}
+
+#crumbs{
+  top:12px;
+  right:12px;
+  white-space:nowrap;
+  overflow:hidden;
+  text-overflow:ellipsis;
+}
+</style>
+</head>
+
+<body>
+
+<div id="app">
+
+  <aside class="panel">
+    <div class="pad">
+
+      <h1>NORA V5.7.2 Knowledge Graph</h1>
+
+      <div class="small">
+        Progressive viewer:
+        Family → Pattern → Leaf → Interaction → semantic layers.
+      </div>
+
+      <h2>Load graph</h2>
+
+      <input
+        id="filePicker"
+        type="file"
+        accept=".json,application/json"
+        style="display:none"
+      >
+
+      <button id="loadFileBtn">
+        Choose graph_bundle.json
+      </button>
+
+      <div id="loadHint" class="small">
+        If opened through the local Python server, the graph loads automatically.
+        If opened directly as a file, use this button and select graph_bundle.json.
+      </div>
+
+      <h2>Search</h2>
+
+      <input
+        id="search"
+        placeholder="Search label / ID / type"
+      >
+
+      <button id="searchBtn">
+        Find and focus
+      </button>
+
+      <h2>View</h2>
+
+      <select id="typeFilter">
+        <option value="">All node types</option>
+      </select>
+
+      <div class="btnrow">
+        <button id="resetBtn">Reset</button>
+        <button id="backBtn">Back</button>
+      </div>
+
+      <div class="btnrow">
+        <button id="expandBtn">Expand selected</button>
+        <button id="hideBtn">Hide selected</button>
+      </div>
+
+      <h2>Statistics</h2>
+
+      <div class="stat">
+
+        <div class="card">
+          <div class="value" id="nodeCount">0</div>
+          <div class="label">Bundle nodes</div>
+        </div>
+
+        <div class="card">
+          <div class="value" id="edgeCount">0</div>
+          <div class="label">Bundle edges</div>
+        </div>
+
+        <div class="card">
+          <div class="value" id="visibleCount">0</div>
+          <div class="label">Visible nodes</div>
+        </div>
+
+        <div class="card">
+          <div class="value" id="visibleEdgeCount">0</div>
+          <div class="label">Visible edges</div>
+        </div>
+
+      </div>
+
+      <h2>Legend</h2>
+      <div id="legend" class="legend"></div>
+
+      <h2>Use</h2>
+
+      <div class="note">
+        Single click = inspect.
+        Double click = expand connected nodes.
+        The viewer deliberately does not draw all 50k+ nodes at once.
+      </div>
+
+    </div>
+  </aside>
+
+
+  <main id="stage">
+
+    <canvas id="canvas"></canvas>
+
+    <div id="crumbs">
+      Loading graph_bundle.json…
+    </div>
+
+    <div id="status">
+      Initializing…
+    </div>
+
+  </main>
+
+
+  <aside class="panel right">
+
+    <div class="pad">
+
+      <h1>Selected node</h1>
+
+      <div id="details" class="small">
+        Click a node.
+      </div>
+
+      <h2>Connected relationships</h2>
+
+      <div id="relations" class="small">
+        No node selected.
+      </div>
+
+    </div>
+
+  </aside>
+
+</div>
+
+
+<script>
+
+(() => {
+
+const canvas =
+  document.getElementById("canvas");
+
+const ctx =
+  canvas.getContext("2d");
+
+const stage =
+  document.getElementById("stage");
+
+const details =
+  document.getElementById("details");
+
+const relations =
+  document.getElementById("relations");
+
+const crumbs =
+  document.getElementById("crumbs");
+
+const status =
+  document.getElementById("status");
+
+const typeFilter =
+  document.getElementById("typeFilter");
+
+const filePicker =
+  document.getElementById("filePicker");
+
+const loadFileBtn =
+  document.getElementById("loadFileBtn");
+
+const loadHint =
+  document.getElementById("loadHint");
+
+
+const COLORS = {
+
+  CONTEXT_FAMILY:"#ef4444",
+  FAMILY:"#ef4444",
+
+  CONTEXT_PATTERN:"#f97316",
+  PATTERN:"#f97316",
+
+  CONTEXT_LEAF:"#f59e0b",
+  LEAF:"#f59e0b",
+
+  INTERACTION:"#8b5cf6",
+
+  PARTICIPANT:"#22c55e",
+
+  ENTITY:"#38bdf8",
+
+  DEVICE_MODEL:"#38bdf8",
+  DEVICE_TYPE:"#38bdf8",
+
+  SERVICE:"#0ea5e9",
+
+  NETWORK_TECHNOLOGY:"#06b6d4",
+  NETWORK_PROTOCOL:"#06b6d4",
+  NETWORK_CONFIGURATION:"#06b6d4",
+  NETWORK_RESOURCE:"#06b6d4",
+
+  CONTEXT_FACT:"#a78bfa",
+
+  ROOT_CAUSE:"#e11d48",
+
+  REMEDIATION:"#84cc16",
+
+  TOOL:"#facc15",
+
+  RELATION_MOTIF:"#fb7185",
+
+  FINGERPRINT:"#c084fc",
+
+  MEASUREMENT:"#10b981",
+
+  ATTRIBUTE:"#64748b",
+
+  DEFAULT:"#94a3b8"
+};
+
+
+const STATE = {
+
+  nodes:[],
+
+  edges:[],
+
+  byId:new Map(),
+
+  adjacency:new Map(),
+
+  visible:new Set(),
+
+  positions:new Map(),
+
+  selected:null,
+
+  history:[],
+
+  panX:0,
+
+  panY:0,
+
+  zoom:1,
+
+  dragging:false,
+
+  lastX:0,
+
+  lastY:0,
+
+  hidden:new Set()
+};
+
+
+function nodeId(node){
+
+  return String(
+    node.id ??
+    node.node_id ??
+    node.key ??
+    ""
+  );
+}
+
+
+function nodeType(node){
+
+  return String(
+    node.type ??
+    node.node_type ??
+    node.kind ??
+    "DEFAULT"
+  ).toUpperCase();
+}
+
+
+function nodeLabel(node){
+
+  return String(
+    node.label ??
+    node.name ??
+    node.title ??
+    node.canonical_name ??
+    nodeId(node)
+  );
+}
+
+
+function edgeSource(edge){
+
+  return String(
+    edge.source ??
+    edge.source_id ??
+    edge.from ??
+    ""
+  );
+}
+
+
+function edgeTarget(edge){
+
+  return String(
+    edge.target ??
+    edge.target_id ??
+    edge.to ??
+    ""
+  );
+}
+
+
+function edgePredicate(edge){
+
+  return String(
+    edge.predicate ??
+    edge.relationship ??
+    edge.type ??
+    edge.kind ??
+    "RELATED_TO"
+  );
+}
+
+
+function escapeHtml(value){
+
+  return String(value ?? "").replace(
+    /[&<>\"']/g,
+    char => ({
+      "&":"&amp;",
+      "<":"&lt;",
+      ">":"&gt;",
+      "\"":"&quot;",
+      "'":"&#039;"
+    }[char])
+  );
+}
+
+
+function getGraphArrays(bundle){
+
+  const nodes =
+    Array.isArray(bundle.nodes)
+      ? bundle.nodes
+      : Array.isArray(bundle.graph?.nodes)
+        ? bundle.graph.nodes
+        : Array.isArray(bundle.data?.nodes)
+          ? bundle.data.nodes
+          : [];
+
+  const edges =
+    Array.isArray(bundle.edges)
+      ? bundle.edges
+      : Array.isArray(bundle.graph?.edges)
+        ? bundle.graph.edges
+        : Array.isArray(bundle.data?.edges)
+          ? bundle.data.edges
+          : [];
+
+  return [nodes,edges];
+}
+
+
+function buildIndexes(){
+
+  STATE.byId.clear();
+
+  STATE.adjacency.clear();
+
+
+  for(const node of STATE.nodes){
+
+    const id =
+      nodeId(node);
+
+    if(!id){
+      continue;
+    }
+
+    STATE.byId.set(
+      id,
+      node
+    );
+
+    STATE.adjacency.set(
+      id,
+      []
+    );
+  }
+
+
+  for(const edge of STATE.edges){
+
+    const source =
+      edgeSource(edge);
+
+    const target =
+      edgeTarget(edge);
+
+
+    if(!STATE.adjacency.has(source)){
+      STATE.adjacency.set(
+        source,
+        []
+      );
+    }
+
+
+    if(!STATE.adjacency.has(target)){
+      STATE.adjacency.set(
+        target,
+        []
+      );
+    }
+
+
+    STATE.adjacency.get(source).push({
+
+      edge:edge,
+
+      other:target,
+
+      direction:"out"
+    });
+
+
+    STATE.adjacency.get(target).push({
+
+      edge:edge,
+
+      other:source,
+
+      direction:"in"
+    });
+  }
+}
+
+
+function findRootNodes(){
+
+  let roots =
+    STATE.nodes.filter(node =>
+
+      [
+        "CONTEXT_FAMILY",
+        "FAMILY"
+      ].includes(
+        nodeType(node)
+      )
+    );
+
+
+  if(roots.length){
+
+    return roots.slice(
+      0,
+      50
+    );
+  }
+
+
+  const incoming =
+    new Map(
+      [...STATE.byId.keys()].map(
+        key => [key,0]
+      )
+    );
+
+
+  for(const edge of STATE.edges){
+
+    const target =
+      edgeTarget(edge);
+
+    incoming.set(
+      target,
+      (incoming.get(target) || 0) + 1
+    );
+  }
+
+
+  roots =
+    STATE.nodes.filter(
+      node =>
+        (incoming.get(nodeId(node)) || 0) === 0
+    );
+
+
+  return (
+    roots.length
+      ? roots
+      : STATE.nodes
+  ).slice(
+    0,
+    30
+  );
+}
+
+
+function resizeCanvas(){
+
+  const rect =
+    stage.getBoundingClientRect();
+
+  const ratio =
+    window.devicePixelRatio || 1;
+
+
+  canvas.width =
+    Math.floor(
+      rect.width * ratio
+    );
+
+  canvas.height =
+    Math.floor(
+      rect.height * ratio
+    );
+
+
+  canvas.style.width =
+    rect.width + "px";
+
+  canvas.style.height =
+    rect.height + "px";
+
+
+  ctx.setTransform(
+    ratio,
+    0,
+    0,
+    ratio,
+    0,
+    0
+  );
+
+
+  draw();
+}
+
+
+window.addEventListener(
+  "resize",
+  resizeCanvas
+);
+
+
+function nodeRadius(node){
+
+  const type =
+    nodeType(node);
+
+
+  if(type.includes("FAMILY")){
+    return 11;
+  }
+
+  if(type.includes("PATTERN")){
+    return 9;
+  }
+
+  if(type.includes("LEAF")){
+    return 8;
+  }
+
+  if(type === "INTERACTION"){
+    return 7;
+  }
+
+  return 6;
+}
+
+
+function layoutGraph(focusId=null){
+
+  const width =
+    stage.clientWidth;
+
+  const height =
+    stage.clientHeight;
+
+  const ids =
+    [...STATE.visible];
+
+
+  if(!ids.length){
+    return;
+  }
+
+
+  const centerX =
+    width / 2;
+
+  const centerY =
+    height / 2;
+
+
+  if(
+    focusId &&
+    STATE.visible.has(focusId)
+  ){
+
+    STATE.positions.set(
+      focusId,
+      {
+        x:centerX,
+        y:centerY
+      }
+    );
+
+
+    const others =
+      ids.filter(
+        id => id !== focusId
+      );
+
+
+    others.forEach(
+      (id,index) => {
+
+        const ring =
+          1 +
+          Math.floor(
+            index / 40
+          );
+
+        const position =
+          index % 40;
+
+        const count =
+          Math.min(
+            40,
+            others.length -
+            (ring - 1) * 40
+          );
+
+        const angle =
+          2 *
+          Math.PI *
+          position /
+          Math.max(
+            count,
+            1
+          );
+
+        const radius =
+          110 *
+          ring;
+
+
+        STATE.positions.set(
+          id,
+          {
+            x:
+              centerX +
+              Math.cos(angle) *
+              radius,
+
+            y:
+              centerY +
+              Math.sin(angle) *
+              radius
+          }
+        );
+      }
+    );
+
+
+    return;
+  }
+
+
+  const groups =
+    new Map();
+
+
+  for(const id of ids){
+
+    const node =
+      STATE.byId.get(id);
+
+    const type =
+      nodeType(node);
+
+
+    if(!groups.has(type)){
+
+      groups.set(
+        type,
+        []
+      );
+    }
+
+
+    groups
+      .get(type)
+      .push(id);
+  }
+
+
+  [...groups.entries()]
+    .forEach(
+      ([type,list],groupIndex) => {
+
+        const groupAngle =
+          2 *
+          Math.PI *
+          groupIndex /
+          Math.max(
+            groups.size,
+            1
+          );
+
+
+        const groupX =
+          centerX +
+          Math.cos(groupAngle) *
+          150;
+
+
+        const groupY =
+          centerY +
+          Math.sin(groupAngle) *
+          150;
+
+
+        list.forEach(
+          (id,index) => {
+
+            const angle =
+              2 *
+              Math.PI *
+              index /
+              Math.max(
+                list.length,
+                1
+              );
+
+
+            const radius =
+              30 +
+              Math.min(
+                120,
+                Math.sqrt(list.length) *
+                14
+              );
+
+
+            STATE.positions.set(
+              id,
+              {
+                x:
+                  groupX +
+                  Math.cos(angle) *
+                  radius,
+
+                y:
+                  groupY +
+                  Math.sin(angle) *
+                  radius
+              }
+            );
+          }
+        );
+      }
+    );
+}
+
+
+function visibleEdges(){
+
+  return STATE.edges.filter(
+    edge =>
+      STATE.visible.has(
+        edgeSource(edge)
+      ) &&
+      STATE.visible.has(
+        edgeTarget(edge)
+      )
+  );
+}
+
+
+function draw(){
+
+  const width =
+    stage.clientWidth;
+
+  const height =
+    stage.clientHeight;
+
+
+  ctx.clearRect(
+    0,
+    0,
+    width,
+    height
+  );
+
+
+  ctx.save();
+
+
+  ctx.translate(
+    STATE.panX,
+    STATE.panY
+  );
+
+
+  ctx.scale(
+    STATE.zoom,
+    STATE.zoom
+  );
+
+
+  for(const edge of visibleEdges()){
+
+    const source =
+      STATE.positions.get(
+        edgeSource(edge)
+      );
+
+    const target =
+      STATE.positions.get(
+        edgeTarget(edge)
+      );
+
+
+    if(!source || !target){
+      continue;
+    }
+
+
+    ctx.strokeStyle =
+      "rgba(148,163,184,.28)";
+
+    ctx.lineWidth =
+      .8 /
+      STATE.zoom;
+
+
+    ctx.beginPath();
+
+    ctx.moveTo(
+      source.x,
+      source.y
+    );
+
+    ctx.lineTo(
+      target.x,
+      target.y
+    );
+
+    ctx.stroke();
+  }
+
+
+  for(const id of STATE.visible){
+
+    const node =
+      STATE.byId.get(id);
+
+    const position =
+      STATE.positions.get(id);
+
+
+    if(!node || !position){
+      continue;
+    }
+
+
+    const radius =
+      nodeRadius(node);
+
+
+    ctx.fillStyle =
+      COLORS[nodeType(node)] ||
+      COLORS.DEFAULT;
+
+
+    ctx.strokeStyle =
+      id === STATE.selected
+        ? "#ffffff"
+        : "rgba(255,255,255,.45)";
+
+
+    ctx.lineWidth =
+      (
+        id === STATE.selected
+          ? 2.4
+          : 1
+      ) /
+      STATE.zoom;
+
+
+    ctx.beginPath();
+
+    ctx.arc(
+      position.x,
+      position.y,
+      radius,
+      0,
+      Math.PI * 2
+    );
+
+
+    ctx.fill();
+
+    ctx.stroke();
+
+
+    if(
+      STATE.visible.size <= 180 ||
+      id === STATE.selected ||
+      nodeType(node).includes("FAMILY") ||
+      nodeType(node).includes("PATTERN")
+    ){
+
+      ctx.fillStyle =
+        "#e5e7eb";
+
+
+      ctx.font =
+        `${Math.max(
+          9,
+          11 / STATE.zoom
+        )}px Segoe UI`;
+
+
+      ctx.fillText(
+        nodeLabel(node).slice(
+          0,
+          42
+        ),
+
+        position.x +
+        radius +
+        4,
+
+        position.y +
+        3
+      );
+    }
+  }
+
+
+  ctx.restore();
+}
+
+
+function updateCounters(){
+
+  document
+    .getElementById("nodeCount")
+    .textContent =
+      STATE.nodes.length.toLocaleString();
+
+
+  document
+    .getElementById("edgeCount")
+    .textContent =
+      STATE.edges.length.toLocaleString();
+
+
+  document
+    .getElementById("visibleCount")
+    .textContent =
+      STATE.visible.size.toLocaleString();
+
+
+  document
+    .getElementById("visibleEdgeCount")
+    .textContent =
+      visibleEdges().length.toLocaleString();
+
+
+  status.textContent =
+    `Visible ${STATE.visible.size.toLocaleString()} / ` +
+    `${STATE.nodes.length.toLocaleString()} nodes • ` +
+    `Zoom ${STATE.zoom.toFixed(2)}x`;
+}
+
+
+function setVisible(
+  ids,
+  saveHistory=true
+){
+
+  if(saveHistory){
+
+    STATE.history.push(
+      new Set(
+        STATE.visible
+      )
+    );
+  }
+
+
+  STATE.visible =
+    new Set(
+      [...ids].filter(
+        id =>
+          STATE.byId.has(id) &&
+          !STATE.hidden.has(id)
+      )
+    );
+
+
+  layoutGraph();
+
+  updateCounters();
+
+  draw();
+}
+
+
+function resetGraph(){
+
+  STATE.history = [];
+
+  STATE.hidden.clear();
+
+  STATE.selected = null;
+
+  STATE.panX = 0;
+
+  STATE.panY = 0;
+
+  STATE.zoom = 1;
+
+
+  setVisible(
+    findRootNodes()
+      .map(nodeId),
+
+    false
+  );
+
+
+  crumbs.textContent =
+    "Top level: Context Families / root nodes";
+
+
+  showSelectedNode(
+    null
+  );
+}
+
+
+function expandNode(id){
+
+  if(!id){
+    return;
+  }
+
+
+  STATE.history.push(
+    new Set(
+      STATE.visible
+    )
+  );
+
+
+  STATE.visible.add(id);
+
+
+  let added =
+    0;
+
+
+  for(
+    const link
+    of
+    (STATE.adjacency.get(id) || [])
+  ){
+
+    if(
+      STATE.hidden.has(
+        link.other
+      )
+    ){
+      continue;
+    }
+
+
+    if(
+      !STATE.visible.has(
+        link.other
+      )
+    ){
+
+      STATE.visible.add(
+        link.other
+      );
+
+      added++;
+    }
+
+
+    if(added >= 250){
+      break;
+    }
+  }
+
+
+  layoutGraph(id);
+
+  updateCounters();
+
+  draw();
+
+
+  crumbs.textContent =
+    `Focused on ${nodeLabel(
+      STATE.byId.get(id)
+    )} — added ${added} connected nodes`;
+}
+
+
+function back(){
+
+  if(!STATE.history.length){
+    return;
+  }
+
+
+  STATE.visible =
+    STATE.history.pop();
+
+
+  layoutGraph();
+
+  updateCounters();
+
+  draw();
+}
+
+
+function showSelectedNode(id){
+
+  if(!id){
+
+    details.textContent =
+      "Click a node.";
+
+    relations.textContent =
+      "No node selected.";
+
+    return;
+  }
+
+
+  const node =
+    STATE.byId.get(id);
+
+
+  details.innerHTML =
+    `
+    <div class="card">
+
+      <div
+        class="value"
+        style="font-size:15px"
+      >
+        ${escapeHtml(
+          nodeLabel(node)
+        )}
+      </div>
+
+      <div class="small">
+        ${escapeHtml(
+          nodeType(node)
+        )}
+      </div>
+
+    </div>
+    `
+
+    +
+
+    Object.entries(node || {})
+
+      .filter(
+        ([key]) =>
+          ![
+            "id",
+            "node_id",
+            "key"
+          ].includes(key)
+      )
+
+      .slice(
+        0,
+        30
+      )
+
+      .map(
+        ([key,value]) =>
+
+          `
+          <div class="kv">
+
+            <b>
+              ${escapeHtml(key)}:
+            </b>
+
+            ${escapeHtml(
+              typeof value === "object"
+                ? JSON.stringify(value)
+                : value
+            )}
+
+          </div>
+          `
+      )
+
+      .join("");
+
+
+  const links =
+    (STATE.adjacency.get(id) || [])
+      .slice(
+        0,
+        80
+      );
+
+
+  relations.innerHTML =
+    links.length
+
+      ?
+
+      links.map(
+        link => {
+
+          const otherNode =
+            STATE.byId.get(
+              link.other
+            ) ||
+            {
+              id:link.other
+            };
+
+
+          return `
+          <div class="kv">
+
+            <span class="badge">
+              ${escapeHtml(
+                edgePredicate(
+                  link.edge
+                )
+              )}
+            </span>
+
+            ${
+              link.direction === "out"
+                ? "→"
+                : "←"
+            }
+
+            <b>
+              ${escapeHtml(
+                nodeLabel(
+                  otherNode
+                )
+              )}
+            </b>
+
+            <span class="small">
+              (
+              ${escapeHtml(
+                nodeType(
+                  otherNode
+                )
+              )}
+              )
+            </span>
+
+          </div>
+          `;
+        }
+      ).join("")
+
+      :
+
+      "No connected relationships.";
+}
+
+
+function screenToWorld(
+  x,
+  y
+){
+
+  return {
+
+    x:
+      (
+        x -
+        STATE.panX
+      ) /
+      STATE.zoom,
+
+    y:
+      (
+        y -
+        STATE.panY
+      ) /
+      STATE.zoom
+  };
+}
+
+
+function hitTest(
+  x,
+  y
+){
+
+  const point =
+    screenToWorld(
+      x,
+      y
+    );
+
+
+  let best =
+    null;
+
+  let distance =
+    Number.MAX_VALUE;
+
+
+  for(const id of STATE.visible){
+
+    const position =
+      STATE.positions.get(id);
+
+    const node =
+      STATE.byId.get(id);
+
+
+    if(!position || !node){
+      continue;
+    }
+
+
+    const currentDistance =
+      Math.hypot(
+        point.x -
+        position.x,
+
+        point.y -
+        position.y
+      );
+
+
+    if(
+      currentDistance <
+      nodeRadius(node) +
+      6 /
+      STATE.zoom
+      &&
+      currentDistance <
+      distance
+    ){
+
+      best =
+        id;
+
+      distance =
+        currentDistance;
+    }
+  }
+
+
+  return best;
+}
+
+
+function buildLegend(){
+
+  const counts =
+    new Map();
+
+
+  for(const node of STATE.nodes){
+
+    const type =
+      nodeType(node);
+
+
+    counts.set(
+      type,
+      (counts.get(type) || 0) + 1
+    );
+  }
+
+
+  const types =
+    [...counts.entries()]
+      .sort(
+        (a,b) =>
+          b[1] - a[1]
+      );
+
+
+  typeFilter.innerHTML =
+
+    `<option value="">All node types</option>`
+
+    +
+
+    types.map(
+      ([type,count]) =>
+
+        `
+        <option value="${escapeHtml(type)}">
+          ${escapeHtml(type)}
+          (${count})
+        </option>
+        `
+    ).join("");
+
+
+  document
+    .getElementById("legend")
+    .innerHTML =
+
+      types.slice(
+        0,
+        18
+      )
+
+      .map(
+        ([type]) =>
+
+          `
+          <span>
+
+            <i
+              class="dot"
+              style="background:${COLORS[type] || COLORS.DEFAULT}"
+            ></i>
+
+            ${escapeHtml(type)}
+
+          </span>
+          `
+      )
+
+      .join("");
+}
+
+
+function searchGraph(){
+
+  const query =
+    document
+      .getElementById("search")
+      .value
+      .trim()
+      .toLowerCase();
+
+
+  const filter =
+    typeFilter.value;
+
+
+  if(!query){
+    return;
+  }
+
+
+  const node =
+    STATE.nodes.find(
+      node =>
+
+        (
+          !filter ||
+          nodeType(node) === filter
+        )
+
+        &&
+
+        (
+          nodeLabel(node)
+            .toLowerCase()
+            .includes(query)
+
+          ||
+
+          nodeId(node)
+            .toLowerCase()
+            .includes(query)
+
+          ||
+
+          nodeType(node)
+            .toLowerCase()
+            .includes(query)
+        )
+    );
+
+
+  if(!node){
+
+    crumbs.textContent =
+      `No match for "${query}"`;
+
+    return;
+  }
+
+
+  const id =
+    nodeId(node);
+
+
+  const visible =
+    new Set(
+      [id]
+    );
+
+
+  for(
+    const link
+    of
+    (STATE.adjacency.get(id) || [])
+      .slice(
+        0,
+        150
+      )
+  ){
+
+    visible.add(
+      link.other
+    );
+  }
+
+
+  STATE.selected =
+    id;
+
+
+  setVisible(
+    visible
+  );
+
+
+  layoutGraph(
+    id
+  );
+
+
+  showSelectedNode(
+    id
+  );
+
+
+  draw();
+
+
+  crumbs.textContent =
+    `Search result: ${nodeLabel(node)} (${nodeType(node)})`;
+}
+
+
+function loadBundleObject(
+  bundle,
+  sourceLabel="graph_bundle.json"
+){
+
+  const [
+    nodes,
+    edges
+  ] =
+    getGraphArrays(
+      bundle
+    );
+
+
+  if(!nodes.length){
+
+    throw new Error(
+      "Selected graph bundle has no nodes array"
+    );
+  }
+
+
+  STATE.nodes =
+    nodes;
+
+  STATE.edges =
+    edges;
+
+
+  buildIndexes();
+
+  buildLegend();
+
+  resizeCanvas();
+
+  resetGraph();
+
+
+  status.textContent =
+    `Loaded ${nodes.length.toLocaleString()} nodes and ` +
+    `${edges.length.toLocaleString()} edges`;
+
+
+  crumbs.textContent =
+    `Loaded ${sourceLabel}`;
+}
+
+
+async function loadGraphFromFile(file){
+
+  try{
+
+    if(!file){
+      return;
+    }
+
+
+    status.textContent =
+      "Reading graph bundle…";
+
+
+    const raw =
+      await file.text();
+
+
+    const bundle =
+      JSON.parse(raw);
+
+
+    loadBundleObject(
+      bundle,
+      file.name
+    );
+  }
+
+  catch(error){
+
+    crumbs.textContent =
+      "ERROR: " +
+      error.message;
+
+
+    status.textContent =
+      "Viewer failed";
+
+
+    details.innerHTML =
+      `
+      <div class="note">
+
+        <b>
+          Could not read the selected graph bundle.
+        </b>
+
+        <br><br>
+
+        ${escapeHtml(
+          error.message
+        )}
+
+      </div>
+      `;
+  }
+}
+
+
+loadFileBtn.onclick =
+  () =>
+    filePicker.click();
+
+
+filePicker.onchange =
+  () =>
+    loadGraphFromFile(
+      filePicker.files &&
+      filePicker.files[0]
+    );
+
+
+canvas.addEventListener(
+  "mousedown",
+  event => {
+
+    STATE.dragging =
+      true;
+
+    STATE.lastX =
+      event.offsetX;
+
+    STATE.lastY =
+      event.offsetY;
+  }
+);
+
+
+canvas.addEventListener(
+  "mousemove",
+  event => {
+
+    if(!STATE.dragging){
+      return;
+    }
+
+
+    STATE.panX +=
+      event.offsetX -
+      STATE.lastX;
+
+
+    STATE.panY +=
+      event.offsetY -
+      STATE.lastY;
+
+
+    STATE.lastX =
+      event.offsetX;
+
+
+    STATE.lastY =
+      event.offsetY;
+
+
+    draw();
+  }
+);
+
+
+window.addEventListener(
+  "mouseup",
+  () => {
+
+    STATE.dragging =
+      false;
+  }
+);
+
+
+canvas.addEventListener(
+  "wheel",
+  event => {
+
+    event.preventDefault();
+
+
+    STATE.zoom =
+      Math.max(
+        .15,
+        Math.min(
+          5,
+
+          STATE.zoom *
+          (
+            event.deltaY < 0
+              ? 1.12
+              : .89
+          )
+        )
+      );
+
+
+    draw();
+
+    updateCounters();
+  },
+
+  {
+    passive:false
+  }
+);
+
+
+canvas.addEventListener(
+  "click",
+  event => {
+
+    const id =
+      hitTest(
+        event.offsetX,
+        event.offsetY
+      );
+
+
+    if(id){
+
+      STATE.selected =
+        id;
+
+
+      showSelectedNode(
+        id
+      );
+
+
+      draw();
+    }
+  }
+);
+
+
+canvas.addEventListener(
+  "dblclick",
+  event => {
+
+    const id =
+      hitTest(
+        event.offsetX,
+        event.offsetY
+      );
+
+
+    if(id){
+
+      STATE.selected =
+        id;
+
+
+      showSelectedNode(
+        id
+      );
+
+
+      expandNode(
+        id
+      );
+    }
+  }
+);
+
+
+document
+  .getElementById("searchBtn")
+  .onclick =
+    searchGraph;
+
+
+document
+  .getElementById("search")
+  .addEventListener(
+    "keydown",
+    event => {
+
+      if(event.key === "Enter"){
+
+        searchGraph();
+      }
+    }
+  );
+
+
+document
+  .getElementById("resetBtn")
+  .onclick =
+    resetGraph;
+
+
+document
+  .getElementById("backBtn")
+  .onclick =
+    back;
+
+
+document
+  .getElementById("expandBtn")
+  .onclick =
+    () =>
+      expandNode(
+        STATE.selected
+      );
+
+
+document
+  .getElementById("hideBtn")
+  .onclick =
+    () => {
+
+      if(STATE.selected){
+
+        STATE.hidden.add(
+          STATE.selected
+        );
+
+
+        STATE.visible.delete(
+          STATE.selected
+        );
+
+
+        STATE.selected =
+          null;
+
+
+        layoutGraph();
+
+        updateCounters();
+
+        draw();
+
+        showSelectedNode(
+          null
+        );
+      }
+    };
+
+
+typeFilter.onchange =
+  () => {
+
+    const filter =
+      typeFilter.value;
+
+
+    if(!filter){
+
+      resetGraph();
+
+      return;
+    }
+
+
+    setVisible(
+
+      STATE.nodes
+
+        .filter(
+          node =>
+            nodeType(node) === filter
+        )
+
+        .slice(
+          0,
+          250
+        )
+
+        .map(
+          nodeId
+        )
+    );
+
+
+    crumbs.textContent =
+      `Node type filter: ${filter}`;
+  };
+
+
+async function initializeViewer(){
+
+  /*
+   * If viewer.html is opened directly using file://,
+   * browser security normally blocks automatic JSON fetch.
+   *
+   * In that case, the user can manually choose graph_bundle.json.
+   */
+
+  if(
+    location.protocol === "file:"
+  ){
+
+    crumbs.textContent =
+      "Direct file mode: choose graph_bundle.json";
+
+
+    status.textContent =
+      "Waiting for graph bundle";
+
+
+    loadHint.textContent =
+      "Direct file mode detected. " +
+      "Click “Choose graph_bundle.json” " +
+      "and select the generated graph_bundle.json file.";
+
+
+    return;
+  }
+
+
+  try{
+
+    const response =
+      await fetch(
+        "graph_bundle.json",
+        {
+          cache:"no-store"
+        }
+      );
+
+
+    if(!response.ok){
+
+      throw new Error(
+        `HTTP ${response.status} loading graph_bundle.json`
+      );
+    }
+
+
+    const bundle =
+      await response.json();
+
+
+    loadBundleObject(
+      bundle,
+      "graph_bundle.json"
+    );
+  }
+
+  catch(error){
+
+    crumbs.textContent =
+      "ERROR: " +
+      error.message;
+
+
+    status.textContent =
+      "Automatic load failed";
+
+
+    details.innerHTML =
+      `
+      <div class="note">
+
+        <b>
+          Automatic graph load failed.
+        </b>
+
+        <br><br>
+
+        ${escapeHtml(
+          error.message
+        )}
+
+        <br><br>
+
+        You can still click
+        <b>Choose graph_bundle.json</b>
+        on the left and select the file manually.
+
+      </div>
+      `;
+  }
+}
+
+
+initializeViewer();
+
+})();
+</script>
+
+</body>
+</html>

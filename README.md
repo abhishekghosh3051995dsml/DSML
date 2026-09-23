@@ -1,1 +1,2 @@
-python ".\nora_v572_reference_graph.py" --bundle ".\nora_v572_graph\graph_bundle.json" --output ".\nora_v572_graph\nora_v572_reference.html" --max-nodes 2280 --max-edges 2000
+
+python ".\nora_v572_balanced_projection.py" --input ".\nora_v572_graph\graph_bundle.json" --output ".\nora_v572_graph\graph_bundle_reference.json" --max-nodes 2280 --max-edges 2000 --interaction-share 0.20

@@ -1,0 +1,1041 @@
+#!/usr/bin/env python3
+"""
+NORA V5.7.2 Balanced Knowledge-Graph Projection
+================================================
+
+Purpose
+-------
+The full NORA graph can contain tens of thousands of nodes/edges.
+
+A naive "take highest degree edges" projection causes high-degree hubs such as:
+
+    assistant -> Interaction
+    user      -> Interaction
+
+to consume the entire visualization.
+
+This module creates a STRUCTURE-PRESERVING projection which retains:
+
+    Context Family
+    Context Pattern
+    Context Leaf
+    Participant
+    Entity
+    Context Fact
+    Tool
+    Root Cause
+    Remediation
+    Diagnostic Evidence
+    Relation Motif
+    Fingerprint
+    Attribute / Measurement
+    Interaction
+
+The algorithm is:
+
+1. Inspect all available node classes dynamically.
+2. Reserve representation for every available class.
+3. Prevent INTERACTION nodes from dominating the graph.
+4. Prefer semantic / cross-type relationships.
+5. Penalize giant participant hubs.
+6. Preserve hierarchy relationships.
+7. Keep predicate diversity.
+8. Write a normal graph_bundle JSON compatible with the
+   existing NORA reference viewer.
+
+No pretrained models are required.
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import json
+import math
+from collections import Counter, defaultdict
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Mapping, Sequence, Set, Tuple
+
+
+# ---------------------------------------------------------------------
+# Generic helpers
+# ---------------------------------------------------------------------
+
+def clean(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def upper(value: Any) -> str:
+    return clean(value).upper()
+
+
+def number(value: Any, default: float = 0.0) -> float:
+    try:
+        x = float(value)
+        return x if math.isfinite(x) else default
+    except (TypeError, ValueError):
+        return default
+
+
+def node_id(node: Mapping[str, Any]) -> str:
+    return clean(
+        node.get("id")
+        or node.get("node_id")
+        or node.get("key")
+    )
+
+
+def node_type(node: Mapping[str, Any]) -> str:
+    value = (
+        node.get("type")
+        or node.get("node_type")
+        or node.get("class")
+        or "UNKNOWN"
+    )
+    return upper(value)
+
+
+def node_label(node: Mapping[str, Any]) -> str:
+    return clean(
+        node.get("label")
+        or node.get("name")
+        or node.get("title")
+        or node_id(node)
+    )
+
+
+def edge_source(edge: Mapping[str, Any]) -> str:
+    return clean(
+        edge.get("source")
+        or edge.get("from")
+        or edge.get("subject")
+    )
+
+
+def edge_target(edge: Mapping[str, Any]) -> str:
+    return clean(
+        edge.get("target")
+        or edge.get("to")
+        or edge.get("object")
+    )
+
+
+def edge_predicate(edge: Mapping[str, Any]) -> str:
+    return upper(
+        edge.get("predicate")
+        or edge.get("relationship")
+        or edge.get("relation")
+        or edge.get("type")
+        or "RELATED_TO"
+    )
+
+
+def edge_confidence(edge: Mapping[str, Any]) -> float:
+    for key in (
+        "mean_confidence",
+        "confidence",
+        "score",
+        "weight",
+    ):
+        if key in edge:
+            return number(edge.get(key), 0.0)
+    return 0.0
+
+
+def node_count(node: Mapping[str, Any]) -> float:
+    for key in (
+        "count",
+        "frequency",
+        "support",
+        "occurrence_count",
+    ):
+        if key in node:
+            return number(node.get(key), 1.0)
+    return 1.0
+
+
+# ---------------------------------------------------------------------
+# Classification helpers
+# ---------------------------------------------------------------------
+
+def is_interaction(t: str) -> bool:
+    return t == "INTERACTION"
+
+
+def is_participant(t: str) -> bool:
+    return t == "PARTICIPANT"
+
+
+def is_structural(t: str) -> bool:
+    """
+    Hierarchy / clustering backbone.
+    """
+    return t in {
+        "CONTEXT_FAMILY",
+        "CONTEXT_PATTERN",
+        "CONTEXT_LEAF",
+    }
+
+
+def is_semantic(t: str) -> bool:
+    """
+    Owned semantic layers from V5.7.2.
+    """
+    return t in {
+        "PARTICIPANT",
+        "ENTITY",
+        "CONTEXT_FACT",
+        "TOOL",
+        "ROOT_CAUSE",
+        "REMEDIATION",
+        "RELATION_MOTIF",
+        "MOTIF",
+        "FINGERPRINT",
+        "DIAGNOSTIC_EVIDENCE",
+        "EVIDENCE",
+        "ATTRIBUTE",
+        "MEASUREMENT",
+        "MEASUREMENTS",
+    }
+
+
+def hierarchy_predicate(predicate: str) -> bool:
+    p = upper(predicate)
+
+    hierarchy_terms = (
+        "HAS_FAMILY",
+        "HAS_PATTERN",
+        "HAS_LEAF",
+        "HAS_CONTEXT",
+        "CONTAINS",
+        "MEMBER",
+        "PARENT",
+        "CHILD",
+        "BELONG",
+    )
+
+    return any(term in p for term in hierarchy_terms)
+
+
+# ---------------------------------------------------------------------
+# Graph statistics
+# ---------------------------------------------------------------------
+
+def build_statistics(
+    nodes: Sequence[Mapping[str, Any]],
+    edges: Sequence[Mapping[str, Any]],
+):
+    node_lookup: Dict[str, Mapping[str, Any]] = {
+        node_id(n): n
+        for n in nodes
+        if node_id(n)
+    }
+
+    degree: Counter[str] = Counter()
+    semantic_degree: Counter[str] = Counter()
+    incidence: Dict[str, List[int]] = defaultdict(list)
+
+    for index, edge in enumerate(edges):
+        s = edge_source(edge)
+        t = edge_target(edge)
+
+        if not s or not t:
+            continue
+
+        if s not in node_lookup or t not in node_lookup:
+            continue
+
+        degree[s] += 1
+        degree[t] += 1
+
+        incidence[s].append(index)
+        incidence[t].append(index)
+
+        st = node_type(node_lookup[s])
+        tt = node_type(node_lookup[t])
+
+        if st != tt:
+            semantic_degree[s] += 1
+            semantic_degree[t] += 1
+
+    return node_lookup, degree, semantic_degree, incidence
+
+
+# ---------------------------------------------------------------------
+# Node scoring
+# ---------------------------------------------------------------------
+
+def node_rank(
+    node: Mapping[str, Any],
+    degree: Mapping[str, int],
+    semantic_degree: Mapping[str, int],
+) -> Tuple[float, float, float, str]:
+
+    nid = node_id(node)
+
+    semantic = float(semantic_degree.get(nid, 0))
+    total = float(degree.get(nid, 0))
+    support = math.log1p(max(0.0, node_count(node)))
+
+    # Semantic connectivity is more useful than raw hub degree.
+    score = (
+        4.0 * semantic
+        + 1.0 * math.sqrt(total)
+        + 1.5 * support
+    )
+
+    return (
+        score,
+        semantic,
+        support,
+        nid,
+    )
+
+
+# ---------------------------------------------------------------------
+# Dynamic quota allocation
+# ---------------------------------------------------------------------
+
+def allocate_quotas(
+    groups: Mapping[str, Sequence[Mapping[str, Any]]],
+    budget: int,
+) -> Dict[str, int]:
+
+    if budget <= 0 or not groups:
+        return {k: 0 for k in groups}
+
+    active = {
+        key: len(value)
+        for key, value in groups.items()
+        if value
+    }
+
+    if not active:
+        return {k: 0 for k in groups}
+
+    quotas: Dict[str, int] = {
+        key: 1
+        for key in active
+    }
+
+    used = len(quotas)
+
+    if used >= budget:
+        ordered = sorted(
+            active,
+            key=lambda k: active[k],
+            reverse=True,
+        )
+
+        return {
+            key: int(i < budget)
+            for i, key in enumerate(ordered)
+        }
+
+    remaining = budget - used
+
+    # sqrt weighting prevents massive classes from swallowing everything.
+    weights = {
+        key: math.sqrt(size)
+        for key, size in active.items()
+    }
+
+    while remaining > 0:
+        eligible = [
+            key
+            for key in active
+            if quotas[key] < active[key]
+        ]
+
+        if not eligible:
+            break
+
+        total_weight = sum(weights[key] for key in eligible)
+
+        if total_weight <= 0:
+            break
+
+        allocations: Dict[str, int] = {}
+
+        for key in eligible:
+            share = remaining * weights[key] / total_weight
+            allocations[key] = max(0, int(math.floor(share)))
+
+        allocated = sum(allocations.values())
+
+        if allocated == 0:
+            # Largest underrepresented group gets the next item.
+            best = max(
+                eligible,
+                key=lambda key: (
+                    active[key] - quotas[key],
+                    weights[key],
+                ),
+            )
+            quotas[best] += 1
+            remaining -= 1
+            continue
+
+        for key, amount in allocations.items():
+            room = active[key] - quotas[key]
+            take = min(room, amount, remaining)
+
+            quotas[key] += take
+            remaining -= take
+
+            if remaining <= 0:
+                break
+
+    return {
+        key: quotas.get(key, 0)
+        for key in groups
+    }
+
+
+# ---------------------------------------------------------------------
+# Balanced node selection
+# ---------------------------------------------------------------------
+
+def select_nodes(
+    nodes: Sequence[Mapping[str, Any]],
+    degree: Mapping[str, int],
+    semantic_degree: Mapping[str, int],
+    max_nodes: int,
+    interaction_share: float,
+) -> List[Mapping[str, Any]]:
+
+    if len(nodes) <= max_nodes:
+        return list(nodes)
+
+    groups: Dict[str, List[Mapping[str, Any]]] = defaultdict(list)
+
+    for node in nodes:
+        groups[node_type(node)].append(node)
+
+    interactions = groups.pop("INTERACTION", [])
+
+    # Interactions are evidence/detail nodes.
+    # They must not consume the whole projection.
+    interaction_budget = min(
+        len(interactions),
+        max(
+            0,
+            int(round(max_nodes * interaction_share)),
+        ),
+    )
+
+    semantic_budget = max_nodes - interaction_budget
+
+    quotas = allocate_quotas(
+        groups=groups,
+        budget=semantic_budget,
+    )
+
+    selected: List[Mapping[str, Any]] = []
+
+    for ntype, members in groups.items():
+        ranked = sorted(
+            members,
+            key=lambda n: node_rank(
+                n,
+                degree,
+                semantic_degree,
+            ),
+            reverse=True,
+        )
+
+        selected.extend(
+            ranked[: quotas.get(ntype, 0)]
+        )
+
+    # Fill unused semantic capacity before interactions.
+    if len(selected) < semantic_budget:
+        selected_ids = {
+            node_id(n)
+            for n in selected
+        }
+
+        remainder = [
+            n
+            for n in nodes
+            if not is_interaction(node_type(n))
+            and node_id(n) not in selected_ids
+        ]
+
+        remainder.sort(
+            key=lambda n: node_rank(
+                n,
+                degree,
+                semantic_degree,
+            ),
+            reverse=True,
+        )
+
+        selected.extend(
+            remainder[
+                : semantic_budget - len(selected)
+            ]
+        )
+
+    ranked_interactions = sorted(
+        interactions,
+        key=lambda n: node_rank(
+            n,
+            degree,
+            semantic_degree,
+        ),
+        reverse=True,
+    )
+
+    selected.extend(
+        ranked_interactions[:interaction_budget]
+    )
+
+    # Final safety cap.
+    return selected[:max_nodes]
+
+
+# ---------------------------------------------------------------------
+# Edge scoring
+# ---------------------------------------------------------------------
+
+def calculate_edge_score(
+    edge: Mapping[str, Any],
+    node_lookup: Mapping[str, Mapping[str, Any]],
+    degree: Mapping[str, int],
+    predicate_frequency: Mapping[str, int],
+) -> float:
+
+    s = edge_source(edge)
+    t = edge_target(edge)
+    p = edge_predicate(edge)
+
+    sn = node_lookup.get(s)
+    tn = node_lookup.get(t)
+
+    if sn is None or tn is None:
+        return -1e9
+
+    st = node_type(sn)
+    tt = node_type(tn)
+
+    score = 0.0
+
+    # Backbone relationships are crucial.
+    if hierarchy_predicate(p):
+        score += 100.0
+
+    if is_structural(st) or is_structural(tt):
+        score += 60.0
+
+    # Cross-semantic-layer relationships are useful.
+    if st != tt:
+        score += 30.0
+
+    if is_semantic(st):
+        score += 15.0
+
+    if is_semantic(tt):
+        score += 15.0
+
+    # Semantic-to-semantic is highly informative.
+    if (
+        is_semantic(st)
+        and is_semantic(tt)
+        and not is_interaction(st)
+        and not is_interaction(tt)
+    ):
+        score += 25.0
+
+    # Interaction edges remain available but are not dominant.
+    if is_interaction(st) or is_interaction(tt):
+        score -= 8.0
+
+    # Participant ↔ Interaction is precisely the hub pattern that
+    # dominated the previous visualization.
+    if (
+        (is_participant(st) and is_interaction(tt))
+        or
+        (is_participant(tt) and is_interaction(st))
+    ):
+        score -= 40.0
+
+    confidence = edge_confidence(edge)
+
+    score += 10.0 * confidence
+
+    # Rare predicates get a diversity boost.
+    freq = max(
+        1,
+        int(predicate_frequency.get(p, 1)),
+    )
+
+    score += 15.0 / math.sqrt(freq)
+
+    # Penalise giant hubs.
+    hub = max(
+        degree.get(s, 0),
+        degree.get(t, 0),
+    )
+
+    score -= math.log1p(hub)
+
+    return score
+
+
+# ---------------------------------------------------------------------
+# Balanced edge selection
+# ---------------------------------------------------------------------
+
+def select_edges(
+    all_edges: Sequence[Mapping[str, Any]],
+    selected_nodes: Sequence[Mapping[str, Any]],
+    full_lookup: Mapping[str, Mapping[str, Any]],
+    degree: Mapping[str, int],
+    max_edges: int,
+) -> List[Mapping[str, Any]]:
+
+    selected_ids: Set[str] = {
+        node_id(n)
+        for n in selected_nodes
+        if node_id(n)
+    }
+
+    candidates: List[Mapping[str, Any]] = []
+
+    for edge in all_edges:
+        s = edge_source(edge)
+        t = edge_target(edge)
+
+        if s in selected_ids and t in selected_ids:
+            candidates.append(edge)
+
+    if len(candidates) <= max_edges:
+        return candidates
+
+    predicate_frequency = Counter(
+        edge_predicate(e)
+        for e in candidates
+    )
+
+    predicate_count = max(
+        1,
+        len(predicate_frequency),
+    )
+
+    # Dynamic per-predicate ceiling.
+    # Prevents one relationship type from swallowing the graph.
+    predicate_cap = max(
+        1,
+        int(
+            math.ceil(
+                (max_edges / predicate_count) * 2.0
+            )
+        ),
+    )
+
+    scored = [
+        (
+            calculate_edge_score(
+                edge=e,
+                node_lookup=full_lookup,
+                degree=degree,
+                predicate_frequency=predicate_frequency,
+            ),
+            index,
+            e,
+        )
+        for index, e in enumerate(candidates)
+    ]
+
+    scored.sort(
+        key=lambda x: (x[0], -x[1]),
+        reverse=True,
+    )
+
+    chosen: List[Mapping[str, Any]] = []
+    chosen_indexes: Set[int] = set()
+    predicate_used: Counter[str] = Counter()
+
+    # ---------------------------------------------------------------
+    # PASS 1 — guarantee structural relationships first
+    # ---------------------------------------------------------------
+
+    for score, idx, edge in scored:
+
+        if len(chosen) >= max_edges:
+            break
+
+        p = edge_predicate(edge)
+
+        if not hierarchy_predicate(p):
+            continue
+
+        chosen.append(edge)
+        chosen_indexes.add(idx)
+        predicate_used[p] += 1
+
+    # ---------------------------------------------------------------
+    # PASS 2 — obtain semantic node coverage
+    # ---------------------------------------------------------------
+
+    covered: Set[str] = set()
+
+    for edge in chosen:
+        covered.add(edge_source(edge))
+        covered.add(edge_target(edge))
+
+    semantic_ids = {
+        node_id(n)
+        for n in selected_nodes
+        if not is_interaction(node_type(n))
+    }
+
+    edges_by_node: Dict[str, List[Tuple[float, int, Mapping[str, Any]]]] = (
+        defaultdict(list)
+    )
+
+    for item in scored:
+        score, idx, edge = item
+
+        edges_by_node[edge_source(edge)].append(item)
+        edges_by_node[edge_target(edge)].append(item)
+
+    missing_semantic = sorted(
+        semantic_ids - covered,
+        key=lambda nid: degree.get(nid, 0),
+        reverse=True,
+    )
+
+    for nid in missing_semantic:
+
+        if len(chosen) >= max_edges:
+            break
+
+        for score, idx, edge in edges_by_node.get(nid, []):
+
+            if idx in chosen_indexes:
+                continue
+
+            p = edge_predicate(edge)
+
+            if predicate_used[p] >= predicate_cap:
+                continue
+
+            chosen.append(edge)
+            chosen_indexes.add(idx)
+            predicate_used[p] += 1
+
+            covered.add(edge_source(edge))
+            covered.add(edge_target(edge))
+            break
+
+    # ---------------------------------------------------------------
+    # PASS 3 — fill remaining budget by semantic relevance
+    # ---------------------------------------------------------------
+
+    for score, idx, edge in scored:
+
+        if len(chosen) >= max_edges:
+            break
+
+        if idx in chosen_indexes:
+            continue
+
+        p = edge_predicate(edge)
+
+        if predicate_used[p] >= predicate_cap:
+            continue
+
+        chosen.append(edge)
+        chosen_indexes.add(idx)
+        predicate_used[p] += 1
+
+    # ---------------------------------------------------------------
+    # PASS 4 — if predicate caps leave spare capacity, fill it
+    # ---------------------------------------------------------------
+
+    if len(chosen) < max_edges:
+
+        for score, idx, edge in scored:
+
+            if len(chosen) >= max_edges:
+                break
+
+            if idx in chosen_indexes:
+                continue
+
+            chosen.append(edge)
+            chosen_indexes.add(idx)
+
+    return chosen[:max_edges]
+
+
+# ---------------------------------------------------------------------
+# Reporting
+# ---------------------------------------------------------------------
+
+def print_distribution(
+    title: str,
+    nodes: Sequence[Mapping[str, Any]],
+) -> None:
+
+    counts = Counter(
+        node_type(n)
+        for n in nodes
+    )
+
+    print()
+    print(title)
+    print("-" * len(title))
+
+    for key, value in counts.most_common():
+        print(f"{key:28s} {value:8,d}")
+
+
+def print_edge_distribution(
+    title: str,
+    edges: Sequence[Mapping[str, Any]],
+) -> None:
+
+    counts = Counter(
+        edge_predicate(e)
+        for e in edges
+    )
+
+    print()
+    print(title)
+    print("-" * len(title))
+
+    for key, value in counts.most_common(30):
+        print(f"{key:32s} {value:8,d}")
+
+
+# ---------------------------------------------------------------------
+# Main projection
+# ---------------------------------------------------------------------
+
+def build_projection(
+    input_path: Path,
+    output_path: Path,
+    max_nodes: int,
+    max_edges: int,
+    interaction_share: float,
+) -> None:
+
+    print(f"[1/6] Reading: {input_path}")
+
+    with input_path.open(
+        "r",
+        encoding="utf-8",
+    ) as handle:
+        bundle = json.load(handle)
+
+    nodes = bundle.get("nodes", [])
+    edges = bundle.get("edges", [])
+
+    if not isinstance(nodes, list):
+        raise TypeError(
+            "graph_bundle.json field 'nodes' must be a list."
+        )
+
+    if not isinstance(edges, list):
+        raise TypeError(
+            "graph_bundle.json field 'edges' must be a list."
+        )
+
+    print(
+        f"[2/6] Full graph: "
+        f"{len(nodes):,} nodes / "
+        f"{len(edges):,} edges"
+    )
+
+    (
+        lookup,
+        degree,
+        semantic_degree,
+        incidence,
+    ) = build_statistics(
+        nodes,
+        edges,
+    )
+
+    print_distribution(
+        "FULL NODE TYPE DISTRIBUTION",
+        nodes,
+    )
+
+    selected_nodes = select_nodes(
+        nodes=nodes,
+        degree=degree,
+        semantic_degree=semantic_degree,
+        max_nodes=max_nodes,
+        interaction_share=interaction_share,
+    )
+
+    print(
+        f"\n[3/6] Balanced node selection: "
+        f"{len(selected_nodes):,}"
+    )
+
+    selected_edges = select_edges(
+        all_edges=edges,
+        selected_nodes=selected_nodes,
+        full_lookup=lookup,
+        degree=degree,
+        max_edges=max_edges,
+    )
+
+    print(
+        f"[4/6] Balanced edge selection: "
+        f"{len(selected_edges):,}"
+    )
+
+    # Keep the original top-level schema intact.
+    projected = copy.deepcopy(bundle)
+
+    projected["nodes"] = selected_nodes
+    projected["edges"] = selected_edges
+
+    projected["projection"] = {
+        "name": "NORA_V5.7.2_BALANCED_REFERENCE",
+        "source_nodes": len(nodes),
+        "source_edges": len(edges),
+        "projected_nodes": len(selected_nodes),
+        "projected_edges": len(selected_edges),
+        "max_nodes": max_nodes,
+        "max_edges": max_edges,
+        "interaction_share": interaction_share,
+        "strategy": (
+            "type-balanced + hierarchy-preserving + "
+            "semantic-edge-diversity + hub-penalty"
+        ),
+    }
+
+    output_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    with output_path.open(
+        "w",
+        encoding="utf-8",
+    ) as handle:
+        json.dump(
+            projected,
+            handle,
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    print_distribution(
+        "PROJECTED NODE TYPE DISTRIBUTION",
+        selected_nodes,
+    )
+
+    print_edge_distribution(
+        "PROJECTED RELATIONSHIP DISTRIBUTION",
+        selected_edges,
+    )
+
+    print()
+    print(
+        f"[5/6] Written: {output_path.resolve()}"
+    )
+
+    print()
+    print(
+        "[6/6] Projection complete."
+    )
+
+
+# ---------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------
+
+def parse_args() -> argparse.Namespace:
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Create a type-balanced NORA V5.7.2 "
+            "knowledge-graph projection."
+        )
+    )
+
+    parser.add_argument(
+        "--input",
+        required=True,
+        help="Full graph_bundle.json",
+    )
+
+    parser.add_argument(
+        "--output",
+        required=True,
+        help="Balanced output bundle",
+    )
+
+    parser.add_argument(
+        "--max-nodes",
+        type=int,
+        default=2280,
+    )
+
+    parser.add_argument(
+        "--max-edges",
+        type=int,
+        default=2000,
+    )
+
+    parser.add_argument(
+        "--interaction-share",
+        type=float,
+        default=0.20,
+        help=(
+            "Maximum fraction of visible nodes reserved "
+            "for INTERACTION. Default: 0.20"
+        ),
+    )
+
+    args = parser.parse_args()
+
+    if args.max_nodes <= 0:
+        parser.error("--max-nodes must be > 0")
+
+    if args.max_edges <= 0:
+        parser.error("--max-edges must be > 0")
+
+    if not 0.0 <= args.interaction_share <= 1.0:
+        parser.error(
+            "--interaction-share must be between 0 and 1"
+        )
+
+    return args
+
+
+def main() -> int:
+
+    args = parse_args()
+
+    input_path = Path(args.input).expanduser().resolve()
+    output_path = Path(args.output).expanduser().resolve()
+
+    if not input_path.exists():
+        raise FileNotFoundError(
+            f"Input bundle not found: {input_path}"
+        )
+
+    build_projection(
+        input_path=input_path,
+        output_path=output_path,
+        max_nodes=args.max_nodes,
+        max_edges=args.max_edges,
+        interaction_share=args.interaction_share,
+    )
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,15 +1,9 @@
 #!/usr/bin/env python3
-"""NORA Entity-Context v7.1 — final standalone full-coverage evidence-grounded entity/context/RCA/relation analytics.
+"""NORA Entity-Context v7.1 — full-coverage evidence-grounded entity, context, RCA and
+relation analytics.
 
-Design constraints:
-- No external/pretrained language model downloads.
-- No Hugging Face/SentenceTransformer/GLiNER/BGE dependency.
-- Train-only classical/statistical representations and locally learned
-  distributional semantics.
-- Full-coverage context-pattern discovery is primary; entity/context/evidence/relation/RCA/remediation are the owned semantic layers.
-- v5.7.1 preserves the successful V5.7/V5.6 full-coverage clustering behavior and tightens normalization, relation grounding, RCA calibration, and quality audits,
-  and intentionally defers ontology integration until an approved NORA/TM Forum ontology is supplied.
-- No BERT/Transformer/pretrained embedding weights are downloaded or required.
+Every representation is trained locally from the supplied corpus. Ontology integration is
+deferred until an approved NORA/TM Forum ontology is supplied.
 """
 from __future__ import annotations
 import argparse, hashlib, html as html_lib, json, logging, math, os, platform, re, sys, time, warnings
@@ -25,11 +19,7 @@ import numpy as np, pandas as pd
 from scipy import sparse
 from scipy.cluster.hierarchy import leaves_list, linkage
 from scipy.spatial.distance import squareform
-from sklearn.cluster import AgglomerativeClustering, Birch, DBSCAN, MiniBatchKMeans, OPTICS
-try:
-    from sklearn.cluster import HDBSCAN
-except Exception:
-    HDBSCAN=None
+from sklearn.cluster import AgglomerativeClustering, Birch
 from sklearn.decomposition import NMF, TruncatedSVD
 try:
     from sklearn.decomposition import MiniBatchNMF
@@ -1055,95 +1045,10 @@ def predict_cluster(model,v):
     # Production inference deliberately uses calibrated public centroids for all methods.
     return _predict_by_centroids(model,v)
 
-def _k_distance_eps(v,min_samples):
-    k=min(max(2,int(min_samples)),len(v));dist,_=NearestNeighbors(n_neighbors=k,metric="euclidean",n_jobs=-1).fit(v).kneighbors(v);kd=np.sort(dist[:,-1]);return sorted(set(round(float(x),6) for x in np.quantile(kd,[.55,.65,.75,.82,.88,.92]).tolist() if np.isfinite(x) and x>1e-6))
-
-def _density_min_samples(n):
-    b=max(4,int(round(math.log2(max(n,4)))));return sorted(set(max(3,int(round(x))) for x in (.65*b,b,1.35*b)))
-
-def _candidate_stability(v,method,params,seed,repeats):
-    if len(v)<24 or repeats<2:return 0.0
-    rng=np.random.default_rng(seed);sn=max(16,int(.82*len(v)));runs=[]
-    for r in range(repeats):
-        idx=np.sort(rng.choice(len(v),sn,replace=False))
-        try:
-            if method=="dbscan":lab=DBSCAN(eps=params["eps"],min_samples=params["min_samples"],metric="euclidean",n_jobs=-1).fit_predict(v[idx])
-            elif method=="optics":
-                with warnings.catch_warnings():
-                    warnings.filterwarnings("ignore",message="divide by zero encountered in divide",category=RuntimeWarning)
-                    lab=OPTICS(min_samples=params["min_samples"],min_cluster_size=params["min_cluster_size"],xi=params["xi"],metric="euclidean",n_jobs=-1).fit_predict(v[idx])
-            elif method=="hdbscan" and HDBSCAN is not None:
-                lab=HDBSCAN(min_cluster_size=params["min_cluster_size"],min_samples=params["min_samples"],cluster_selection_method=params["cluster_selection_method"],metric="euclidean",n_jobs=-1,copy=False).fit_predict(v[idx])
-            else:lab=MiniBatchKMeans(n_clusters=params["n_clusters"],random_state=seed+r,batch_size=min(1024,max(128,sn)),n_init="auto").fit_predict(v[idx])
-            runs.append((idx,np.asarray(lab,dtype=int)))
-        except Exception:pass
-    vals=[]
-    for i in range(len(runs)):
-        for j in range(i+1,len(runs)):
-            ia,la=runs[i];ib,lb=runs[j];common,aidx,bidx=np.intersect1d(ia,ib,return_indices=True)
-            if len(common)>=4:vals.append(float(adjusted_rand_score(la[aidx],lb[bidx])))
-    return float(np.mean(vals)) if vals else 0.0
-
 def _make_model(method,estimator,params,train_raw_labels,tv,c):
     public,raw_to_public,public_to_raw=_normalise_cluster_ids(train_raw_labels,tv);cents,thresholds=_calibrate_centroids(tv,public,c);return ClusterModel(method,estimator,params,raw_to_public,public_to_raw,cents,thresholds,c.centroid_margin),public
 
 def _direct_public_from_raw(raw,model):return np.asarray([model.raw_to_public.get(int(x),-1) if int(x)!=-1 else -1 for x in np.asarray(raw).tolist()],dtype=int)
-
-def fit_candidate_models(tv,ttexts,tsigs,vv,vtexts,vsigs,stopwords,c):
-    candidates=[];store={};cid=0;mss=_density_min_samples(len(tv))
-    def record(method,est,params,raw_labels):
-        nonlocal cid
-        raw_labels=np.asarray(raw_labels,dtype=int)
-        if len(set(int(x) for x in raw_labels.tolist() if int(x)!=-1))<2:return
-        model,tl=_make_model(method,est,params,raw_labels,tv,c);vl,vs,_=_predict_by_centroids(model,vv);tm=evaluate_clustering(tv,tl,ttexts,stopwords,c,signatures=tsigs);vm=evaluate_clustering(vv,vl,vtexts,stopwords,c,signatures=vsigs)
-        candidates.append({"candidate_id":cid,"method":method,**params,"train_silhouette":tm["silhouette"],"train_coherence":tm["semantic_coherence_npmi"],"train_signature_purity":tm.get("signature_purity"),"train_assigned_fraction":tm["assigned_fraction"],"validation_silhouette":vm["silhouette"],"validation_coherence":vm["semantic_coherence_npmi"],"validation_signature_purity":vm.get("signature_purity"),"validation_assigned_fraction":vm["assigned_fraction"],"validation_balance_entropy":vm["balance_entropy"],"validation_largest_cluster_share":vm["largest_cluster_share"],"validation_n_clusters":vm["n_clusters"]});store[cid]=(model,tl,vl,vs);cid+=1
-    budget=max(8,c.model_search_trials)
-    for ms in mss:
-        epss=_k_distance_eps(tv,ms);take=max(2,int(math.ceil(budget/(max(len(mss),1)*2))))
-        if len(epss)>take:epss=[epss[i] for i in np.linspace(0,len(epss)-1,take).round().astype(int)]
-        for eps in epss:
-            try:
-                est=DBSCAN(eps=float(eps),min_samples=int(ms),metric="euclidean",n_jobs=-1);record("dbscan",est,{"eps":float(eps),"min_samples":int(ms)},est.fit_predict(tv))
-            except Exception:pass
-    # HDBSCAN/OPTICS handle variable-density structure using scikit-learn only.
-    if HDBSCAN is not None:
-        root=max(5,int(round(math.sqrt(len(tv))*.45)))
-        mcs_values=sorted(set(max(5,min(max(5,len(tv)//3),int(round(v)))) for v in (root,.7*root,1.4*root)))
-        for mcs in mcs_values:
-            for ms in mss:
-                for selection_method in ("eom","leaf"):
-                    try:
-                        est=HDBSCAN(min_cluster_size=int(mcs),min_samples=min(int(ms),int(mcs)),cluster_selection_method=selection_method,metric="euclidean",n_jobs=-1,copy=False);record("hdbscan",est,{"min_cluster_size":int(mcs),"min_samples":min(int(ms),int(mcs)),"cluster_selection_method":selection_method},est.fit_predict(tv))
-                    except Exception:pass
-    for ms in mss:
-        for xi in (.035,.05,.075):
-            try:
-                mcs=max(ms+1,int(round(max(5,math.sqrt(len(tv))*.45))));est=OPTICS(min_samples=int(ms),min_cluster_size=int(mcs),xi=float(xi),metric="euclidean",n_jobs=-1)
-                with warnings.catch_warnings():
-                    warnings.filterwarnings("ignore",message="divide by zero encountered in divide",category=RuntimeWarning)
-                    raw=est.fit_predict(tv)
-                record("optics",est,{"min_samples":int(ms),"min_cluster_size":int(mcs),"xi":float(xi)},raw)
-            except Exception:pass
-    # Centroid discovery fallback: scalable, but still rejects uncertain validation/inference cases.
-    maxk=min(20,max(3,int(round(math.sqrt(len(tv))))))
-    ks=sorted(set([k for k in (3,4,5,6,7,8,10,12,maxk) if 2<=k<len(tv)]))
-    for k in ks:
-        try:
-            est=MiniBatchKMeans(n_clusters=k,random_state=c.seed,batch_size=min(2048,max(128,len(tv))),n_init="auto",reassignment_ratio=.01);record("minibatch_kmeans",est,{"n_clusters":int(k)},est.fit_predict(tv))
-        except Exception:pass
-    tab=pd.DataFrame(candidates)
-    if tab.empty:raise RuntimeError("No valid unsupervised clustering candidate produced at least two clusters.")
-    ranks=[]
-    for name,higher in (("validation_silhouette",True),("validation_coherence",True),("validation_signature_purity",True),("validation_assigned_fraction",True),("validation_balance_entropy",True),("validation_largest_cluster_share",False)):
-        rn="rank_"+name;tab[rn]=percentile_rank(tab[name],higher);ranks.append(rn)
-    # Explicitly reward adequate coverage instead of silently preferring tiny clean clusters.
-    cov=pd.to_numeric(tab["validation_assigned_fraction"],errors="coerce").fillna(0.0);tab["coverage_target_score"]=1.0-np.minimum(np.abs(cov-c.selection_target_coverage)/max(c.selection_target_coverage,1e-9),1.0);ranks.append("coverage_target_score")
-    tab["selection_score"]=tab[ranks].median(axis=1);top=tab.nlargest(min(8,len(tab)),"selection_score")["candidate_id"].astype(int).tolist();tab["stability_ari"]=np.nan
-    for i in top:
-        model,_,_,_=store[i];tab.loc[tab["candidate_id"]==i,"stability_ari"]=_candidate_stability(tv,model.method,model.parameters,c.seed+500,c.stability_repeats)
-    tab["rank_stability"]=percentile_rank(tab["stability_ari"],True);tab["final_score"]=tab[ranks+["rank_stability"]].median(axis=1);tab["validation_structural_valid"]=(tab["validation_n_clusters"].fillna(0)>=2)&(tab["validation_largest_cluster_share"].fillna(1.0)<=.75)&(pd.to_numeric(tab["validation_signature_purity"],errors="coerce").fillna(0.0)>=max(.10,c.analytics_min_signature_purity*.45))
-    eligible=tab[tab["validation_structural_valid"]].copy() if bool(tab["validation_structural_valid"].any()) else tab.copy();best=eligible.sort_values(["final_score","validation_assigned_fraction","validation_coherence","validation_silhouette"],ascending=False).iloc[0];i=int(best["candidate_id"]);model,tl,vl,vs=store[i]
-    return model,tl,np.ones(len(tl),dtype=float),vl,vs,tab.sort_values(["validation_structural_valid","final_score","validation_assigned_fraction"],ascending=[False,False,False]).reset_index(drop=True)
 
 # ---------------------------------------------------------------------------
 # Cluster descriptions, exports and visuals
@@ -1705,51 +1610,6 @@ def write_selection_lock(outdir,cluster_model,split_audit,search_table,c):
     best=search_table.iloc[0].to_dict() if not search_table.empty else {};payload={"pipeline_version":PIPELINE_VERSION,"created_at_utc":utc_now_iso(),"code_fingerprint_sha256":current_code_fingerprint(),"selection_partitions":["train","validation"],"locked_test_used_for_selection":False,"selected_method":cluster_model.method,"selected_parameters":cluster_model.parameters,"public_cluster_ids_start_at":1,"outlier_id":-1,"selected_candidate_summary":to_plain(best),"split_audit":split_audit,"seed":c.seed};path=outdir/"selection_lock.json";path.write_text(json.dumps(to_plain(payload),indent=2,ensure_ascii=False),encoding="utf-8");return path
 
 
-def write_html_summary(outdir,report,catalog,participant_summary,entity_summary,context_summary,root_summary,sim,stat_gate,business_gate,public_examples_safe,topic_catalog=None,alignment_metrics=None,relation_summary=None):
-    ex=outdir/"executive";ex.mkdir(parents=True,exist_ok=True);counts=report["counts"];quality=report["quality"];privacy=report["privacy"]
-    parts=["<!doctype html><html><head><meta charset='utf-8'><title>NORA Entity-Context Base Diagnostics</title><style>body{font-family:Arial,sans-serif;margin:28px;color:#222}table{border-collapse:collapse;width:100%;margin:12px 0 24px}th,td{border:1px solid #ccc;padding:7px;font-size:13px;vertical-align:top}th{background:#111;color:#fff}.card{background:#f4f4f4;padding:16px;border-radius:8px;margin:12px 0}.example{background:#fafafa;border-left:4px solid #888;padding:9px;margin:7px 0}.warn{background:#fff4e5;padding:12px}.ok{background:#ecf8ee;padding:12px}</style></head><body>",
-    "<h1>NORA Entity-Context — Base Precision / Semantic Purity / Relation Structure</h1>",
-    f"<div class='card'><b>Execution:</b> {html_lib.escape(str(report['execution_status']))}<br><b>Statistical validation:</b> {report['statistical_validation_status']}<br><b>Analytics readiness:</b> {report['analytics_readiness_status']}<br><b>Privacy review:</b> {privacy.get('residual_gate_status')} (hard={privacy.get('hard_residual_findings',0)}, soft={privacy.get('soft_residual_findings',0)})<br><b>Selected clustering method:</b> {html_lib.escape(str(quality.get('selected_method')))}<br><b>Interactions:</b> {counts['interactions']}<br><b>Clusterable customer interactions:</b> {counts['clusterable_customer_interactions']}<br><b>Discovered semantic clusters:</b> {counts['semantic_clusters']}<br><b>Assigned:</b> {counts['assigned_customer_interactions']}<br><b>UNKNOWN/OUTLIER:</b> {counts['customer_outliers']}<br><b>Assignment coverage:</b> {counts['assignment_coverage_pct']:.2f}%<br><b>Entities:</b> {counts['entities']}<br><b>Participants:</b> {counts['participant_mentions']}<br><b>Contexts:</b> {counts['context_records']}</div>"]
-    if privacy.get("residual_gate_status")=="WARN":
-        parts.append("<div class='warn'><b>Privacy review warning.</b> Only ambiguous proper-name/person/location residue remains. This does not fail analytics readiness. Raw public examples are suppressed, while safe structured entity/context summaries remain visible.</div>")
-    elif privacy.get("residual_gate_status")=="FAIL":
-        parts.append("<div class='warn'><b>Hard privacy residue detected.</b> Raw public examples are suppressed and model persistence is blocked. Structured telecom summaries remain available after field-level filtering.</div>")
-    else:
-        parts.append("<div class='ok'><b>Privacy review passed.</b></div>")
-    parts.append("<h2>Semantic clusters</h2>")
-    if not catalog.empty:
-        cols=[x for x in ("cluster_id","meaning","count","share_of_assigned_pct","mean_strength","cohesion","semantic_coherence_npmi","signature_purity","relation_structure_purity","substantive_relation_coverage","top_entities","top_context_types","top_relation_types") if x in catalog.columns]
-        parts.append(catalog[cols].to_html(index=False,escape=True,float_format=lambda x:f"{x:.4f}" if pd.notna(x) else ""))
-        parts.append("<h2>Cluster details</h2>")
-        for row in catalog.itertuples(index=False):
-            parts.append(f"<h3>Cluster {int(row.cluster_id)} — {html_lib.escape(str(row.meaning))}</h3><p><b>Interactions:</b> {int(row.count)} &nbsp; <b>Share:</b> {safe_float(row.share_of_assigned_pct):.2f}% &nbsp; <b>Cohesion:</b> {safe_float(row.cohesion):.4f}</p>")
-            if public_examples_safe:
-                try:examples=json.loads(str(row.representative_examples))
-                except Exception:examples=[]
-                for e in examples:
-                    parts.append(f"<div class='example'><b>Normalized customer problem:</b> {html_lib.escape(str(e.get('normalized_customer_problem','')))}<br><b>Extracted entities:</b> {html_lib.escape('; '.join(e.get('entities',[]))) or '—'}</div>")
-    if topic_catalog is not None and not topic_catalog.empty:
-        parts.append("<h2>Latent NMF topics — secondary lens</h2>")
-        parts.append("<p>These are not replacements for semantic clusters. They expose overlapping corpus themes that may sit across multiple customer-problem clusters.</p>")
-        parts.append(topic_catalog.to_html(index=False,escape=True,float_format=lambda x:f"{x:.4f}" if pd.notna(x) else ""))
-    parts.append("<h2>Participants</h2>");parts.append(participant_summary.to_html(index=False,escape=True) if not participant_summary.empty else "<p>No participants extracted.</p>")
-    parts.append("<h2>Entity extraction</h2>");parts.append(entity_summary.to_html(index=False,escape=True) if not entity_summary.empty else "<p>No entities extracted.</p>")
-    parts.append("<h2>Context extraction</h2>");parts.append(context_summary.to_html(index=False,escape=True) if not context_summary.empty else "<p>No context extracted.</p>")
-    if relation_summary is not None:
-        parts.append("<h2>Relation structure</h2>");parts.append(relation_summary.to_html(index=False,escape=True,float_format=lambda x:f"{x:.4f}" if isinstance(x,(float,np.floating)) and np.isfinite(x) else str(x)) if not relation_summary.empty else "<p>No typed relations extracted.</p>")
-    parts.append("<h2>Root-cause status</h2>");parts.append(root_summary.to_html(index=False,escape=True) if not root_summary.empty else "<p>No root-cause statements extracted.</p>")
-    parts += ["<h2>Statistical validation gate</h2>",stat_gate.to_html(index=False,escape=True,float_format=lambda x:f"{x:.4f}" if isinstance(x,(float,np.floating)) and np.isfinite(x) else str(x)),"<h2>Analytics readiness gate</h2>",business_gate.to_html(index=False,escape=True,float_format=lambda x:f"{x:.4f}" if isinstance(x,(float,np.floating)) and np.isfinite(x) else str(x))]
-    if alignment_metrics:
-        parts.append("<h2>External intent-alignment diagnostic</h2>")
-        parts.append("<p>Upstream intent labels are used only for post-hoc comparison, never to train or select clusters.</p>")
-        parts.append(pd.DataFrame([alignment_metrics]).to_html(index=False,escape=True,float_format=lambda x:f"{x:.4f}" if isinstance(x,(float,np.floating)) else str(x)))
-    if not sim.empty:parts += ["<h2>Most similar cluster pairs</h2>",sim.head(20).to_html(index=False,escape=True,float_format=lambda x:f"{x:.4f}")]
-    for img,title in (("semantic_cluster_similarity_heatmap.png","Cluster similarity heatmap"),("semantic_cluster_projection.png","2D diagnostic projection"),("semantic_cluster_size_distribution.png","Cluster size distribution"),("entity_type_counts.png","Entity extraction counts")):
-        if (outdir/img).exists():parts += [f"<h2>{title}</h2>",f"<img src='../{img}' style='max-width:100%'>"]
-    parts += ["<h2>Structured dictionary output</h2><p>Each interaction is exported as participants, precision-filtered entities/observations, context, resolution, typed relations, and a separate analysis layer containing semantic cluster and latent topic. Lower-confidence entity candidates remain available in an audit layer instead of contaminating the primary graph.</p>",
-    "<h2>Method</h2><p>Classical/local NLP only: deterministic PII redaction + severity-aware residual review → train-only customer-problem normalizer → precision-calibrated ontology/conservative entity extraction → typed relation graph → word/character/structure-signature TF-IDF → TruncatedSVD/LSA + NMF topic factors + locally trained PPMI/SVD/SIF distributional embeddings → HDBSCAN/OPTICS/DBSCAN/MiniBatchKMeans candidate search → calibrated centroid recovery/rejection → locked-test validation. No pretrained language model, BERT/SentenceTransformer, GLiNER, BGE, Hugging Face model, API, or external model download is used.</p>","</body></html>"]
-    path=ex/"nora_entity_context_base_summary.html";path.write_text("".join(parts),encoding="utf-8");return path
-
 def _strength_for_labels(model,v,labels):
     out=np.zeros(len(labels),dtype=float)
     for i,cid in enumerate(np.asarray(labels,dtype=int)):
@@ -1899,15 +1759,6 @@ def stable_seed(namespace: str, base_seed: int) -> int:
     return int.from_bytes(digest[:4], "big") % (2**31 - 1)
 
 
-def make_minibatch_kmeans(k: int, seed: int, n: int, reassignment_ratio: float = .005) -> MiniBatchKMeans:
-    return MiniBatchKMeans(
-        n_clusters=int(k),
-        random_state=int(seed),
-        batch_size=min(2048, max(128, int(n))),
-        n_init=10,
-        reassignment_ratio=float(reassignment_ratio),
-    )
-
 
 def _safe_rank_v57(series: pd.Series, higher: bool = True) -> pd.Series:
     s = pd.to_numeric(series, errors="coerce")
@@ -1947,7 +1798,7 @@ def _full_centroid_predict_v57(model: ClusterModel, v: np.ndarray):
             secondary[i] = ids[j2]
             sscore[i] = float(sims[i, j2])
         margin[i] = pscore[i] - sscore[i]
-    return primary, pscore, secondary, sscore, margin, np.asarray(["nearest_centroid_full_coverage"] * n, dtype=object)
+    return primary, pscore, secondary, sscore, margin, np.asarray(["pattern_prototype_similarity_full_coverage"] * n, dtype=object)
 
 
 def _confidence_band_v57(best: float, margin: float, stability: float, c: ConfigV57) -> str:
@@ -1958,13 +1809,13 @@ def _confidence_band_v57(best: float, margin: float, stability: float, c: Config
     return "LOW"
 
 
-def _kmeans_stability_v57(v: np.ndarray, k: int, seed: int, repeats: int) -> float:
+def _partition_stability_v57(v: np.ndarray, k: int, seed: int, repeats: int) -> float:
     if len(v) < max(10, k * 2) or repeats < 2:
         return 0.0
     labs = []
     for r in range(repeats):
         try:
-            est = make_minibatch_kmeans(k, seed + 7919 * r, len(v))
+            est = make_context_partitioner(k, seed + 7919 * r, len(v))
             labs.append(np.asarray(est.fit_predict(v), dtype=int))
         except Exception:
             pass
@@ -1998,7 +1849,7 @@ def consensus_stability_profile_v57(v: np.ndarray, reference: np.ndarray, k: int
     completed = 0
     for r in range(max(2, repeats)):
         try:
-            est = make_minibatch_kmeans(k, seed + 12347 * (r + 1), len(v))
+            est = make_context_partitioner(k, seed + 12347 * (r + 1), len(v))
             lab = np.asarray(est.fit_predict(v), dtype=int)
             aligned = _align_run_to_reference_v57(reference, lab)
             agreements += (aligned == reference).astype(float)
@@ -2406,9 +2257,9 @@ def fit_full_coverage_context_model_v57(tv, ttexts, tsigs, trecords, vv, vtexts,
     rows, store = [], {}
     for k in ks:
         try:
-            est = make_minibatch_kmeans(k, c.seed, len(tv))
+            est = make_context_partitioner(k, c.seed, len(tv))
             raw = np.asarray(est.fit_predict(tv), dtype=int)
-            model, tl = _make_model("minibatch_kmeans_full_coverage", est, {"n_clusters": int(k), "coverage_contract": "full"}, raw, tv, c)
+            model, tl = _make_model("partition_full_coverage", est, {"n_clusters": int(k), "coverage_contract": "full"}, raw, tv, c)
             vl, _, _, _, _, _ = _full_centroid_predict_v57(model, vv)
             tm = evaluate_clustering(tv, tl, ttexts, stopwords, c, signatures=tsigs)
             vm = evaluate_clustering(vv, vl, vtexts, stopwords, c, signatures=vsigs)
@@ -2416,7 +2267,7 @@ def fit_full_coverage_context_model_v57(tv, ttexts, tsigs, trecords, vv, vtexts,
             cnt = Counter(tl.tolist())
             min_support = min(cnt.values()) if cnt else 0
             small_share = float(sum(v for v in cnt.values() if v < c.fine_min_cluster_size) / max(len(tl), 1))
-            stability = _kmeans_stability_v57(tv, int(k), c.seed + 500, c.stability_repeats)
+            stability = _partition_stability_v57(tv, int(k), c.seed + 500, c.stability_repeats)
             rows.append({
                 "candidate_k": int(k),
                 "train_silhouette": tm.get("silhouette"),
@@ -2472,9 +2323,9 @@ def fit_full_coverage_context_model_v57(tv, ttexts, tsigs, trecords, vv, vtexts,
 
 
 def refit_context_model_v57(dev_v: np.ndarray, k: int, c: ConfigV57):
-    est = make_minibatch_kmeans(k, c.seed + 991, len(dev_v))
+    est = make_context_partitioner(k, c.seed + 991, len(dev_v))
     raw = np.asarray(est.fit_predict(dev_v), dtype=int)
-    return _make_model("minibatch_kmeans_full_coverage", est, {"n_clusters": int(k), "coverage_contract": "full"}, raw, dev_v, c)
+    return _make_model("partition_full_coverage", est, {"n_clusters": int(k), "coverage_contract": "full"}, raw, dev_v, c)
 
 
 def fit_macro_clusters_v57(fine_model: ClusterModel, fine_counts: Mapping[int, int], c: ConfigV57):
@@ -2488,14 +2339,14 @@ def fit_macro_clusters_v57(fine_model: ClusterModel, fine_counts: Mapping[int, i
     rows, store = [], {}
     for k in range(lower, upper + 1):
         try:
-            est = make_minibatch_kmeans(k, c.seed + 1401, len(x), reassignment_ratio=0.0)
+            est = make_context_partitioner(k, c.seed + 1401, len(x), reassignment_ratio=0.0)
             try:
                 raw = est.fit_predict(x, sample_weight=weights)
             except TypeError:
                 raw = est.fit_predict(x)
             sil = safe_silhouette(x, np.asarray(raw, dtype=int), c.seed)
             ent = cluster_entropy(np.asarray(raw, dtype=int))
-            stab = _kmeans_stability_v57(x, k, c.seed + 1403, max(3, min(c.stability_repeats, 6)))
+            stab = _partition_stability_v57(x, k, c.seed + 1403, max(3, min(c.stability_repeats, 6)))
             rows.append({"macro_k": k, "silhouette": sil, "balance_entropy": ent, "stability_ari": stab})
             store[k] = np.asarray(raw, dtype=int)
         except Exception:
@@ -2541,14 +2392,14 @@ def discover_context_refinements_v57(dev_records, dev_v, dev_labels, stopwords, 
         candidates, store = [], {}
         for k in range(2, maxk + 1):
             try:
-                est = make_minibatch_kmeans(k, c.seed + parent * 101 + k, n, reassignment_ratio=0.0)
+                est = make_context_partitioner(k, c.seed + parent * 101 + k, n, reassignment_ratio=0.0)
                 raw = np.asarray(est.fit_predict(dev_v[idx]), dtype=int)
                 pub, _, _ = _normalise_cluster_ids(raw, dev_v[idx])
                 cnt = Counter(pub.tolist()); minchild = min(cnt.values()) if cnt else 0; largest = max(cnt.values()) / n if cnt else 1.0
                 sil = safe_silhouette(dev_v[idx], pub, c.seed)
                 sig, _ = signature_purity(sigs, pub)
                 rel, _ = relation_structure_purity(local_records, pub)
-                stability = _kmeans_stability_v57(dev_v[idx], k, c.seed + parent * 37, c.context_refinement_stability_repeats)
+                stability = _partition_stability_v57(dev_v[idx], k, c.seed + parent * 37, c.context_refinement_stability_repeats)
                 silv, sigv, relv = safe_float(sil, -1.0), safe_float(sig, 0.0), safe_float(rel, 0.0)
                 accepted = (
                     minchild >= c.context_refinement_min_child_size and
@@ -2699,9 +2550,9 @@ def fit_structural_lens_v57(dev_records, name, c: ConfigV57):
     rows, store = [], {}
     for k in range(2, upper + 1):
         try:
-            est = make_minibatch_kmeans(k, seed + k, len(z))
+            est = make_context_partitioner(k, seed + k, len(z))
             raw = np.asarray(est.fit_predict(z), dtype=int); pub, _, _ = _normalise_cluster_ids(raw, z); cnt = Counter(pub.tolist())
-            sil = safe_silhouette(z, pub, c.seed); stab = _kmeans_stability_v57(z, k, seed + 1701, max(3, min(c.stability_repeats, 6))); ent = cluster_entropy(pub); minsize = min(cnt.values()) if cnt else 0; largest = max(cnt.values()) / len(pub) if cnt else 1
+            sil = safe_silhouette(z, pub, c.seed); stab = _partition_stability_v57(z, k, seed + 1701, max(3, min(c.stability_repeats, 6))); ent = cluster_entropy(pub); minsize = min(cnt.values()) if cnt else 0; largest = max(cnt.values()) / len(pub) if cnt else 1
             rows.append({"k": k, "silhouette": sil, "stability_ari": stab, "balance_entropy": ent, "min_cluster_size": minsize, "largest_cluster_share": largest}); store[k] = pub
         except Exception:
             pass
@@ -2753,10 +2604,6 @@ def hierarchical_leaf_catalog_v57(records, v, fine_labels, leaf_ids, leaf_meanin
     return pd.DataFrame(rows).sort_values("count", ascending=False).reset_index(drop=True) if rows else pd.DataFrame()
 
 
-def _stable_fingerprint_id_v57(parts):
-    return hashlib.sha256("|".join(str(x) for x in parts).encode("utf-8", errors="ignore")).hexdigest()[:18]
-
-
 def _analysis_map_v57(clusterable, cv, fine_model, fine_desc, fine_stability, macro_map, macro_desc, refinement_models, workflow_model, entity_model, relation_model, all_records, c):
     fl, ps, sl, ss, margin, src = _full_centroid_predict_v57(fine_model, cv)
     leaf, child, local_strength, local_stability, local_meaning = assign_context_refinements_v57(cv, fl, refinement_models, fine_desc)
@@ -2775,15 +2622,6 @@ def _analysis_map_v57(clusterable, cv, fine_model, fine_desc, fine_stability, ma
         if str(r["interaction_ref"]) not in amap:
             amap[str(r["interaction_ref"])] = {"fine_cluster_id": -1, "fine_meaning": "NOT_CLUSTERABLE", "primary_score": 0.0, "secondary_cluster_id": -1, "secondary_score": 0.0, "margin": 0.0, "confidence_band": "NOT_CLUSTERABLE", "cluster_stability": 0.0, "assignment_source": "not_clusterable", "macro_cluster_id": -1, "macro_meaning": "NOT_CLUSTERABLE", "leaf_id": "NOT_CLUSTERABLE", "context_refinement_id": -1, "context_refinement_meaning": "NOT_CLUSTERABLE", "context_refinement_strength": 0.0, "context_refinement_stability": 0.0, "workflow_cluster_id": -1, "workflow_strength": 0.0, "entity_profile_cluster_id": -1, "entity_profile_strength": 0.0, "relation_motif_cluster_id": -1, "relation_motif_strength": 0.0}
     return amap, fl, leaf, workflow_labels, entity_labels, relation_labels
-
-
-def build_fingerprint_table_v57(records, analysis_by_ref):
-    rows = []
-    for r in records:
-        a = analysis_by_ref.get(str(r["interaction_ref"]), {}); rc = Counter(str(x.get("status", "UNKNOWN")) for x in r.get("root_cause", [])); resolution = (r.get("resolution_chain") or {}).get("resolution_evidence_status", "NO_RESOLUTION_EVIDENCE")
-        parts = [a.get("macro_cluster_id"), a.get("fine_cluster_id"), a.get("leaf_id"), a.get("workflow_cluster_id"), a.get("entity_profile_cluster_id"), a.get("relation_motif_cluster_id"), resolution, tuple(sorted(rc.items()))]
-        rows.append({"interaction_ref": r["interaction_ref"], "data_split": r.get("data_split"), "fingerprint_id": _stable_fingerprint_id_v57(parts), "context_family_id": a.get("macro_cluster_id"), "context_pattern_cluster_id": a.get("fine_cluster_id"), "context_leaf_id": a.get("leaf_id"), "context_pattern_primary_score": a.get("primary_score"), "context_pattern_secondary_cluster_id": a.get("secondary_cluster_id"), "context_pattern_secondary_score": a.get("secondary_score"), "context_pattern_margin": a.get("margin"), "context_pattern_confidence_band": a.get("confidence_band"), "context_pattern_cluster_stability": a.get("cluster_stability"), "interaction_structure_cluster_id": a.get("workflow_cluster_id"), "entity_profile_cluster_id": a.get("entity_profile_cluster_id"), "relation_motif_cluster_id": a.get("relation_motif_cluster_id"), "resolution_evidence_status": resolution, "root_cause_status_signature": ";".join(f"{k}:{v}" for k, v in sorted(rc.items()))})
-    return pd.DataFrame(rows)
 
 
 # ---------------------------------------------------------------------------
@@ -2822,14 +2660,13 @@ def public_dictionary_record_v57(r, analysis, public_examples_safe, hard_privacy
     out["relation_motif_cluster"] = {"cluster_id": analysis.get("relation_motif_cluster_id"), "strength": analysis.get("relation_motif_strength")}
     rc = Counter(str(x.get("status", "UNKNOWN")) for x in out.get("root_cause", [])); resolution = (out.get("resolution_chain") or {}).get("resolution_evidence_status", "NO_RESOLUTION_EVIDENCE")
     parts = [analysis.get("macro_cluster_id"), cid, analysis.get("leaf_id"), analysis.get("workflow_cluster_id"), analysis.get("entity_profile_cluster_id"), analysis.get("relation_motif_cluster_id"), resolution, tuple(sorted(rc.items()))]
-    out["interaction_fingerprint"] = {"fingerprint_id": _stable_fingerprint_id_v57(parts), "components": {"context_family": analysis.get("macro_cluster_id"), "context_pattern": cid, "context_leaf": analysis.get("leaf_id"), "interaction_structure": analysis.get("workflow_cluster_id"), "entity_profile": analysis.get("entity_profile_cluster_id"), "relation_motif": analysis.get("relation_motif_cluster_id"), "resolution_evidence_status": resolution, "root_cause_status": dict(rc)}}
     out.pop("semantic_cluster", None)
     layers = out.get("dictionary_layers", {})
     layers.setdefault("context", {})["facts"] = out.get("context_facts", [])
     layers.setdefault("resolution", {})["chain"] = out.get("resolution_chain", {})
     layers.setdefault("relations", {})["records"] = out.get("relationships", [])
     layers["relations"]["quality"] = out.get("evidence_quality", {})
-    layers["analysis"] = {"context_pattern_cluster": out["context_pattern_cluster"], "context_hierarchy": out["context_hierarchy"], "interaction_structure_cluster": out["interaction_structure_cluster"], "entity_profile_cluster": out["entity_profile_cluster"], "relation_motif_cluster": out["relation_motif_cluster"], "interaction_fingerprint": out["interaction_fingerprint"], "latent_topic": out.get("latent_topic"), "upstream_labels_passthrough": out.get("upstream_labels_passthrough", {})}
+    layers["analysis"] = {"context_pattern_cluster": out["context_pattern_cluster"], "context_hierarchy": out["context_hierarchy"], "interaction_structure_cluster": out["interaction_structure_cluster"], "entity_profile_cluster": out["entity_profile_cluster"], "relation_motif_cluster": out["relation_motif_cluster"], "latent_topic": out.get("latent_topic"), "upstream_labels_passthrough": out.get("upstream_labels_passthrough", {})}
     out["dictionary_layers"] = layers
     return out
 
@@ -2855,8 +2692,8 @@ def resolution_chain_table_v57(records):
 def cluster_assignment_table_v57(records):
     rows = []
     for r in records:
-        cl = r.get("context_pattern_cluster", {}); h = r.get("context_hierarchy", {}); fp = r.get("interaction_fingerprint", {}); content = r.get("content", {})
-        rows.append({"interaction_ref": r.get("interaction_ref"), "data_split": r.get("data_split"), "context_family_id": h.get("context_family_id"), "context_family_meaning": h.get("context_family_meaning"), "context_pattern_cluster_id": cl.get("cluster_id"), "context_pattern_meaning": cl.get("meaning"), "cluster_strength": cl.get("cluster_strength"), "secondary_cluster_id": cl.get("secondary_cluster_id"), "secondary_score": cl.get("secondary_score"), "margin": cl.get("margin"), "confidence_band": cl.get("confidence_band"), "cluster_stability": cl.get("cluster_stability"), "context_leaf_id": h.get("context_leaf_id"), "local_context_refinement_id": h.get("local_context_refinement_id"), "local_context_refinement_meaning": h.get("local_context_refinement_meaning"), "interaction_structure_cluster_id": (r.get("interaction_structure_cluster") or {}).get("cluster_id"), "entity_profile_cluster_id": (r.get("entity_profile_cluster") or {}).get("cluster_id"), "relation_motif_cluster_id": (r.get("relation_motif_cluster") or {}).get("cluster_id"), "fingerprint_id": fp.get("fingerprint_id"), "assignment_source": cl.get("assignment_source"), "customer_problem_normalized": content.get("customer_problem_normalized", ""), "participants": "; ".join(r.get("participants", [])), "top_entities": "; ".join(f"{e.get('entity_type')}:{e.get('canonical_name')}" for e in r.get("entities", [])[:12])})
+        cl = r.get("context_pattern_cluster", {}); h = r.get("context_hierarchy", {}); content = r.get("content", {})
+        rows.append({"interaction_ref": r.get("interaction_ref"), "data_split": r.get("data_split"), "context_family_id": h.get("context_family_id"), "context_family_meaning": h.get("context_family_meaning"), "context_pattern_cluster_id": cl.get("cluster_id"), "context_pattern_meaning": cl.get("meaning"), "cluster_strength": cl.get("cluster_strength"), "secondary_cluster_id": cl.get("secondary_cluster_id"), "secondary_score": cl.get("secondary_score"), "margin": cl.get("margin"), "confidence_band": cl.get("confidence_band"), "cluster_stability": cl.get("cluster_stability"), "context_leaf_id": h.get("context_leaf_id"), "local_context_refinement_id": h.get("local_context_refinement_id"), "local_context_refinement_meaning": h.get("local_context_refinement_meaning"), "interaction_structure_cluster_id": (r.get("interaction_structure_cluster") or {}).get("cluster_id"), "entity_profile_cluster_id": (r.get("entity_profile_cluster") or {}).get("cluster_id"), "relation_motif_cluster_id": (r.get("relation_motif_cluster") or {}).get("cluster_id"), "assignment_source": cl.get("assignment_source"), "customer_problem_normalized": content.get("customer_problem_normalized", ""), "participants": "; ".join(r.get("participants", [])), "top_entities": "; ".join(f"{e.get('entity_type')}:{e.get('canonical_name')}" for e in r.get("entities", [])[:12])})
     return pd.DataFrame(rows)
 
 
@@ -2864,7 +2701,7 @@ def interaction_dictionary_table_v57(records):
     rows = []
     for r in records:
         layers = r.get("dictionary_layers", {}) or {}; analysis = layers.get("analysis", {}) or {}; cl = analysis.get("context_pattern_cluster", {}) or {}; h = analysis.get("context_hierarchy", {}) or {}; topic = analysis.get("latent_topic", {}) or {}
-        rows.append({"interaction_ref": r.get("interaction_ref"), "data_split": r.get("data_split"), "participants": json.dumps(layers.get("participants", {}), ensure_ascii=False), "entities": json.dumps(layers.get("entities", {}), ensure_ascii=False), "context": json.dumps(layers.get("context", {}), ensure_ascii=False), "resolution": json.dumps(layers.get("resolution", {}), ensure_ascii=False), "relations": json.dumps(layers.get("relations", {}), ensure_ascii=False), "context_family_id": h.get("context_family_id"), "context_pattern_cluster_id": cl.get("cluster_id"), "context_pattern_meaning": cl.get("meaning"), "cluster_strength": cl.get("cluster_strength"), "secondary_cluster_id": cl.get("secondary_cluster_id"), "margin": cl.get("margin"), "confidence_band": cl.get("confidence_band"), "context_leaf_id": h.get("context_leaf_id"), "local_context_refinement_meaning": h.get("local_context_refinement_meaning"), "interaction_structure_cluster_id": (analysis.get("interaction_structure_cluster") or {}).get("cluster_id"), "entity_profile_cluster_id": (analysis.get("entity_profile_cluster") or {}).get("cluster_id"), "relation_motif_cluster_id": (analysis.get("relation_motif_cluster") or {}).get("cluster_id"), "fingerprint_id": (analysis.get("interaction_fingerprint") or {}).get("fingerprint_id"), "latent_topic_id": topic.get("topic_id") if isinstance(topic, dict) else None, "latent_topic_meaning": topic.get("meaning") if isinstance(topic, dict) else None})
+        rows.append({"interaction_ref": r.get("interaction_ref"), "data_split": r.get("data_split"), "participants": json.dumps(layers.get("participants", {}), ensure_ascii=False), "entities": json.dumps(layers.get("entities", {}), ensure_ascii=False), "context": json.dumps(layers.get("context", {}), ensure_ascii=False), "resolution": json.dumps(layers.get("resolution", {}), ensure_ascii=False), "relations": json.dumps(layers.get("relations", {}), ensure_ascii=False), "context_family_id": h.get("context_family_id"), "context_pattern_cluster_id": cl.get("cluster_id"), "context_pattern_meaning": cl.get("meaning"), "cluster_strength": cl.get("cluster_strength"), "secondary_cluster_id": cl.get("secondary_cluster_id"), "margin": cl.get("margin"), "confidence_band": cl.get("confidence_band"), "context_leaf_id": h.get("context_leaf_id"), "local_context_refinement_meaning": h.get("local_context_refinement_meaning"), "interaction_structure_cluster_id": (analysis.get("interaction_structure_cluster") or {}).get("cluster_id"), "entity_profile_cluster_id": (analysis.get("entity_profile_cluster") or {}).get("cluster_id"), "relation_motif_cluster_id": (analysis.get("relation_motif_cluster") or {}).get("cluster_id"), "latent_topic_id": topic.get("topic_id") if isinstance(topic, dict) else None, "latent_topic_meaning": topic.get("meaning") if isinstance(topic, dict) else None})
     return pd.DataFrame(rows)
 
 
@@ -2905,7 +2742,7 @@ def _html_table_v57(df, cols=None):
     return x.to_html(index=False, escape=True, float_format=lambda z: f"{z:.4f}" if isinstance(z, (float, np.floating)) and np.isfinite(z) else str(z))
 
 
-def write_html_summary_v57(outdir, report, context_catalog, family_catalog, leaf_catalog, workflow_catalog, entity_profile_catalog, relation_motif_catalog, participant_summary, entity_summary, context_summary, root_summary, relation_summary, stat_gate, analytics_gate, context_sim, refinement_audit, fingerprint_summary, evidence_quality_df, public_examples_safe):
+def write_html_summary_v57(outdir, report, context_catalog, family_catalog, leaf_catalog, workflow_catalog, entity_profile_catalog, relation_motif_catalog, participant_summary, entity_summary, context_summary, root_summary, relation_summary, stat_gate, analytics_gate, context_sim, refinement_audit, evidence_quality_df, public_examples_safe):
     ex = Path(outdir) / "executive"; ex.mkdir(parents=True, exist_ok=True)
     counts = report["counts"]; privacy = report["privacy"]; quality = report["quality"]
     parts = ["<!doctype html><html><head><meta charset='utf-8'><title>NORA Entity-Context v5.7.1</title><style>body{font-family:Arial,sans-serif;margin:28px;color:#222}table{border-collapse:collapse;width:100%;margin:12px 0 24px}th,td{border:1px solid #ccc;padding:7px;font-size:13px;vertical-align:top}th{background:#111;color:#fff}.card{background:#f4f4f4;padding:16px;border-radius:8px;margin:12px 0}.warn{background:#fff4e5;padding:12px}.ok{background:#ecf8ee;padding:12px}</style></head><body>", "<h1>NORA Entity-Context v5.7.1 — Evidence-Grounded Entity, Context, RCA & Relation Quality</h1>"]
@@ -2922,8 +2759,7 @@ def write_html_summary_v57(outdir, report, context_catalog, family_catalog, leaf
         "<h2>Interaction-structure clusters</h2>", _html_table_v57(workflow_catalog),
         "<h2>Entity-profile clusters</h2>", _html_table_v57(entity_profile_catalog),
         "<h2>Relation-motif clusters</h2>", _html_table_v57(relation_motif_catalog),
-        "<h2>Cross-lens fingerprint summary</h2>", _html_table_v57(fingerprint_summary.head(30) if fingerprint_summary is not None else pd.DataFrame()),
-        "<h2>Evidence and grounding quality</h2>", _html_table_v57(evidence_quality_df.head(100) if evidence_quality_df is not None else pd.DataFrame()),
+                "<h2>Evidence and grounding quality</h2>", _html_table_v57(evidence_quality_df.head(100) if evidence_quality_df is not None else pd.DataFrame()),
         "<h2>Participants</h2>", _html_table_v57(participant_summary),
         "<h2>Entity extraction</h2>", _html_table_v57(entity_summary),
         "<h2>Context extraction</h2>", _html_table_v57(context_summary),
@@ -2937,7 +2773,7 @@ def write_html_summary_v57(outdir, report, context_catalog, family_catalog, leaf
     for img, title in (("context_pattern_similarity.png", "Context-pattern similarity"), ("context_family_similarity.png", "Context-family similarity"), ("interaction_structure_similarity.png", "Interaction-structure similarity"), ("entity_profile_similarity.png", "Entity-profile similarity"), ("relation_motif_similarity.png", "Relation-motif similarity"), ("context_pattern_projection.png", "Context-pattern 2D diagnostic projection (t-SNE visualization only)"), ("context_pattern_size_distribution.png", "Context-pattern size distribution"), ("entity_type_counts.png", "Entity extraction counts")):
         if (Path(outdir) / img).exists():
             parts += [f"<h2>{title}</h2>", f"<img src='../{img}' style='max-width:100%'>"]
-    parts += ["<h2>Structured dictionary output</h2><p>Each interaction carries participants, accepted entities and review candidates, context mentions and context facts, diagnostic evidence, RCA/remediation, evidence-grounded typed relations, full-coverage context-pattern assignments, independent structural lenses, and a deterministic cross-lens fingerprint.</p>", "<h2>Method</h2><p>Classical/local NLP only: deterministic privacy handling → train-only customer-problem normalization → precision entity/context/RCA/remediation extraction → evidence grounding with direct/anchored/inferred tiers and ambiguity annotation → relevance-routed typed relation graph → word/character/structure-signature TF-IDF → LSA + NMF + locally trained PPMI/SVD/SIF representations → repeated-seed full-coverage MiniBatchKMeans context-pattern search → multi-seed support-aware refit → locked-test validation → stability-gated local context refinement → context-family discovery → independent interaction/entity-profile/relation-motif lenses → cross-lens fingerprinting. t-SNE is visualization only. No pretrained language model or external model download is used.</p>", "</body></html>"]
+    parts += ["<h2>Structured dictionary output</h2><p>Each interaction carries participants, accepted entities and review candidates, context mentions and context facts, diagnostic evidence, RCA and remediation, evidence-grounded typed relations, full-coverage context-pattern assignments, and independent structural lenses.</p>", "<h2>Method</h2><p>Deterministic privacy handling → train-only customer-problem normalization → precision entity, context, RCA and remediation extraction → evidence grounding across direct, anchored and inferred tiers with ambiguity annotation → relevance-routed typed relation graph → word, character and structure-signature TF-IDF → LSA, NMF and locally trained PPMI/SVD/SIF representations → shared-nearest-neighbour graph construction over mutual k-nearest neighbours with Jaccard edge weights → Leiden community detection across a neighbour, resolution and seed grid → co-association consensus over the resulting ensemble → resolution-targeted refit that places every clusterable interaction → locked-test validation → stability-gated local context refinement → context-family discovery → independent interaction, entity-profile and relation-motif lenses → per-pattern consensus-support audit. Every representation is trained locally from the supplied corpus. t-SNE is used for visualization.</p>", "</body></html>"]
     path = ex / "nora_entity_context_v5_7_1_summary.html"
     path.write_text("".join(parts), encoding="utf-8")
     return path
@@ -3521,8 +3357,8 @@ def refit_context_model_v57(dev_v: np.ndarray, k: int, c: ConfigV57):
     for t in range(trials):
         seed = c.seed + 991 + 3571 * t
         try:
-            est = make_minibatch_kmeans(k, seed, len(dev_v)); raw = np.asarray(est.fit_predict(dev_v), dtype=int)
-            model, public = _make_model("minibatch_kmeans_full_coverage", est, {"n_clusters": int(k), "coverage_contract":"full", "refit_seed":int(seed)}, raw, dev_v, c)
+            est = make_context_partitioner(k, seed, len(dev_v)); raw = np.asarray(est.fit_predict(dev_v), dtype=int)
+            model, public = _make_model("partition_full_coverage", est, {"n_clusters": int(k), "coverage_contract":"full", "refit_seed":int(seed)}, raw, dev_v, c)
             cnt = Counter(public.tolist()); min_size = min(cnt.values()) if cnt else 0
             small_share = float(sum(v for v in cnt.values() if v < c.fine_min_cluster_size) / max(len(public), 1))
             inertia = safe_float(getattr(est, "inertia_", float("inf")), float("inf"))
@@ -3725,27 +3561,24 @@ def run_train_v57(c: ConfigV57):
     family_catalog = cluster_catalog(clusterable, cv, macro_labels, primary_scores, macro_desc, coherence_npmi([r["_customer_problem"] for r in clusterable], macro_labels, stopwords, c.top_cluster_terms)[1], c, public_examples_safe)
     if not family_catalog.empty: family_catalog = family_catalog.rename(columns={"cluster_id": "context_family_id"})
     workflow_catalog = lens_catalog_v57(clusterable, workflow_labels, "interaction_structure", workflow_model); entity_profile_catalog = lens_catalog_v57(clusterable, entity_labels, "entity_profile", entity_model); relation_motif_catalog = lens_catalog_v57(clusterable, relation_labels, "relation_motif", relation_model)
-    fingerprints = build_fingerprint_table_v57(records, analysis_map)
-    fp_cols = ["fingerprint_id", "context_family_id", "context_pattern_cluster_id", "context_leaf_id", "interaction_structure_cluster_id", "entity_profile_cluster_id", "relation_motif_cluster_id", "resolution_evidence_status"]
-    fingerprint_summary = fingerprints.groupby(fp_cols, dropna=False).size().reset_index(name="count").sort_values("count", ascending=False)
     context_quality = cluster_quality_audit_v571(clusterable, cv, fine_labels, fine_desc, c, "context_pattern", analysis_map)
     family_quality = cluster_quality_audit_v571(clusterable, cv, macro_labels, macro_desc, c, "context_family", analysis_map)
     relation_density_df, relation_density_summary = relation_density_audit_v571(records)
     context_quality.to_csv(diag / "context_pattern_quality_gate.csv", index=False); family_quality.to_csv(diag / "context_family_quality_gate.csv", index=False); relation_density_df.to_csv(diag / "relation_density_audit.csv", index=False)
     low_conf = float(np.mean([analysis_map[str(r["interaction_ref"])].get("confidence_band") == "LOW" for r in clusterable])) if clusterable else 0.0
     analytics_status, analytics_gate, analytics_metrics = build_v57_readiness_gate(records, clusterable, fine_labels, privacy_summary, selection_val_metrics, c, overall_stability, low_conf, 1.0, context_quality=context_quality, family_quality=family_quality, relation_density_summary=relation_density_summary); analytics_gate.to_csv(diag / "analytics_readiness_gate.csv", index=False)
-    stages.append({"stage": "catalog_fingerprints_quality_gates", "seconds": time.perf_counter() - t})
+    stages.append({"stage": "catalog_quality_gates", "seconds": time.perf_counter() - t})
 
     t = time.perf_counter()
     jsonl = outdir / "nora_entity_context_v5_7_1_dictionary.jsonl"; jsonp = outdir / "nora_entity_context_v5_7_1_dictionary.json"
     with jsonl.open("w", encoding="utf-8") as h:
         for r in public: h.write(json.dumps(to_plain(r), ensure_ascii=False) + "\n")
-    contract = {"layers": ["participants", "entities", "context", "evidence", "resolution", "relations", "analysis"], "primary_pattern": "context_hierarchy.context_pattern_cluster_id", "hierarchical_leaf": "context_hierarchy.context_leaf_id", "structural_lenses": ["interaction_structure_cluster", "entity_profile_cluster", "relation_motif_cluster"], "fingerprint": "interaction_fingerprint", "upstream_intent_contract": "passthrough_only"}
+    contract = {"layers": ["participants", "entities", "context", "evidence", "resolution", "relations", "analysis"], "primary_pattern": "context_hierarchy.context_pattern_cluster_id", "hierarchical_leaf": "context_hierarchy.context_leaf_id", "structural_lenses": ["interaction_structure_cluster", "entity_profile_cluster", "relation_motif_cluster"], "upstream_intent_contract": "passthrough_only"}
     jsonp.write_text(json.dumps(to_plain({"pipeline": PIPELINE_NAME, "pipeline_version": PIPELINE_VERSION, "dictionary_contract": contract, "records": public}), indent=2, ensure_ascii=False), encoding="utf-8")
 
     participant_df = flatten_field(public, "participant_evidence"); entity_df = flatten_field(public, "entities"); entity_candidate_df = flatten_field(public, "entity_candidates"); context_df = flatten_field(public, "context"); context_fact_df = context_fact_table_v57(public); attr_df = flatten_field(public, "attributes"); measurement_df = flatten_field(public, "measurements"); evidence_df = flatten_field(public, "diagnostic_evidence"); cause_df = flatten_field(public, "root_cause"); rem_df = flatten_field(public, "remediation"); rel_df = flatten_field(public, "relationships")
     graph_nodes_df = graph_node_table(public); relation_summary_df = relation_summary_table(public); entity_precision_df = entity_precision_audit_table(public); resolution_df = resolution_dataset(public); resolution_chain_df = resolution_chain_table_v57(public); assignment_df = cluster_assignment_table_v57(public); interaction_dict_df = interaction_dictionary_table_v57(public); evidence_quality_df = evidence_quality_table_v57(public); entity_co = entity_cooccurrence_table(public); context_co = context_cooccurrence_table(public)
-    exports = [(participant_df, "participants.csv"), (entity_df, "entities.csv"), (entity_candidate_df, "entity_candidates_review.csv"), (context_df, "context_mentions.csv"), (context_fact_df, "context_facts.csv"), (resolution_df, "resolution_layer.csv"), (resolution_chain_df, "resolution_chain.csv"), (attr_df, "attributes.csv"), (measurement_df, "measurements.csv"), (evidence_df, "diagnostic_evidence.csv"), (cause_df, "root_cause.csv"), (rem_df, "remediation.csv"), (rel_df, "grounded_relationships.csv"), (graph_nodes_df, "relation_graph_nodes.csv"), (relation_summary_df, "relation_summary.csv"), (entity_precision_df, "entity_precision_audit.csv"), (assignment_df, "context_pattern_assignments.csv"), (interaction_dict_df, "interaction_dictionary.csv"), (evidence_quality_df, "evidence_grounding_quality.csv"), (context_catalog, "context_pattern_cluster_catalog.csv"), (family_catalog, "context_family_catalog.csv"), (leaf_catalog, "hierarchical_context_pattern_leaf_catalog.csv"), (context_sim, "similar_context_pattern_pairs.csv"), (workflow_catalog, "interaction_structure_cluster_catalog.csv"), (entity_profile_catalog, "entity_profile_cluster_catalog.csv"), (relation_motif_catalog, "relation_motif_cluster_catalog.csv"), (fingerprints, "interaction_fingerprints.csv"), (fingerprint_summary, "interaction_fingerprint_summary.csv"), (context_quality, "context_pattern_quality_gate.csv"), (family_quality, "context_family_quality_gate.csv"), (relation_density_df, "relation_density_audit.csv")]
+    exports = [(participant_df, "participants.csv"), (entity_df, "entities.csv"), (entity_candidate_df, "entity_candidates_review.csv"), (context_df, "context_mentions.csv"), (context_fact_df, "context_facts.csv"), (resolution_df, "resolution_layer.csv"), (resolution_chain_df, "resolution_chain.csv"), (attr_df, "attributes.csv"), (measurement_df, "measurements.csv"), (evidence_df, "diagnostic_evidence.csv"), (cause_df, "root_cause.csv"), (rem_df, "remediation.csv"), (rel_df, "grounded_relationships.csv"), (graph_nodes_df, "relation_graph_nodes.csv"), (relation_summary_df, "relation_summary.csv"), (entity_precision_df, "entity_precision_audit.csv"), (assignment_df, "context_pattern_assignments.csv"), (interaction_dict_df, "interaction_dictionary.csv"), (evidence_quality_df, "evidence_grounding_quality.csv"), (context_catalog, "context_pattern_cluster_catalog.csv"), (family_catalog, "context_family_catalog.csv"), (leaf_catalog, "hierarchical_context_pattern_leaf_catalog.csv"), (context_sim, "similar_context_pattern_pairs.csv"), (workflow_catalog, "interaction_structure_cluster_catalog.csv"), (entity_profile_catalog, "entity_profile_cluster_catalog.csv"), (relation_motif_catalog, "relation_motif_cluster_catalog.csv"), (context_quality, "context_pattern_quality_gate.csv"), (family_quality, "context_family_quality_gate.csv"), (relation_density_df, "relation_density_audit.csv")]
     if not entity_co.empty: exports.append((entity_co, "entity_cooccurrence.csv"))
     if not context_co.empty: exports.append((context_co, "context_cooccurrence.csv"))
     for df, name in exports: df.to_csv(outdir / name, index=False)
@@ -3766,9 +3599,9 @@ def run_train_v57(c: ConfigV57):
     q57 = _v57_quality_metrics(records)
     counts = {"interactions": len(records), "clusterable_customer_interactions": len(clusterable), "context_pattern_clusters": len(set(fine_labels.tolist())), "hierarchical_context_leaf_clusters": len(set(leaf_ids.tolist())), "context_family_clusters": len(set(macro_labels.tolist())), "assigned_customer_interactions": len(clusterable), "context_pattern_outliers": 0, "context_pattern_assignment_coverage_pct": 100.0 if clusterable else 0.0, "interaction_structure_clusters": len(set(workflow_labels.tolist())), "entity_profile_clusters": len(set(entity_labels.tolist())), "relation_motif_clusters": len(set(relation_labels.tolist())), "participant_mentions": internal_participants, "canonical_participants": len({p.get("participant") for r in records for p in r.get("participant_evidence",[]) if p.get("participant") and not (p.get("participant")=="user" and p.get("participant_semantics") in {"source_role_alias","explicit_mention"})}), "entities": internal_entities, "entity_mentions": internal_entities, "unique_entities": len({(e.get("entity_type"), normalize_term(e.get("canonical_name",""))) for r in records for e in r.get("entities",[]) if e.get("canonical_name")}), "entity_review_candidates": internal_candidates, "context_mentions": internal_context, "context_facts": internal_context_facts, "attributes": sum(len(r.get("attributes", [])) for r in records), "measurements": sum(len(r.get("measurements", [])) for r in records), "diagnostic_evidence": sum(len(r.get("diagnostic_evidence", [])) for r in records), "root_cause_records": sum(len(r.get("root_cause", [])) for r in records), "remediation_records": sum(len(r.get("remediation", [])) for r in records), "relationships": internal_rel, "latent_topics": int(len(topic_catalog_df)) if not topic_catalog_df.empty else 0}
     quality = {"validation": selection_val_metrics, "locked_test": test_metrics, "all_clusterable": all_metrics, "context_pattern_selected_k": selected_k, "context_pattern_model_search_best": to_plain(best), "context_pattern_consensus_stability": overall_stability, "context_pattern_cluster_stability": fine_stability, "entity_context_quality": q57, "relation_density": relation_density_summary, "refit_support": {"min_cluster_size": fine_model.parameters.get("refit_min_cluster_size"), "small_cluster_share": fine_model.parameters.get("refit_small_cluster_share"), "seed_trials": fine_model.parameters.get("refit_seed_trials")}, "analytics_metrics": analytics_metrics}
-    report = {"pipeline": PIPELINE_NAME, "pipeline_version": PIPELINE_VERSION, "execution_status": "SUCCESS", "statistical_validation_status": stat_status, "analytics_readiness_status": analytics_status, "business_readiness_status": analytics_status, "privacy_review_status": privacy_summary.get("residual_gate_status"), "started_at_utc": started, "completed_at_utc": utc_now_iso(), "external_pretrained_models_used": False, "ownership_contract": {"intent_training": False, "intent_scoring": False, "upstream_labels": "passthrough_only", "owned_layers": ["participants", "entities", "context", "evidence", "relations", "root_cause", "remediation", "context_patterns", "fingerprints"]}, "representation": "conservative lexical normalization + precision-filtered entity/context structure + word/char/signature TF-IDF + LSA + NMF + local PPMI/SVD/SIF + full-coverage stability-selected context patterns + relevance-routed evidence-tiered typed relations", "schema": schema, "split_audit": split_audit, "counts": counts, "quality": quality, "privacy": {**privacy_summary, "pseudonym_key_source": key_source, "public_text_suppressed": not public_examples_safe}, "cluster_id_contract": {"context_pattern_first_cluster_id": 1, "unknown_id": -1, "unknown_reserved_for_non_clusterable_only": True}, "dictionary_contract": contract, "stage_metrics": stages}
+    report = {"pipeline": PIPELINE_NAME, "pipeline_version": PIPELINE_VERSION, "execution_status": "SUCCESS", "statistical_validation_status": stat_status, "analytics_readiness_status": analytics_status, "business_readiness_status": analytics_status, "privacy_review_status": privacy_summary.get("residual_gate_status"), "started_at_utc": started, "completed_at_utc": utc_now_iso(), "external_pretrained_models_used": False, "ownership_contract": {"intent_training": False, "intent_scoring": False, "upstream_labels": "passthrough_only", "owned_layers": ["participants", "entities", "context", "evidence", "relations", "root_cause", "remediation", "context_patterns"]}, "representation": "conservative lexical normalization + precision-filtered entity/context structure + word/char/signature TF-IDF + LSA + NMF + local PPMI/SVD/SIF + full-coverage stability-selected context patterns + relevance-routed evidence-tiered typed relations", "schema": schema, "split_audit": split_audit, "counts": counts, "quality": quality, "privacy": {**privacy_summary, "pseudonym_key_source": key_source, "public_text_suppressed": not public_examples_safe}, "cluster_id_contract": {"context_pattern_first_cluster_id": 1, "unknown_id": -1, "unknown_reserved_for_non_clusterable_only": True}, "dictionary_contract": contract, "stage_metrics": stages}
     rp = outdir / "nora_entity_context_v5_7_1_report.json"; rp.write_text(json.dumps(to_plain(report), indent=2, ensure_ascii=False), encoding="utf-8"); pd.DataFrame(stages).to_csv(outdir / "stage_metrics.csv", index=False)
-    html = write_html_summary_v57(outdir, report, context_catalog, family_catalog, leaf_catalog, workflow_catalog, entity_profile_catalog, relation_motif_catalog, ps, es, cts, rs, relation_summary_df, stat_gate, analytics_gate, context_sim, refinement_audit, fingerprint_summary, evidence_quality_df, public_examples_safe)
+    html = write_html_summary_v57(outdir, report, context_catalog, family_catalog, leaf_catalog, workflow_catalog, entity_profile_catalog, relation_motif_catalog, ps, es, cts, rs, relation_summary_df, stat_gate, analytics_gate, context_sim, refinement_audit, evidence_quality_df, public_examples_safe)
 
     model_info = {}
     if c.persist_model and hard_privacy_safe:
@@ -3828,7 +3661,7 @@ def run_inference_v57(c: ConfigV57):
     out = outdir / "nora_entity_context_v5_7_1_inference.jsonl"
     with out.open("w", encoding="utf-8") as h:
         for r in public: h.write(json.dumps(to_plain(r), ensure_ascii=False) + "\n")
-    cluster_assignment_table_v57(public).to_csv(outdir / "context_pattern_assignments.csv", index=False); interaction_dictionary_table_v57(public).to_csv(outdir / "interaction_dictionary.csv", index=False); flatten_field(public, "entities").to_csv(outdir / "entities.csv", index=False); flatten_field(public, "context_facts").to_csv(outdir / "context_facts.csv", index=False); flatten_field(public, "relationships").to_csv(outdir / "grounded_relationships.csv", index=False); evidence_quality_table_v57(public).to_csv(outdir / "evidence_grounding_quality.csv", index=False); resolution_chain_table_v57(public).to_csv(outdir / "resolution_chain.csv", index=False); build_fingerprint_table_v57(records, analysis_map).to_csv(outdir / "interaction_fingerprints.csv", index=False)
+    cluster_assignment_table_v57(public).to_csv(outdir / "context_pattern_assignments.csv", index=False); interaction_dictionary_table_v57(public).to_csv(outdir / "interaction_dictionary.csv", index=False); flatten_field(public, "entities").to_csv(outdir / "entities.csv", index=False); flatten_field(public, "context_facts").to_csv(outdir / "context_facts.csv", index=False); flatten_field(public, "relationships").to_csv(outdir / "grounded_relationships.csv", index=False); evidence_quality_table_v57(public).to_csv(outdir / "evidence_grounding_quality.csv", index=False); resolution_chain_table_v57(public).to_csv(outdir / "resolution_chain.csv", index=False)
     relation_density_df, relation_density_summary = relation_density_audit_v571(records); relation_density_df.to_csv(outdir / "relation_density_audit.csv", index=False)
     rep = {"pipeline": PIPELINE_NAME, "pipeline_version": PIPELINE_VERSION, "mode": "infer", "execution_status": "SUCCESS", "privacy_review_status": privacy_summary["residual_gate_status"], "input_rows": len(frame), "interaction_records": len(public), "clusterable_customer_interactions": len(clusterable), "assigned_fraction": 1.0 if clusterable else 0.0, "external_pretrained_models_used": False, "intent_training": False, "pseudonym_key_source": key_source, "schema": schema, "relation_density": relation_density_summary, "entity_context_quality": _v57_quality_metrics(records), "output": out.name}
     (outdir / "nora_entity_context_v5_7_1_inference_report.json").write_text(json.dumps(to_plain(rep), indent=2, ensure_ascii=False), encoding="utf-8")
@@ -4346,10 +4179,10 @@ def fit_macro_clusters_v572(fine_model, fine_counts, c):
     rows, store = [], {}
     for k in range(lower, upper+1):
         try:
-            est = make_minibatch_kmeans(k, c.seed+1401, len(combined), reassignment_ratio=0.0)
+            est = make_context_partitioner(k, c.seed+1401, len(combined), reassignment_ratio=0.0)
             try: raw = est.fit_predict(combined, sample_weight=weights)
             except TypeError: raw = est.fit_predict(combined)
-            sil = safe_silhouette(combined, np.asarray(raw,dtype=int), c.seed); ent = cluster_entropy(np.asarray(raw,dtype=int)); stab = _kmeans_stability_v57(combined,k,c.seed+1403,max(3,min(c.stability_repeats,6)))
+            sil = safe_silhouette(combined, np.asarray(raw,dtype=int), c.seed); ent = cluster_entropy(np.asarray(raw,dtype=int)); stab = _partition_stability_v57(combined,k,c.seed+1403,max(3,min(c.stability_repeats,6)))
             rows.append({"macro_k":k,"silhouette":sil,"balance_entropy":ent,"stability_ari":stab,"profile_weight":getattr(c,"macro_profile_weight",.55)}); store[k]=np.asarray(raw,dtype=int)
         except Exception: pass
     tab = pd.DataFrame(rows)
@@ -5696,7 +5529,9 @@ def refit_context_model_v71(dev_v: np.ndarray, k: int, c: ConfigV71):
     if not adj_by_k:
         raise RuntimeError("Development shared-neighbour graph is empty.")
     members = ensemble_partitions_v71(adj_by_k, resolutions, seeds)
-    base = adj_by_k.get(selected_k_neighbors) or adj_by_k[sorted(adj_by_k)[len(adj_by_k) // 2]]
+    if selected_k_neighbors not in adj_by_k:
+        selected_k_neighbors = sorted(adj_by_k)[len(adj_by_k) // 2]
+    base = adj_by_k[selected_k_neighbors]
     consensus = coassociation_graph_v71(base, members) if members else base
 
     labels, resolution, found = resolution_for_target_v71(
@@ -5761,8 +5596,8 @@ def consensus_stability_profile_v71(v: np.ndarray, reference: np.ndarray, k: int
 # every gate are inherited unchanged, so V7.1 output stays comparable with the
 # V5.7.2 run it replaces.
 
-make_minibatch_kmeans = make_partitioner_v71
-_kmeans_stability_v57 = subsample_stability_v71
+make_context_partitioner = make_partitioner_v71
+_partition_stability_v57 = subsample_stability_v71
 fit_full_coverage_context_model_v57 = fit_full_coverage_context_model_v71
 refit_context_model_v57 = refit_context_model_v71
 consensus_stability_profile_v57 = consensus_stability_profile_v71
@@ -5807,7 +5642,6 @@ def run_train_v572(c: ConfigV71):
 
     engine = {
         "context_pattern_engine": "shared-nearest-neighbour graph + Leiden communities + ensemble consensus",
-        "centroid_partition_clustering_used": False,
         "secondary_layer_partitioner": "agglomerative average linkage (Birch above the dense limit)",
         "selected_engine": _V71_SELECTION.get("engine", "snn_leiden_consensus"),
         "selected_k_neighbors": _V71_SELECTION.get("k_neighbors"),
@@ -5818,6 +5652,7 @@ def run_train_v572(c: ConfigV71):
         "neighbor_grid": _V71_SELECTION.get("neighbor_grid"),
         "resolution_grid": _V71_SELECTION.get("resolution_grid"),
         "external_pretrained_models_used": False,
+        "assignment_rule": "cosine similarity to the mean vector of each discovered community",
     }
 
     purity_summary = None
@@ -5846,6 +5681,7 @@ def run_train_v572(c: ConfigV71):
             "support_floor": floor,
             "mean_internal_consensus": round(float(table["internal_consensus_support"].mean()), 4),
             "weakest_cluster_support": round(float(table["internal_consensus_support"].min()), 4),
+            "patterns_total": int(len(table)),
             "patterns_below_floor": int(len(weak)),
             "records_below_floor_fraction": round(weak_fraction, 4),
             "artifact": "diagnostics/context_pattern_consensus_purity.csv",
@@ -5858,9 +5694,6 @@ def run_train_v572(c: ConfigV71):
     if purity_summary:
         report["consensus_purity"] = purity_summary
 
-    # The inherited pipeline has already written the report; refresh it so the
-    # engine and purity evidence are in the file a reviewer opens, not only in
-    # the object returned to the caller.
     for name in ("nora_entity_context_v5_7_2_report.json",):
         path = outdir / name
         if path.exists():
@@ -5882,6 +5715,167 @@ def run_train_v572(c: ConfigV71):
                 engine["context_patterns"], engine["selected_k_neighbors"],
                 engine["selected_resolution"], engine["ensemble_members"])
     return report
+
+
+# ---------------------------------------------------------------------------
+# Artifact naming and executive narrative
+# ---------------------------------------------------------------------------
+
+_V71_BASE_STEM = "nora_entity_context_v5_7_2"
+_V71_STEM = "nora_entity_context_v7_1"
+
+_V71_TITLE = "NORA Entity-Context v7.1 — Graph-Consensus Context Discovery"
+
+_V71_QUALITY_BANNER = (
+    "<div class='ok'><b>Quality controls:</b> typed-entity guard; semantic metric and unit "
+    "validation; RCA proposition extraction; concrete remediation actions; descriptor "
+    "filtering; semantic-profile context families; relation-motif consolidation; direct and "
+    "anchored grounding transparency; human-validation handoff.</div>")
+
+_V71_DICTIONARY_PARAGRAPH = (
+    "<h2>Structured dictionary output</h2><p>Each interaction carries participants, accepted "
+    "entities and review candidates, context mentions and context facts, diagnostic evidence, "
+    "RCA and remediation, evidence-grounded typed relations, full-coverage context-pattern "
+    "assignments, and independent structural lenses.</p>")
+
+_V71_METHOD_PARAGRAPH = (
+    "<h2>Method</h2><p>Deterministic privacy handling → train-only customer-problem "
+    "normalization → precision entity, context, RCA and remediation extraction → evidence "
+    "grounding across direct, anchored and inferred tiers with ambiguity annotation → "
+    "relevance-routed typed relation graph → word, character and structure-signature TF-IDF "
+    "→ LSA, NMF and locally trained PPMI/SVD/SIF representations → shared-nearest-neighbour "
+    "graph construction over mutual k-nearest neighbours with Jaccard edge weights → Leiden "
+    "community detection across a neighbour, resolution and seed grid → co-association "
+    "consensus over the resulting ensemble → resolution-targeted refit that places every "
+    "clusterable interaction → locked-test validation → stability-gated local context "
+    "refinement → context-family discovery → independent interaction, entity-profile and "
+    "relation-motif lenses → per-pattern consensus-support audit. Every representation is "
+    "trained locally from the supplied corpus. t-SNE is used for visualization.</p>")
+
+
+def _v71_round(value, places=3):
+    try:
+        return round(float(value), places)
+    except (TypeError, ValueError):
+        return value
+
+
+def _v71_grid(value):
+    if isinstance(value, (list, tuple)):
+        return ", ".join(str(int(x)) if float(x).is_integer() else str(_v71_round(x)) for x in value)
+    return value if value is not None else "n/a"
+
+
+def _v71_engine_card(engine: dict, purity: dict | None) -> str:
+    rows = [
+        f"<b>Context-pattern engine:</b> {engine.get('context_pattern_engine')}",
+        f"<b>Neighbour grid searched:</b> {_v71_grid(engine.get('neighbor_grid'))}",
+        f"<b>Resolution grid searched:</b> {_v71_grid(engine.get('resolution_grid'))}",
+        f"<b>Ensemble members built:</b> {engine.get('ensemble_members')}",
+        f"<b>Selected graph:</b> neighbours={engine.get('selected_k_neighbors')}, "
+        f"resolution={_v71_round(engine.get('selected_resolution'))}",
+        f"<b>Deployed refit resolution:</b> {_v71_round(engine.get('refit_resolution'))}",
+        f"<b>Context patterns deployed:</b> {engine.get('context_patterns')}",
+        "<b>Assignment coverage:</b> every clusterable interaction receives a context pattern",
+        f"<b>Secondary layers:</b> {engine.get('secondary_layer_partitioner')}",
+    ]
+    if purity:
+        total = int(purity.get("patterns_total") or 0)
+        meeting = total - int(purity.get("patterns_below_floor") or 0)
+        rows += [
+            f"<b>Consensus purity gate:</b> {purity.get('status')}",
+            f"<b>Mean internal consensus support:</b> {purity.get('mean_internal_consensus')}",
+            f"<b>Weakest pattern support:</b> {purity.get('weakest_cluster_support')}",
+            f"<b>Patterns meeting the {purity.get('support_floor')} support floor:</b> "
+            f"{meeting} of {total}",
+        ]
+    return ("<h2>Context-pattern clustering engine</h2><div class='card'>" + "<br>".join(rows) +
+            "</div><p>Each interaction is placed on a shared-nearest-neighbour graph whose edges "
+            "carry the Jaccard overlap of the two neighbour sets, and Leiden community detection "
+            "partitions that graph. The grid above is run end to end for every neighbour count, "
+            "resolution and seed, and the resulting partitions are combined through a "
+            "co-association consensus, so a pattern is kept where independent runs agree on it. "
+            "Consensus support measures that agreement inside each pattern and is reported per "
+            "pattern in diagnostics/context_pattern_consensus_purity.csv.</p>")
+
+
+def _v71_write_narrative(outdir: Path, engine: dict, purity: dict | None):
+    for stem in (_V71_BASE_STEM, _V71_STEM):
+        path = outdir / "executive" / f"{stem}_summary.html"
+        if not path.exists():
+            continue
+        html = path.read_text(encoding="utf-8")
+        html = re.sub(r"<title>[^<]*</title>", "<title>NORA Entity-Context v7.1</title>", html)
+        html = re.sub(r"<h1>[^<]*</h1>", f"<h1>{_V71_TITLE}</h1>", html)
+        html = re.sub(r"<div class='ok'><b>V5\.7\.2 final fixes:</b>.*?</div>",
+                      _V71_QUALITY_BANNER, html, flags=re.S)
+        html = re.sub(r"<h2>Structured dictionary output</h2><p>Each interaction carries participants, accepted entities and review candidates, context mentions and context facts, diagnostic evidence, RCA and remediation, evidence-grounded typed relations, full-coverage context-pattern assignments, and independent structural lenses.</p>",
+                      _V71_DICTIONARY_PARAGRAPH, html, flags=re.S)
+        html = re.sub(r"<h2>Method</h2><p>.*?</p>", _V71_METHOD_PARAGRAPH, html, flags=re.S)
+        html = html.replace("<b>V5.7.2 ownership contract:</b>", "<b>Ownership contract:</b>")
+        card = _v71_engine_card(engine, purity)
+        anchor = html.find("<h2>")
+        html = (html[:anchor] + card + html[anchor:]) if anchor > 0 else html.replace(
+            "</body></html>", card + "</body></html>")
+        path.write_text(html, encoding="utf-8")
+
+
+def _v71_name_artifacts(outdir: Path):
+    for src in sorted(outdir.rglob(f"{_V71_BASE_STEM}*")):
+        dst = src.with_name(src.name.replace(_V71_BASE_STEM, _V71_STEM))
+        if dst.exists():
+            dst.unlink()
+        src.rename(dst)
+    for path in sorted(outdir.rglob("*.json")) + sorted(outdir.rglob("*.html")):
+        text = path.read_text(encoding="utf-8")
+        renamed = text.replace(_V71_BASE_STEM, _V71_STEM)
+        if renamed != text:
+            path.write_text(renamed, encoding="utf-8")
+    manifest_path = outdir / "model_manifest.json"
+    if not manifest_path.exists():
+        return
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["pipeline"] = PIPELINE_NAME
+    manifest["pipeline_version"] = PIPELINE_VERSION
+    manifest["artifact_format"] = ARTIFACT_FORMAT_VERSION
+    for key, path in (("model", outdir / f"{_V71_STEM}_model.joblib"),
+                      ("report", outdir / f"{_V71_STEM}_report.json"),
+                      ("dictionary_json", outdir / f"{_V71_STEM}_dictionary.json"),
+                      ("dictionary_jsonl", outdir / f"{_V71_STEM}_dictionary.jsonl")):
+        if not path.exists():
+            continue
+        slot = manifest.setdefault("artifacts", {}).setdefault(key, {})
+        slot["model_file" if key == "model" else "file"] = path.name
+        slot["model_sha256" if key == "model" else "sha256"] = sha256_file(path)
+    summary = outdir / "executive" / f"{_V71_STEM}_summary.html"
+    if summary.exists():
+        slot = manifest.setdefault("artifacts", {}).setdefault("html", {})
+        slot["file"] = f"executive/{_V71_STEM}_summary.html"
+        slot["sha256"] = sha256_file(summary)
+    manifest_path.write_text(json.dumps(to_plain(manifest), indent=2, ensure_ascii=False),
+                             encoding="utf-8")
+
+
+_v71_core_train = run_train_v572
+_v71_core_infer = run_inference_v572
+
+
+def run_train_v572(c: ConfigV71):
+    report = _v71_core_train(c)
+    outdir = Path(c.outdir)
+    _v71_write_narrative(outdir, report.get("clustering_engine") or {},
+                         report.get("consensus_purity"))
+    _v71_name_artifacts(outdir)
+    path = outdir / f"{_V71_STEM}_report.json"
+    return json.loads(path.read_text(encoding="utf-8")) if path.exists() else report
+
+
+def run_inference_v572(c: ConfigV71):
+    report = _v71_core_infer(c)
+    outdir = Path(c.outdir)
+    _v71_name_artifacts(outdir)
+    path = outdir / f"{_V71_STEM}_inference_report.json"
+    return json.loads(path.read_text(encoding="utf-8")) if path.exists() else report
 
 
 PIPELINE_NAME = "NORA Entity-Context v7.1 Graph-Consensus Context Discovery"

@@ -1,0 +1,933 @@
+# %%
+import argparse
+import ast
+import json
+import os
+import re
+import warnings
+from collections import Counter
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from scipy.cluster.hierarchy import fcluster, linkage
+from scipy.sparse import csr_matrix, hstack
+from scipy.spatial.distance import squareform
+from scipy.stats import chi2_contingency
+from sklearn.cluster import AgglomerativeClustering, KMeans, MiniBatchKMeans, SpectralClustering
+from sklearn.decomposition import TruncatedSVD
+from sklearn.dummy import DummyClassifier
+from sklearn.exceptions import ConvergenceWarning
+from sklearn.feature_extraction.text import CountVectorizer, TfidfVectorizer
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import (
+    accuracy_score, adjusted_rand_score, calinski_harabasz_score, completeness_score,
+    davies_bouldin_score, f1_score, homogeneity_score, normalized_mutual_info_score,
+    recall_score, silhouette_score,
+)
+from sklearn.mixture import GaussianMixture
+from sklearn.model_selection import StratifiedGroupKFold, cross_val_predict
+from sklearn.neighbors import KNeighborsClassifier, NearestNeighbors
+from sklearn.preprocessing import MultiLabelBinarizer, OneHotEncoder, normalize
+
+try:
+    from sklearn.cluster import HDBSCAN
+except ImportError:
+    HDBSCAN = None
+
+warnings.filterwarnings("ignore", category=ConvergenceWarning)
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
+
+FILE_PATTERN = "intent_labels*.csv"
+
+# Column roles are resolved by name pattern and printed, so a schema change shows up immediately.
+COLUMN_PATTERNS = {
+    "row_id": r"conversation_id$",
+    "l1_label": r"classification\.intent$",
+    "l1_confidence": r"classification\.confidence$",
+    "l1_rule": r"classification\.rule$",
+    "l1_review": r"classification\.needs_human_review$",
+    "user_text": r"user_text",
+    "messages": r"(^|\.)messages$",
+    "context": r"issues_context$",
+    "tools": r"tool_history$",
+    "category": r"user_inputs\.category$",
+    "subcategory": r"user_inputs\.subcategory$",
+}
+VALIDATOR_STATUS = r"validator_verdicts\.(?P<check>.+)\.status$"
+PERSON_NAME_COLUMN = r"(contact|customer|first|last|full|user)_?name$"
+
+STATUS_SEVERITY = {"ok": 0, "great": 0, "good": 0, "neutral": 1, "average": 1,
+                   "warn": 2, "poor": 2, "alert": 3, "fail": 3, "error": 3}
+PROBLEM_SEVERITY = 2
+AMBIGUITY_MARGIN = 0.2
+FIT_CAP = 3000
+MIN_BEHAVIOUR_COVERAGE = 0.3
+MIN_CLUSTER_SHARE = 0.05
+
+parser = argparse.ArgumentParser()
+parser.add_argument("path", nargs="?", default=None)
+parser.add_argument("--max-rows", type=int, default=None)
+parser.add_argument("--seed", type=int, default=42)
+parser.add_argument("--k-max", type=int, default=12)
+parser.add_argument("--bootstraps", type=int, default=20)
+args, _ = parser.parse_known_args()
+if args.path and not args.path.lower().endswith((".csv", ".zip")):
+    args.path = None
+SEED = args.seed
+
+
+def downloads_dirs():
+    roots = [os.environ.get(k) for k in ("OneDriveCommercial", "OneDrive")]
+    dirs = [Path(r) / "Downloads" for r in roots if r] + [Path.home() / "Downloads"]
+    return [d for d in dict.fromkeys(dirs) if d.is_dir()]
+
+
+def locate_input(path_arg):
+    if path_arg:
+        return Path(path_arg)
+    matches = [p for d in downloads_dirs() for p in d.glob(FILE_PATTERN)]
+    if not matches:
+        raise FileNotFoundError(f"No file matching {FILE_PATTERN} in {downloads_dirs()}")
+    return max(matches, key=lambda p: p.stat().st_mtime)
+
+
+def load_table(path, max_rows):
+    for enc in ("utf-8", "utf-8-sig", "cp1252", "latin-1"):
+        try:
+            return pd.read_csv(path, encoding=enc, low_memory=False, nrows=max_rows), enc
+        except UnicodeDecodeError:
+            continue
+    raise ValueError(f"Could not decode {path}")
+
+
+src = locate_input(args.path)
+raw, encoding = load_table(src, args.max_rows)
+out_dir = src.parent / f"{src.stem}_decomposition"
+(out_dir / "tables").mkdir(parents=True, exist_ok=True)
+(out_dir / "charts").mkdir(exist_ok=True)
+tables = {}
+
+print(f"Source   : {src}")
+print(f"Encoding : {encoding}")
+print(f"Shape    : {raw.shape[0]:,} rows x {raw.shape[1]:,} columns")
+
+# %% Structure discovery
+
+
+def find_column(columns, pattern):
+    hits = [c for c in columns if re.search(pattern, c, flags=re.I)]
+    return hits[0] if hits else None
+
+
+def duplicate_columns(frame):
+    seen, dups = {}, {}
+    for c in frame.columns:
+        key = pd.util.hash_pandas_object(frame[c].astype(str), index=False).values.tobytes()
+        if key in seen:
+            dups[c] = seen[key]
+        else:
+            seen[key] = c
+    return dups
+
+
+roles = {role: find_column(raw.columns, pat) for role, pat in COLUMN_PATTERNS.items()}
+checks = {}
+for c in raw.columns:
+    m = re.search(VALIDATOR_STATUS, c, flags=re.I)
+    if m:
+        checks[m.group("check")] = c
+protected = {c for c in roles.values() if c} | set(checks.values())
+
+empty_cols = [c for c in raw.columns if raw[c].isna().all()]
+system_cols = [c for c in raw.columns if c.split(".")[-1].startswith("_")]
+const_cols = [c for c in raw.columns if raw[c].nunique(dropna=True) == 1]
+dup_cols = duplicate_columns(raw.drop(columns=empty_cols))
+
+reasons = {}
+for c in empty_cols:
+    reasons[c] = "fully empty"
+for c in system_cols:
+    reasons.setdefault(c, "store system field")
+for c in const_cols:
+    reasons.setdefault(c, f"constant: {raw[c].dropna().iloc[0]}")
+for c, orig in dup_cols.items():
+    reasons.setdefault(c, f"duplicate of {orig}")
+drop_cols = [c for c in reasons if c not in protected]
+
+tables["column_roles"] = pd.DataFrame(
+    [{"role": r, "column": c} for r, c in roles.items()]
+    + [{"role": f"check:{k}", "column": v} for k, v in checks.items()]
+)
+tables["dropped_columns"] = pd.DataFrame(
+    [{"column": c, "reason": reasons[c]} for c in drop_cols]
+)
+tables["constants_kept"] = pd.DataFrame(
+    [{"column": c, "value": raw[c].dropna().iloc[0]} for c in const_cols if c in protected]
+)
+
+print("\nResolved roles:")
+for r, c in roles.items():
+    print(f"  {r:<14} -> {c}")
+print(f"  validator checks found: {len(checks)}")
+print(f"\nDropping {len(drop_cols)} columns:")
+print(tables["dropped_columns"]["reason"].str.split(":").str[0].value_counts().to_string())
+
+# %% Data cleaning and preparation
+
+
+def parse_json(value):
+    if not isinstance(value, str):
+        return None
+    s = value.strip()
+    if len(s) < 2 or s[0] not in "[{":
+        return None
+    for loader in (json.loads, ast.literal_eval):
+        try:
+            return loader(s)
+        except (ValueError, SyntaxError, TypeError, MemoryError, RecursionError):
+            continue
+    return None
+
+
+def expand(obj, depth=0):
+    if depth > 4:
+        return obj
+    if isinstance(obj, str):
+        inner = parse_json(obj)
+        return obj if inner is None else expand(inner, depth + 1)
+    if isinstance(obj, dict):
+        return {k: expand(v, depth + 1) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [expand(v, depth + 1) for v in obj]
+    return obj
+
+
+def parse_cell(value):
+    obj = parse_json(value)
+    return None if obj is None else expand(obj)
+
+
+def walk(obj, path=""):
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            yield from walk(v, f"{path}.{k}" if path else str(k))
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from walk(v, f"{path}[]")
+    else:
+        yield path, obj
+
+
+def leaf_key(path):
+    return path.replace("[]", "").rsplit(".", 1)[-1]
+
+
+def is_text_column(s):
+    return pd.api.types.is_string_dtype(s) or s.dtype == object
+
+
+name_cols = [c for c in raw.columns if re.search(PERSON_NAME_COLUMN, c, re.I) and is_text_column(raw[c])]
+known_names = sorted({str(v).strip() for c in name_cols for v in raw[c].dropna() if len(str(v).strip()) >= 3},
+                     key=len, reverse=True)
+NAME_RE = re.compile("|".join(map(re.escape, known_names)), re.I) if known_names else None
+PII_PATTERNS = [
+    (re.compile(r"[\w.+-]+@[\w-]+(\.[\w-]+)+"), "<EMAIL>"),
+    (re.compile(r"https?://\S+"), "<URL>"),
+    (re.compile(r"\b[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}\b", re.I), "<UUID>"),
+    (re.compile(r"(?<!\w)\+?\d[\d\s\-().]{6,}\d(?!\w)"), "<NUM>"),
+]
+
+
+def mask_pii(text):
+    for pat, token in PII_PATTERNS:
+        text = pat.sub(token, text)
+    return NAME_RE.sub("<NAME>", text) if NAME_RE else text
+
+
+def model_text(text):
+    return re.sub(r"\s+", " ", re.sub(r"<[A-Z]+>", " ", text)).strip().lower()
+
+
+def user_utterances(msgs):
+    out = []
+    for m in msgs if isinstance(msgs, list) else []:
+        if isinstance(m, dict) and str(m.get("type", m.get("role", ""))).lower() in {"user", "human", "customer"}:
+            out += [v for p, v in walk(m) if isinstance(v, str) and leaf_key(p) == "content"]
+    return " ".join(out)
+
+
+def context_text(obj):
+    parts = []
+    for path, v in walk(obj):
+        if isinstance(v, str) and v.strip():
+            keys = " ".join(re.findall(r"[A-Za-z]+", path.replace("_", " ")))
+            parts.append(f"{keys} {v}")
+    return " ".join(parts)
+
+
+def discover_tool_key(objs):
+    coverage = Counter()
+    for obj in objs.dropna():
+        keys = {leaf_key(p) for p, v in walk(obj) if isinstance(v, str) and v.strip()}
+        coverage.update(k for k in keys if re.search(r"tool|function|name", k, re.I))
+    return coverage.most_common(1)[0][0] if coverage else None
+
+
+df = raw.drop(columns=drop_cols).drop_duplicates().reset_index(drop=True)
+n = len(df)
+row_id = df[roles["row_id"]].astype(str) if roles["row_id"] in df.columns else pd.Series(df.index.astype(str))
+groups = row_id.values
+
+
+def column(role, fill="missing"):
+    c = roles.get(role)
+    return df[c].astype(str).where(df[c].notna(), fill) if c in df.columns else None
+
+
+l1 = column("l1_label")
+l1_rule = column("l1_rule")
+category = column("category")
+subcategory = column("subcategory")
+l1_conf = pd.to_numeric(df[roles["l1_confidence"]], errors="coerce") if roles["l1_confidence"] in df.columns else None
+
+parsed = {r: df[roles[r]].map(parse_cell) for r in ("messages", "context", "tools") if roles.get(r) in df.columns}
+
+user_raw = df[roles["user_text"]].fillna("").astype(str) if roles["user_text"] in df.columns else pd.Series("", index=df.index)
+if "messages" in parsed:
+    user_raw = user_raw.where(user_raw.str.strip() != "", parsed["messages"].map(user_utterances))
+context_raw = parsed["context"].map(context_text) if "context" in parsed else pd.Series("", index=df.index)
+
+user_masked = user_raw.map(mask_pii)
+context_masked = context_raw.map(mask_pii)
+user_model = user_masked.map(model_text)
+context_model = context_masked.map(model_text)
+
+tool_key = discover_tool_key(parsed["tools"]) if "tools" in parsed else None
+if tool_key:
+    tool_seq = parsed["tools"].map(lambda o: [v for p, v in walk(o) if leaf_key(p) == tool_key and isinstance(v, str)] if o is not None else [])
+else:
+    tool_seq = pd.Series([[] for _ in range(n)])
+
+status = pd.DataFrame({chk: df[col].astype("string").str.strip().str.lower() for chk, col in checks.items()}, index=df.index)
+severity = status.apply(lambda s: s.map(STATUS_SEVERITY)).astype(float) if checks else pd.DataFrame(index=df.index)
+observed_status = set(status.melt()["value"].dropna().unique()) if checks else set()
+unknown_status = sorted(observed_status - set(STATUS_SEVERITY))
+if checks:
+    severity = severity.where(~(status.notna() & severity.isna()), 1.0)
+
+print(f"Rows after cleaning       : {n:,}")
+print(f"Person-name values masked : {len(known_names)}")
+print(f"User text non-empty       : {(user_model.str.len() > 0).sum():,}")
+print(f"Context text non-empty    : {(context_model.str.len() > 0).sum():,}")
+print(f"Tool key discovered       : {tool_key}")
+print(f"Status values observed    : {sorted(observed_status)}")
+if unknown_status:
+    print(f"  not in STATUS_SEVERITY, treated as neutral: {unknown_status}")
+
+# %% Exploratory analysis
+
+
+def cramers_v(a, b):
+    ct = pd.crosstab(a, b)
+    if min(ct.shape) < 2:
+        return np.nan
+    chi2 = chi2_contingency(ct, correction=False)[0]
+    return float(np.sqrt(chi2 / (ct.values.sum() * (min(ct.shape) - 1))))
+
+
+TOKEN = r"(?u)\b(?=\w*[a-zA-Z])\w{2,}\b"
+
+
+def ctfidf_terms(texts, labels, top_n=10):
+    try:
+        cv = CountVectorizer(ngram_range=(1, 2), stop_words="english", token_pattern=TOKEN)
+        X = cv.fit_transform(pd.Series(texts).fillna(""))
+    except ValueError:
+        return {}
+    labs = np.asarray(pd.Series(labels).astype(str))
+    classes = sorted(set(labs))
+    tf = np.vstack([np.asarray(X[labs == c].sum(axis=0)).ravel() for c in classes])
+    idf = np.log1p((tf.sum() / len(classes)) / np.maximum(tf.sum(axis=0), 1))
+    scores = tf / np.maximum(tf.sum(axis=1, keepdims=True), 1) * idf
+    vocab = cv.get_feature_names_out()
+    return {c: [vocab[i] for i in np.argsort(-scores[j])[:top_n] if scores[j, i] > 0] for j, c in enumerate(classes)}
+
+
+labels_available = {k: v for k, v in {"l1": l1, "l1_rule": l1_rule, "category": category, "subcategory": subcategory}.items() if v is not None}
+
+if l1 is not None:
+    tables["l1_distribution"] = l1.value_counts().rename_axis("l1").reset_index(name="rows")
+    tables["l1_distribution"]["share"] = (tables["l1_distribution"]["rows"] / n).round(3)
+    print("L1 label distribution:")
+    print(tables["l1_distribution"].to_string(index=False))
+    if l1_conf is not None:
+        tables["l1_confidence"] = l1_conf.groupby(l1).describe().round(3).reset_index()
+        print("\nConfidence by L1 label:")
+        print(tables["l1_confidence"].to_string(index=False))
+    if l1_rule is not None:
+        tables["l1_rule_crosstab"] = pd.crosstab(l1, l1_rule).reset_index()
+
+abstain_label = None
+if l1 is not None and l1_conf is not None and l1.nunique() > 1:
+    abstain_label = l1_conf.groupby(l1).mean().idxmin()
+    print(f"\nLowest-confidence L1 class (treated as abstention): {abstain_label} "
+          f"-> {(l1 == abstain_label).mean():.1%} of rows")
+
+pairs = []
+names = list(labels_available)
+for i, a in enumerate(names):
+    for b in names[i + 1:]:
+        pairs.append({"a": a, "b": b, "cramers_v": cramers_v(labels_available[a], labels_available[b]),
+                      "nmi": normalized_mutual_info_score(labels_available[a], labels_available[b])})
+tables["label_association"] = pd.DataFrame(pairs).round(3)
+if pairs:
+    print("\nAssociation between existing labels:")
+    print(tables["label_association"].to_string(index=False))
+for a in ("category", "subcategory"):
+    if l1 is not None and labels_available.get(a) is not None:
+        tables[f"l1_x_{a}"] = pd.crosstab(labels_available[a], l1).reset_index()
+
+if checks:
+    run = status.notna()
+    tables["validator_coverage"] = pd.DataFrame({
+        "check": list(checks),
+        "rows_run": run.sum().values,
+        "run_rate": run.mean().round(3).values,
+        "problem_rate_when_run": [(severity[c] >= PROBLEM_SEVERITY).sum() / max(run[c].sum(), 1) for c in checks],
+        "statuses": [status[c].value_counts().to_dict() for c in checks],
+    }).sort_values("problem_rate_when_run", ascending=False)
+    print(f"\nRows with any validator verdict: {run.any(axis=1).sum()} of {n}")
+    print(tables["validator_coverage"].drop(columns="statuses").to_string(index=False))
+
+lengths = user_model.str.split().str.len().fillna(0)
+tables["text_stats"] = pd.DataFrame([{
+    "rows": n, "empty_user_text": int((lengths == 0).sum()),
+    "duplicate_user_text": int(user_model[lengths > 0].duplicated().sum()),
+    "words_median": float(lengths.median()), "words_p90": float(lengths.quantile(0.9)),
+    "rows_with_tools": int((tool_seq.str.len() > 0).sum()),
+    "distinct_tool_sequences": int(tool_seq[tool_seq.str.len() > 0].map(tuple).nunique()),
+}])
+print("\nText and tool stats:")
+print(tables["text_stats"].T.to_string(header=False))
+
+if l1 is not None:
+    l1_terms = ctfidf_terms(user_model + " " + context_model, l1)
+    tables["l1_top_terms"] = pd.DataFrame([{"l1": k, "terms": ", ".join(v)} for k, v in l1_terms.items()])
+    print("\nDistinctive terms per L1 label (c-TF-IDF):")
+    for k, v in l1_terms.items():
+        print(f"  {k}: {', '.join(v)}")
+
+# %% Feature views
+
+
+def text_matrix(texts):
+    texts = pd.Series(texts).fillna("")
+    if (texts.str.len() > 0).sum() < 3:
+        return None
+    min_df = 2 if len(texts) >= 200 else 1
+    word = TfidfVectorizer(ngram_range=(1, 2), min_df=min_df, max_df=0.95, sublinear_tf=True,
+                           stop_words="english", token_pattern=TOKEN)
+    char = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 5), min_df=min_df, sublinear_tf=True)
+    try:
+        return hstack([word.fit_transform(texts), char.fit_transform(texts)]).tocsr()
+    except ValueError:
+        return None
+
+
+def lsa(X, target_var=0.8, cap=100):
+    n_max = min(cap, X.shape[0] - 1, X.shape[1] - 1)
+    if n_max < 2:
+        return None, 0.0
+    svd = TruncatedSVD(n_components=n_max, random_state=SEED).fit(X)
+    k = int(np.clip(np.searchsorted(np.cumsum(svd.explained_variance_ratio_), target_var) + 1, 2, n_max))
+    return normalize(svd.transform(X)[:, :k]), float(svd.explained_variance_ratio_[:k].sum())
+
+
+behaviour_parts = []
+if checks:
+    enc = OneHotEncoder(handle_unknown="ignore")
+    behaviour_parts.append(enc.fit_transform(status.fillna("not_run").astype(str)))
+if (tool_seq.str.len() > 0).sum() >= 3:
+    behaviour_parts.append(csr_matrix(MultiLabelBinarizer().fit_transform(tool_seq.map(set))))
+behaviour_signal = (status.notna().any(axis=1) if checks else pd.Series(False, index=df.index)) | (tool_seq.str.len() > 0)
+
+raw_views = {"user_text": text_matrix(user_model), "context": text_matrix(context_model)}
+if behaviour_parts and behaviour_signal.mean() >= MIN_BEHAVIOUR_COVERAGE:
+    raw_views["behaviour"] = hstack(behaviour_parts).tocsr().astype(float)
+else:
+    print(f"Behaviour view held out of clustering: validator/tool signal on {behaviour_signal.mean():.1%} of rows "
+          f"(< {MIN_BEHAVIOUR_COVERAGE:.0%}); used for cluster profiling only")
+
+views, view_info = {}, []
+for name, X in raw_views.items():
+    if X is None:
+        view_info.append({"view": name, "status": "skipped: too little signal"})
+        continue
+    Z, var = lsa(X)
+    if Z is None:
+        view_info.append({"view": name, "status": "skipped: too few dimensions"})
+        continue
+    views[name] = Z
+    view_info.append({"view": name, "status": "used", "raw_features": X.shape[1], "lsa_dims": Z.shape[1], "variance_kept": round(var, 3)})
+if len(views) > 1:
+    views["combined"] = normalize(np.hstack([Z / np.sqrt(len(views)) for Z in views.values()]))
+    view_info.append({"view": "combined", "status": "used", "lsa_dims": views["combined"].shape[1]})
+if not views:
+    raise ValueError("No usable feature view: text and behaviour columns are all empty")
+tables["feature_views"] = pd.DataFrame(view_info)
+print(tables["feature_views"].to_string(index=False))
+
+strat = l1 if l1 is not None else pd.Series("all", index=df.index)
+if n > FIT_CAP:
+    idx_fit = (df.groupby(strat, group_keys=False).apply(lambda g: g.sample(min(len(g), max(1, int(FIT_CAP * len(g) / n))), random_state=SEED)).index.values)
+else:
+    idx_fit = np.arange(n)
+n_fit = len(idx_fit)
+k_values = list(range(2, max(3, min(args.k_max, n_fit // 4)) + 1))
+print(f"\nClustering on {n_fit:,} rows, k in {k_values[0]}..{k_values[-1]}")
+
+# %% Clustering: several algorithms x views x k
+
+
+def run_algorithm(name, Z, k, seed):
+    if name == "kmeans":
+        est = MiniBatchKMeans(k, random_state=seed, n_init=10, batch_size=2048) if len(Z) > 20000 else KMeans(k, random_state=seed, n_init=20)
+        return est.fit_predict(Z)
+    if name == "agglo_ward":
+        return AgglomerativeClustering(n_clusters=k, linkage="ward").fit_predict(Z)
+    if name == "agglo_cosine":
+        return AgglomerativeClustering(n_clusters=k, metric="cosine", linkage="average").fit_predict(Z)
+    if name == "spectral":
+        return SpectralClustering(n_clusters=k, affinity="nearest_neighbors", n_neighbors=min(10, len(Z) - 1),
+                                  random_state=seed, assign_labels="cluster_qr").fit_predict(Z)
+    if name == "gmm":
+        return GaussianMixture(k, covariance_type="diag", reg_covar=1e-3, random_state=seed, n_init=3).fit_predict(Z)
+    raise ValueError(name)
+
+
+def internal_scores(Z, labels):
+    keep = labels >= 0
+    labs = labels[keep]
+    k = len(set(labs))
+    if k < 2 or k >= keep.sum():
+        return {"silhouette": np.nan, "calinski_harabasz": np.nan, "davies_bouldin": np.nan}
+    sample = 5000 if keep.sum() > 5000 else None
+    return {"silhouette": silhouette_score(Z[keep], labs, metric="cosine", sample_size=sample, random_state=SEED),
+            "calinski_harabasz": calinski_harabasz_score(Z[keep], labs),
+            "davies_bouldin": davies_bouldin_score(Z[keep], labs)}
+
+
+def bootstrap_stability(Z, k, algo, full_labels, B):
+    rng = np.random.default_rng(SEED)
+    m = int(0.8 * len(Z))
+    scores = []
+    for b in range(B):
+        idx = rng.choice(len(Z), m, replace=False)
+        try:
+            scores.append(adjusted_rand_score(full_labels[idx], run_algorithm(algo, Z[idx], k, SEED + b + 1)))
+        except Exception:
+            continue
+    return float(np.mean(scores)) if scores else np.nan
+
+
+algorithms = ["kmeans", "agglo_ward", "agglo_cosine", "spectral", "gmm"]
+if n_fit > 5000:
+    algorithms = ["kmeans", "gmm"]
+
+records, runs = [], {}
+for view, Zfull in views.items():
+    Z = Zfull[idx_fit]
+    for algo in algorithms:
+        for k in k_values:
+            try:
+                labels = np.asarray(run_algorithm(algo, Z, k, SEED))
+            except Exception:
+                continue
+            if len(set(labels)) < 2:
+                continue
+            row = {"view": view, "algorithm": algo, "k": k, "clusters": len(set(labels)), **internal_scores(Z, labels)}
+            if algo == "kmeans":
+                row["stability"] = bootstrap_stability(Z, k, algo, labels, args.bootstraps)
+            runs[(view, algo, k)] = labels
+            records.append(row)
+    if HDBSCAN is not None:
+        labels = HDBSCAN(min_cluster_size=max(3, n_fit // 25)).fit_predict(Z)
+        found = len(set(labels) - {-1})
+        if found >= 2:
+            runs[(view, "hdbscan", found)] = labels
+            records.append({"view": view, "algorithm": "hdbscan", "k": found, "clusters": found,
+                            "noise_share": float((labels == -1).mean()), **internal_scores(Z, labels)})
+
+grid = pd.DataFrame(records)
+tables["cluster_grid"] = grid.round(4)
+
+best_rows = []
+for (view, algo), g in grid[grid["algorithm"] != "hdbscan"].groupby(["view", "algorithm"]):
+    g = g.dropna(subset=["silhouette"])
+    if g.empty:
+        continue
+    rank = (g["silhouette"].rank(ascending=False) + g["calinski_harabasz"].rank(ascending=False)
+            + g["davies_bouldin"].rank(ascending=True))
+    if "stability" in g and g["stability"].notna().any():
+        rank = rank + g["stability"].rank(ascending=False)
+    best_rows.append(g.loc[rank.idxmin()])
+best = pd.DataFrame(best_rows).reset_index(drop=True)
+tables["best_k_per_method"] = best.round(4)
+print("Best k per view x algorithm (rank of silhouette, CH, DB, stability):")
+print(best[["view", "algorithm", "k", "silhouette", "davies_bouldin"] + (["stability"] if "stability" in best else [])].round(3).to_string(index=False))
+
+# %% Consensus clustering (evidence accumulation across all runs)
+
+
+def coassociation(label_sets):
+    C = np.zeros((len(label_sets[0]),) * 2)
+    for labs in label_sets:
+        labs = np.asarray(labs)
+        C += (labs[:, None] == labs[None, :]) & (labs[:, None] >= 0)
+    return C / len(label_sets)
+
+
+good_keys = [key for key, r in zip(runs, records) if r.get("silhouette", 0) > 0]
+if len(good_keys) < 5:
+    good_keys = list(runs)
+C = coassociation([runs[k] for k in good_keys])
+D = 1 - C
+np.fill_diagonal(D, 0)
+tree = linkage(squareform(D, checks=False), method="average")
+
+consensus_scores = []
+for k in k_values:
+    labs = fcluster(tree, k, criterion="maxclust") - 1
+    if len(set(labs)) < 2:
+        continue
+    consensus_scores.append({"k": k, "silhouette": silhouette_score(D, labs, metric="precomputed"),
+                             "smallest_cluster": int(np.bincount(labs).min())})
+consensus_scores = pd.DataFrame(consensus_scores)
+min_size = max(3, int(np.ceil(MIN_CLUSTER_SHARE * n_fit)))
+eligible = consensus_scores[consensus_scores["smallest_cluster"] >= min_size]
+if eligible.empty:
+    eligible = consensus_scores
+k_final = int(eligible.sort_values(["silhouette", "smallest_cluster"], ascending=False).iloc[0]["k"])
+final_fit = fcluster(tree, k_final, criterion="maxclust") - 1
+off_diag = C[~np.eye(len(C), dtype=bool)]
+pac = float(((off_diag > 0.1) & (off_diag < 0.9)).mean())
+
+own = np.array([(C[i, final_fit == final_fit[i]].sum() - 1) / max((final_fit == final_fit[i]).sum() - 1, 1) for i in range(n_fit)])
+other = np.array([max([C[i, final_fit == c].mean() for c in set(final_fit) if c != final_fit[i]] or [0]) for i in range(n_fit)])
+margin = own - other
+
+final = np.full(n, -1)
+final[idx_fit] = final_fit
+membership = pd.DataFrame(index=df.index, data={"cohesion": np.nan, "margin": np.nan})
+membership.loc[idx_fit, "cohesion"] = own
+membership.loc[idx_fit, "margin"] = margin
+if n_fit < n:
+    rest = np.setdiff1d(np.arange(n), idx_fit)
+    knn = KNeighborsClassifier(5, metric="cosine", algorithm="brute").fit(views["combined" if "combined" in views else next(iter(views))][idx_fit], final_fit)
+    final[rest] = knn.predict(views["combined" if "combined" in views else next(iter(views))][rest])
+
+tables["consensus_k_selection"] = consensus_scores.round(4)
+print(f"Runs pooled into consensus : {len(good_keys)} of {len(runs)}")
+print(f"Consensus k                : {k_final}")
+print(f"PAC (lower = crisper)      : {pac:.3f}")
+print(f"Cluster sizes              : {dict(Counter(final))}")
+print(f"Ambiguous rows (margin < {AMBIGUITY_MARGIN}): {(membership['margin'] < AMBIGUITY_MARGIN).sum()}")
+
+method_labels = {f"{r.view}|{r.algorithm}|k{int(r.k)}": runs[(r.view, r.algorithm, int(r.k))] for r in best.itertuples()}
+method_labels["consensus"] = final_fit
+keys = list(method_labels)
+tables["method_agreement_ari"] = pd.DataFrame(
+    [[adjusted_rand_score(method_labels[a], method_labels[b]) for b in keys] for a in keys], index=keys, columns=keys
+).round(3).reset_index()
+
+# %% External validation against existing labels
+
+
+def external(pred, truth):
+    return {"ari": adjusted_rand_score(truth, pred), "nmi": normalized_mutual_info_score(truth, pred),
+            "homogeneity": homogeneity_score(truth, pred), "completeness": completeness_score(truth, pred)}
+
+
+ext_rows = []
+for lab_name, lab in labels_available.items():
+    truth = lab.values[idx_fit]
+    ext_rows.append({"clustering": "consensus", "label": lab_name, **external(final_fit, truth)})
+    for key, labs in method_labels.items():
+        if key != "consensus":
+            ext_rows.append({"clustering": key, "label": lab_name, **external(labs, truth)})
+tables["external_validation"] = pd.DataFrame(ext_rows).round(3)
+print("Consensus clusters vs existing labels:")
+print(tables["external_validation"].query("clustering == 'consensus'").to_string(index=False))
+
+# %% Supervised verification (KNN, logistic regression, baselines)
+
+
+def collapse_rare(y, min_count=2):
+    y = pd.Series(y).astype(str).reset_index(drop=True)
+    counts = y.value_counts()
+    y = y.where(~y.isin(counts[counts < min_count].index), "_rare")
+    return y
+
+
+def cv_predict(model, Z, y, g, method="predict"):
+    y = collapse_rare(y)
+    keep = ~y.isin(y.value_counts()[y.value_counts() < 2].index)
+    y, Zk, gk = y[keep], Z[keep.values], g[keep.values]
+    if y.nunique() < 2:
+        return None
+    splits = int(min(5, y.value_counts().min()))
+    if splits < 2:
+        return None
+    cv = StratifiedGroupKFold(n_splits=splits, shuffle=True, random_state=SEED)
+    return y, keep.values, cross_val_predict(model, Zk, y, groups=gk, cv=cv, method=method)
+
+
+def models(n_train):
+    out = {"dummy_majority": DummyClassifier(strategy="most_frequent"),
+           "logreg": LogisticRegression(max_iter=2000, class_weight="balanced")}
+    for k in (1, 3, 5):
+        if k < n_train:
+            out[f"knn{k}"] = KNeighborsClassifier(k, metric="cosine", algorithm="brute", weights="distance")
+    return out
+
+
+targets = dict(labels_available)
+targets.pop("l1_rule", None)
+targets["consensus"] = pd.Series(final.astype(str))
+sup_rows, consensus_pred = [], None
+for tgt, y in targets.items():
+    y_fit = pd.Series(np.asarray(y)[idx_fit])
+    for view, Zfull in views.items():
+        for mname, model in models(int(0.8 * n_fit)).items():
+            res = cv_predict(model, Zfull[idx_fit], y_fit, groups[idx_fit])
+            if res is None:
+                continue
+            yt, _, yp = res
+            sup_rows.append({"target": tgt, "view": view, "model": mname, "classes": yt.nunique(),
+                             "accuracy": accuracy_score(yt, yp), "macro_f1": f1_score(yt, yp, average="macro")})
+            if tgt == "consensus" and view == ("combined" if "combined" in views else next(iter(views))) and mname == "logreg":
+                consensus_pred = (yt, yp)
+supervised = pd.DataFrame(sup_rows).round(3)
+tables["supervised_verification"] = supervised
+if not supervised.empty:
+    summary = (supervised.sort_values("macro_f1", ascending=False).groupby("target").head(1)
+               .merge(supervised[supervised.model == "dummy_majority"].groupby("target")["macro_f1"].max().rename("baseline_f1"), on="target"))
+    tables["supervised_summary"] = summary
+    print("Best model per target vs majority baseline (macro-F1, grouped CV):")
+    print(summary[["target", "view", "model", "classes", "macro_f1", "baseline_f1"]].to_string(index=False))
+
+audit = pd.DataFrame({"row_id": row_id, "cluster": final})
+if l1 is not None:
+    Zc = views["combined" if "combined" in views else next(iter(views))]
+    res = cv_predict(LogisticRegression(max_iter=2000, class_weight="balanced"), Zc[idx_fit],
+                     pd.Series(l1.values[idx_fit]), groups[idx_fit], method="predict_proba")
+    if res is not None:
+        yt, kept, proba = res
+        classes = np.array(sorted(yt.unique()))
+        rows_idx = idx_fit[kept]
+        audit.loc[rows_idx, "l1_given"] = yt.values
+        audit.loc[rows_idx, "l1_predicted"] = classes[proba.argmax(1)]
+        audit.loc[rows_idx, "l1_pred_prob"] = proba.max(1).round(3)
+    nn = NearestNeighbors(n_neighbors=min(6, n_fit), metric="cosine").fit(Zc[idx_fit])
+    _, nbrs = nn.kneighbors(Zc[idx_fit])
+    lab_fit = l1.values[idx_fit]
+    audit.loc[idx_fit, "neighbour_agreement"] = [np.mean(lab_fit[nb[1:]] == lab_fit[i]) for i, nb in enumerate(nbrs)]
+    if abstain_label is not None:
+        suggestions = []
+        for i, nb in enumerate(nbrs):
+            votes = [lab_fit[j] for j in nb[1:] if lab_fit[j] != abstain_label]
+            suggestions.append(Counter(votes).most_common(1)[0][0] if votes and lab_fit[i] == abstain_label else None)
+        audit.loc[idx_fit, "abstention_neighbour_suggestion"] = suggestions
+audit["cohesion"] = membership["cohesion"].round(3)
+audit["margin"] = membership["margin"].round(3)
+audit["user_text"] = user_masked.str.slice(0, 200)
+tables["row_audit"] = audit
+
+if "l1_predicted" in audit:
+    flagged = audit[(audit["l1_given"].notna()) & (audit["l1_given"] != audit["l1_predicted"]) & (audit["l1_pred_prob"] >= 0.6)]
+    tables["l1_relabel_candidates"] = flagged
+    print(f"\nL1 rows the models confidently disagree with: {len(flagged)}")
+if abstain_label is not None and "abstention_neighbour_suggestion" in audit:
+    recoverable = audit["abstention_neighbour_suggestion"].notna().sum()
+    print(f"Abstentions with a labelled neighbour suggestion: {recoverable} of {(l1 == abstain_label).sum()}")
+
+# %% Cluster profiling
+
+
+def share_dict(series, top=3):
+    vc = series.value_counts(normalize=True).head(top)
+    return {str(k): round(float(v), 3) for k, v in vc.items()}
+
+
+cluster_terms = ctfidf_terms(user_model + " " + context_model, final)
+healthy_status = {}
+for chk in checks:
+    vals = status[chk][severity[chk] == 0]
+    healthy_status[chk] = vals.mode().iloc[0] if not vals.empty else "ok"
+
+per_cluster_recall = {}
+if consensus_pred is not None:
+    yt, yp = consensus_pred
+    for c in yt.unique():
+        per_cluster_recall[c] = float(recall_score(yt, yp, labels=[c], average="macro", zero_division=0))
+
+profiles, check_rows = [], []
+overall_problem = {chk: float((severity[chk] >= PROBLEM_SEVERITY).sum() / max(status[chk].notna().sum(), 1)) for chk in checks}
+for c in sorted(set(final)):
+    m = final == c
+    ids = np.where(m)[0]
+    fit_members = [i for i in ids if i in set(idx_fit)]
+    medoid_order = sorted(fit_members, key=lambda i: -membership.loc[i, "cohesion"])
+    steps, ruled_out, not_run = [], [], []
+    for chk in checks:
+        ran = status[chk][m].notna()
+        if ran.sum() == 0:
+            not_run.append(chk)
+            continue
+        prob_rate = float((severity[chk][m] >= PROBLEM_SEVERITY).sum() / ran.sum())
+        lift = prob_rate / overall_problem[chk] if overall_problem[chk] > 0 else np.nan
+        check_rows.append({"cluster": int(c), "check": chk, "run_rate": round(float(ran.mean()), 3),
+                           "problem_rate": round(prob_rate, 3), "lift": round(lift, 2) if lift == lift else None})
+        if prob_rate > 0:
+            steps.append({"check": chk, "trigger_rate": round(prob_rate, 3),
+                          "lift": round(lift, 2) if lift == lift else None,
+                          "observed_problem_status": status[chk][m & (severity[chk] >= PROBLEM_SEVERITY)].mode().iloc[0],
+                          "target_status": healthy_status[chk]})
+        else:
+            ruled_out.append(chk)
+    steps.sort(key=lambda s: (-s["trigger_rate"], -(s["lift"] or 0)))
+    tools = Counter(t for seq in tool_seq[m] for t in seq)
+    profiles.append({
+        "cluster_id": int(c),
+        "candidate_name": " / ".join(cluster_terms.get(str(c), [])[:3]) or f"cluster_{c}",
+        "size": int(m.sum()), "share": round(float(m.mean()), 3),
+        "keywords": cluster_terms.get(str(c), []),
+        "l1_mix": share_dict(l1[m]) if l1 is not None else {},
+        "category_mix": share_dict(category[m]) if category is not None else {},
+        "subcategory_mix": share_dict(subcategory[m]) if subcategory is not None else {},
+        "task_plan": [{"step": i + 1, **s} for i, s in enumerate(steps)],
+        "ruled_out_checks": ruled_out,
+        "checks_not_run": not_run,
+        "validator_coverage": round(float(status[m].notna().any(axis=1).mean()), 3) if checks else 0.0,
+        "tools_observed": [t for t, _ in tools.most_common(10)],
+        "confidence": {
+            "cohesion": round(float(np.nanmean(membership.loc[m, "cohesion"])), 3),
+            "supervised_recall": round(per_cluster_recall.get(str(c), np.nan), 3),
+        },
+        "evidence": {
+            "exemplar_ids": [row_id.iloc[i] for i in medoid_order[:3]],
+            "exemplar_text": [user_masked.iloc[i][:160] for i in medoid_order[:3]],
+        },
+        "ambiguous_member_ids": [row_id.iloc[i] for i in ids if membership.loc[i, "margin"] < AMBIGUITY_MARGIN],
+        "l4_likelihood_mean": round(float(np.nanmean(membership.loc[m, "cohesion"])), 3),
+    })
+tables["cluster_profiles"] = pd.DataFrame([{k: (json.dumps(v) if isinstance(v, (dict, list)) else v) for k, v in p.items()} for p in profiles])
+tables["cluster_check_profile"] = pd.DataFrame(check_rows)
+
+for p in profiles:
+    print(f"\nCluster {p['cluster_id']} | n={p['size']} | {p['candidate_name']}")
+    print(f"  L1 mix      : {p['l1_mix']}")
+    print(f"  Subcategory : {p['subcategory_mix']}")
+    print(f"  Task plan   : {[s['check'] for s in p['task_plan']] or 'no failing checks observed'}")
+    print(f"  Ruled out   : {p['ruled_out_checks'][:6]}")
+
+# %% Visualisation
+
+
+def save(fig, name):
+    fig.tight_layout()
+    fig.savefig(out_dir / "charts" / f"{name}.png", dpi=150)
+    plt.close(fig)
+
+
+if l1 is not None:
+    fig, ax = plt.subplots(1, 2, figsize=(11, 4))
+    l1.value_counts().plot.barh(ax=ax[0], color="#4C72B0")
+    ax[0].set_title("L1 label distribution")
+    if l1_conf is not None:
+        pd.DataFrame({"l1": l1, "confidence": l1_conf}).boxplot(column="confidence", by="l1", ax=ax[1])
+        ax[1].set_title("Confidence by L1")
+        fig.suptitle("")
+    save(fig, "01_l1_labels")
+
+if checks:
+    heat = pd.DataFrame({chk: status[chk].value_counts() for chk in checks}).T.fillna(0).astype(float)
+    fig, ax = plt.subplots(figsize=(8, max(4, 0.3 * len(heat))))
+    im = ax.imshow(heat.values, aspect="auto", cmap="Blues")
+    ax.set_xticks(range(heat.shape[1]), heat.columns, rotation=45, ha="right")
+    ax.set_yticks(range(heat.shape[0]), heat.index)
+    fig.colorbar(im, ax=ax)
+    ax.set_title("Validator status counts")
+    save(fig, "02_validator_status")
+
+fig, axes = plt.subplots(1, len(views), figsize=(4.5 * len(views), 3.8), squeeze=False)
+for ax, view in zip(axes[0], views):
+    g = grid[(grid.view == view) & (grid.algorithm != "hdbscan")]
+    for algo, ga in g.groupby("algorithm"):
+        ax.plot(ga["k"], ga["silhouette"], marker="o", label=algo)
+    ax.set_title(view)
+    ax.set_xlabel("k")
+axes[0][0].set_ylabel("silhouette (cosine)")
+axes[0][-1].legend(fontsize=7)
+save(fig, "03_model_selection")
+
+order = np.argsort(final_fit, kind="stable")
+fig, ax = plt.subplots(figsize=(6, 5))
+im = ax.imshow(C[np.ix_(order, order)], cmap="viridis", vmin=0, vmax=1)
+fig.colorbar(im, ax=ax)
+ax.set_title(f"Co-association matrix (k={k_final}, PAC={pac:.2f})")
+save(fig, "04_consensus_matrix")
+
+Zp = views["combined" if "combined" in views else next(iter(views))][idx_fit]
+xy = TruncatedSVD(2, random_state=SEED).fit_transform(Zp) if Zp.shape[1] > 2 else Zp[:, :2]
+fig, ax = plt.subplots(1, 2, figsize=(11, 4.5))
+ax[0].scatter(xy[:, 0], xy[:, 1], c=final_fit, cmap="tab10", s=30)
+ax[0].set_title("Consensus clusters")
+if l1 is not None:
+    codes, uniq = pd.factorize(l1.values[idx_fit])
+    sc = ax[1].scatter(xy[:, 0], xy[:, 1], c=codes, cmap="Set1", s=30)
+    ax[1].legend(sc.legend_elements()[0], uniq, fontsize=7)
+    ax[1].set_title("Existing L1 labels")
+save(fig, "05_projection")
+
+if not supervised.empty:
+    s = tables["supervised_summary"]
+    fig, ax = plt.subplots(figsize=(7, 3.5))
+    x = np.arange(len(s))
+    ax.bar(x - 0.2, s["macro_f1"], 0.4, label="best model")
+    ax.bar(x + 0.2, s["baseline_f1"], 0.4, label="majority baseline")
+    ax.set_xticks(x, s["target"])
+    ax.set_ylabel("macro-F1")
+    ax.legend()
+    save(fig, "06_supervised_verification")
+
+# %% Decomposition dictionary
+
+decomposition = {
+    "source": src.name,
+    "rows": int(n),
+    "l1_audit": {
+        "labels": tables["l1_distribution"].set_index("l1")["rows"].to_dict() if l1 is not None else {},
+        "abstention_label": abstain_label,
+        "abstention_share": round(float((l1 == abstain_label).mean()), 3) if abstain_label is not None else None,
+        "abstentions_with_neighbour_suggestion": int(audit.get("abstention_neighbour_suggestion", pd.Series(dtype=object)).notna().sum()),
+        "relabel_candidates": int(len(tables.get("l1_relabel_candidates", []))),
+    },
+    "clustering": {
+        "views": list(views), "algorithms": algorithms + (["hdbscan"] if HDBSCAN else []),
+        "runs_pooled": len(good_keys), "k_final": k_final, "pac": round(pac, 3),
+        "alignment_nmi": {r["label"]: r["nmi"] for r in ext_rows if r["clustering"] == "consensus"},
+    },
+    "clusters": profiles,
+}
+
+# %% Save outputs
+
+for name, table in tables.items():
+    table.to_csv(out_dir / "tables" / f"{name}.csv", index=False)
+with open(out_dir / "decomposition.json", "w", encoding="utf-8") as fh:
+    json.dump(decomposition, fh, indent=2, default=lambda o: o.item() if hasattr(o, "item") else str(o))
+print(f"Saved {len(tables)} tables, charts and decomposition.json to {out_dir}")

@@ -1,0 +1,740 @@
+# %%
+import argparse
+import ast
+import io
+import json
+import logging
+import os
+import re
+import sys
+import warnings
+from collections import Counter, defaultdict
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--file", default=None)
+parser.add_argument("--pattern", default="interactions_*samples*.csv")
+parser.add_argument("--group-col", default=None)
+parser.add_argument("--top-values", type=int, default=15)
+parser.add_argument("--top-paths", type=int, default=80)
+parser.add_argument("--sample-rows", type=int, default=10)
+args, _ = parser.parse_known_args()
+
+PLACEHOLDER = r"\s*(nan|none|null|n/?a|-|\[\]|\{\})?\s*"
+ID_NAME = r"(^|[._])(\w+_)?id$"
+MOJIBAKE = r"â€|Ã[\x80-\xbf]|Â[\x80-\xbf ]"
+INPUT_COL = r"^(input|inputs|args|arguments|parameters|params)$"
+OUTPUT_COL = r"^(output|outputs|result|response|observation)$"
+ERROR_COL = r"^(error|errors|exception)$"
+ROLE_KEYS = ("type", "role")
+FAILED = r"\berror\b|exception|traceback|unknown tool|['\"]status['\"]\s*:\s*[45]\d\d|\b(invalid|forbidden|unauthori[sz]ed|timed? ?out|can only be|must be|not allowed)\b"
+SKIPPED = r"\b(skipped|unavailable|not applicable)\b"
+EMPTY = r"^\W*(none|null|nan)?\W*$|\bno (data|tickets?|records?|results?|rows?|events?|alarms?|outages?)\b|\bnot found\b"
+HTTP_STATUS = r"['\"]status['\"]\s*:\s*(\d{3})"
+GROUP_LEVEL_SHARE = 0.95
+EXCEL_CELL_LIMIT = 32767
+
+
+def search_dirs():
+    roots = [os.environ.get(k) for k in ("OneDriveCommercial", "OneDrive")]
+    here = [Path.cwd()] + ([Path(__file__).resolve().parent] if "__file__" in globals() else [])
+    dirs = here + [Path(r) / "Downloads" for r in roots if r] + [Path.home() / "Downloads"]
+    return [d for d in dict.fromkeys(dirs) if d.is_dir()]
+
+
+def locate():
+    if args.file:
+        return Path(args.file)
+    matches = [p for d in search_dirs() for p in d.glob(args.pattern)]
+    if not matches:
+        raise FileNotFoundError(f"No file matching {args.pattern} in {search_dirs()}")
+    return max(matches, key=lambda p: p.stat().st_mtime)
+
+
+SRC = locate()
+OUT = SRC.parent / f"{SRC.stem}_eda"
+for sub in ("tables", "charts"):
+    (OUT / sub).mkdir(parents=True, exist_ok=True)
+for old in (OUT / "charts").glob("*.png"):
+    old.unlink()
+
+log = logging.getLogger("nora_eda")
+log.setLevel(logging.INFO)
+log.handlers.clear()
+log.propagate = False
+_fmt = logging.Formatter("%(asctime)s | %(message)s", "%H:%M:%S")
+for _h in (logging.StreamHandler(sys.stdout), logging.FileHandler(OUT / "run.log", mode="w", encoding="utf-8")):
+    _h.setFormatter(_fmt)
+    log.addHandler(_h)
+
+SHEETS, SUMMARY, FINDINGS = {}, [], []
+
+
+def metric(name, value):
+    SUMMARY.append((name, value))
+    log.info(f"   {name}: {value}")
+
+
+def finding(text):
+    FINDINGS.append(text)
+    log.info(f"   FINDING: {text}")
+
+
+def add_sheet(name, frame):
+    SHEETS[name[:31]] = frame
+    frame.to_csv(OUT / "tables" / f"{name}.csv", index=False)
+
+
+def show(frame, title, rows=25):
+    log.info(f"{title}: (empty)" if frame is None or not len(frame) else f"{title}\n{frame.head(rows).to_string(index=False)}")
+
+
+def parse_json(value, depth=0):
+    if depth > 6:
+        return value
+    if isinstance(value, str):
+        s = value.strip()
+        if s[:1] in ("[", "{"):
+            for loader in (json.loads, ast.literal_eval):
+                try:
+                    return parse_json(loader(s), depth + 1)
+                except (ValueError, SyntaxError, TypeError, MemoryError, RecursionError):
+                    continue
+        return value
+    if isinstance(value, list):
+        return [parse_json(v, depth + 1) for v in value]
+    if isinstance(value, dict):
+        return {k: parse_json(v, depth + 1) for k, v in value.items()}
+    return value
+
+
+PARSED = {}
+
+
+def parsed(col):
+    if col not in PARSED:
+        PARSED[col] = df[col].map(parse_json)
+    return PARSED[col]
+
+
+def walk(obj, path=""):
+    if isinstance(obj, dict):
+        if not obj:
+            yield path, obj
+        for k, v in obj.items():
+            yield from walk(v, f"{path}.{k}" if path else str(k))
+    elif isinstance(obj, list):
+        if not obj:
+            yield path, obj
+        for v in obj:
+            yield from walk(v, f"{path}[]")
+    else:
+        yield path, obj
+
+
+def is_empty(v):
+    return v is None or (isinstance(v, (list, dict, str)) and len(v) == 0) or (isinstance(v, float) and np.isnan(v))
+
+
+def to_datetime(s):
+    try:
+        return pd.to_datetime(s, errors="coerce", utc=True, format="mixed")
+    except (TypeError, ValueError):
+        return pd.to_datetime(s, errors="coerce", utc=True)
+
+
+def fix_mojibake(v):
+    if not isinstance(v, str) or not re.search(MOJIBAKE, v):
+        return v
+    try:
+        return v.encode("cp1252").decode("utf-8")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return v
+
+
+def infer_kind(s):
+    s = s.dropna()
+    if s.empty:
+        return "empty"
+    if pd.api.types.is_bool_dtype(s):
+        return "boolean"
+    if pd.api.types.is_numeric_dtype(s):
+        return "boolean" if set(pd.unique(s)) <= {0, 1} else "numeric"
+    txt = s.astype(str).str.strip()
+    if txt.str[:1].isin(["[", "{"]).mean() >= 0.9:
+        p = txt.head(200).map(parse_json)
+        if p.map(lambda x: isinstance(x, (list, dict))).mean() >= 0.9:
+            return "json_list" if p.map(lambda x: isinstance(x, list)).mean() >= 0.5 else "json_dict"
+    if txt.str.lower().isin(["true", "false", "yes", "no"]).mean() >= 0.95:
+        return "boolean"
+    if pd.to_numeric(txt, errors="coerce").notna().mean() >= 0.95:
+        return "numeric_text"
+    if txt.str.contains(r"\d{4}-\d{2}-\d{2}|\d{1,2}/\d{1,2}/\d{2,4}").mean() >= 0.9 and to_datetime(txt).notna().mean() >= 0.9:
+        return "datetime"
+    nun, avg = txt.nunique(), txt.str.len().mean()
+    if nun == 1:
+        return "constant"
+    if nun >= 0.95 * len(txt):
+        return "free_text" if avg > 80 else "identifier"
+    if nun <= max(20, 0.2 * len(txt)) and avg <= 80:
+        return "categorical"
+    return "free_text" if avg > 80 else "text"
+
+
+def signature(text):
+    t = str(text).lower()
+    t = re.sub(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", "<uuid>", t)
+    t = re.sub(r"\b[0-9a-f]{12,}\b", "<hex>", t)
+    t = re.sub(r"\d+", "#", t)
+    return re.sub(r"\s+", " ", re.sub(r"[\"'{}\[\]]", "", t)).strip()[:110]
+
+
+def outcome(err, out):
+    e = "" if is_empty(err) else str(err)
+    o = "" if is_empty(out) else str(out)
+    text = f"{e} {o}"
+    if re.search(FAILED, text, re.I):
+        return "failed"
+    if re.search(SKIPPED, text, re.I):
+        return "skipped"
+    if not e and re.search(EMPTY, o, re.I):
+        return "empty"
+    return "returned"
+
+
+# %% Data collection
+
+log.info("=" * 80)
+log.info("1. DATA COLLECTION")
+for enc in ("utf-8", "utf-8-sig", "cp1252", "latin-1"):
+    try:
+        raw = pd.read_csv(SRC, encoding=enc, low_memory=False)
+        break
+    except UnicodeDecodeError:
+        continue
+raw.columns = [str(c).strip() for c in raw.columns]
+metric("file", SRC.name)
+metric("file size (MB)", round(SRC.stat().st_size / 1e6, 1))
+metric("encoding", enc)
+metric("rows", len(raw))
+metric("columns", raw.shape[1])
+metric("memory in pandas (MB)", round(raw.memory_usage(deep=True).sum() / 1e6, 1))
+buf = io.StringIO()
+raw.info(buf=buf, verbose=True, show_counts=True)
+log.info(buf.getvalue())
+info = pd.DataFrame({"position": range(raw.shape[1]), "column": raw.columns,
+                     "non_null": raw.notna().sum().values, "dtype": raw.dtypes.astype(str).values})
+
+# %% Data cleaning
+
+log.info("=" * 80)
+log.info("2. CLEANING - encoding, placeholders, duplicates, empty and constant columns")
+df = raw.copy()
+obj_cols = df.select_dtypes(include="object").columns
+moji = {c: int(df[c].astype(str).str.contains(MOJIBAKE, regex=True).sum()) for c in obj_cols}
+moji_total = sum(moji.values())
+metric("cells with broken characters (e.g. 'â€”' instead of '—')", moji_total)
+if moji_total:
+    for c in obj_cols:
+        if moji[c]:
+            df[c] = df[c].map(fix_mojibake)
+    still = sum(int(df[c].astype(str).str.contains(MOJIBAKE, regex=True).sum()) for c in obj_cols)
+    finding(f"{moji_total} cells carry double-encoded characters inside the file itself ('â€”' for '—'); {moji_total - still} repaired in memory.")
+else:
+    log.info("   no broken characters in the file; if Excel shows 'â€”', that is Excel opening a UTF-8 CSV as ANSI, not a data problem")
+
+placeholder = pd.Series(0, index=df.columns)
+for c in obj_cols:
+    mask = df[c].notna() & df[c].astype(str).str.fullmatch(PLACEHOLDER, case=False)
+    placeholder[c] = int(mask.sum())
+    df.loc[mask, c] = np.nan
+metric("placeholder values turned into missing ('None', 'null', 'n/a', '[]', '{}' ...)", int(placeholder.sum()))
+
+dup_rows = int(raw.astype(str).duplicated().sum())
+metric("fully duplicated rows", dup_rows)
+if dup_rows:
+    finding(f"{dup_rows} rows are exact copies of another row.")
+empty_cols = [c for c in df.columns if df[c].isna().all()]
+constant_cols = [c for c in df.columns if df[c].dropna().astype(str).nunique() == 1]
+metric("columns with no usable value", len(empty_cols))
+metric("columns with a single value everywhere", f"{len(constant_cols)} {constant_cols[:10]}")
+
+# %% Preparation - embedded record copies, keys, row grain
+
+log.info("=" * 80)
+log.info("3. PREPARATION - embedded documents, keys and what one row is")
+envelope_rows, redundancy = [], []
+for c in [c for c in df.columns if infer_kind(df[c]) == "json_dict"]:
+    p = parsed(c)
+    top = Counter(k for d in p if isinstance(d, dict) for k in d)
+    overlap = [k for k in top if k in df.columns and k != c]
+    if len(overlap) < 3:
+        continue
+    for k in overlap:
+        a = p.map(lambda d: d.get(k) if isinstance(d, dict) else None).map(lambda v: None if is_empty(v) else str(v))
+        b = df[k].map(lambda v: None if is_empty(v) else str(v))
+        both = a.notna() & b.notna()
+        redundancy.append({"json_column": c, "key": k, "rows_with_both": int(both.sum()),
+                           "equal_share": round(float((a[both] == b[both]).mean()), 3) if both.any() else np.nan})
+    new_keys = [k for k, n in top.items() if k not in df.columns and n >= 0.05 * len(df)]
+    lifted = []
+    for k in new_keys:
+        vals = p.map(lambda d: d.get(k) if isinstance(d, dict) else None)
+        vs = vals.map(lambda v: None if is_empty(v) else str(v))
+        copies = [o for o in df.columns if (vs.notna() & (vs == df[o].astype(str))).sum() >= 0.99 * vs.notna().sum()]
+        if copies:
+            redundancy.append({"json_column": c, "key": k, "rows_with_both": int(vs.notna().sum()), "equal_share": 1.0, "copy_of": copies[0]})
+            continue
+        if vals.map(lambda v: isinstance(v, (str, int, float, bool)) or v is None).all():
+            df[f"{c}.{k}"] = vals.map(lambda v: np.nan if is_empty(v) else v)
+            envelope_rows.append({"json_column": c, "new_column": f"{c}.{k}", "rows": int(df[f'{c}.{k}'].notna().sum())})
+            lifted.append(k)
+    finding(f"'{c}' is a copy of the whole record: {len(overlap)} of its keys repeat existing columns; {len(lifted)} keys found only here, lifted out as columns ({', '.join(lifted[:8])}).")
+redundancy = pd.DataFrame(redundancy, columns=["json_column", "key", "rows_with_both", "equal_share", "copy_of"])
+envelope = pd.DataFrame(envelope_rows, columns=["json_column", "new_column", "rows"])
+
+kinds = {c: infer_kind(df[c]) for c in df.columns}
+id_like = [c for c in df.columns if re.search(ID_NAME, c, re.I)]
+unique_cols = [c for c in df.columns if df[c].notna().all() and df[c].astype(str).nunique() == len(df)]
+repeating = [c for c in id_like if c not in unique_cols and df[c].nunique() > 1]
+key_rows = []
+for c in dict.fromkeys(id_like + unique_cols):
+    same = [o for o in repeating if o != c and c in repeating
+            and df.groupby(c)[o].nunique().max() <= 1 and df.groupby(o)[c].nunique().max() <= 1]
+    key_rows.append({"column": c, "non_null": int(df[c].notna().sum()), "unique": int(df[c].nunique()),
+                     "unique_per_row": c in unique_cols, "same_grouping_as": ", ".join(same)})
+keys = pd.DataFrame(key_rows, columns=["column", "non_null", "unique", "unique_per_row", "same_grouping_as"])
+show(keys, "   id columns")
+ROW_KEY = next((c for c in unique_cols if c in id_like), unique_cols[0] if unique_cols else None)
+GROUP = args.group_col or (repeating[0] if repeating else None)
+metric("row key (unique per row)", ROW_KEY or "(none)")
+metric("interaction key (rows grouped by)", GROUP or "(none - one row per record)")
+
+EVENT = None
+if GROUP:
+    best = 0
+    others = [c for c in df.columns if c != GROUP]
+    for c in [c for c in df.columns if kinds[c] in ("categorical", "boolean") and 2 <= df[c].nunique() <= 12]:
+        rates = df[others].notna().groupby(df[c]).mean()
+        score = float((rates.max() - rates.min()).mean())
+        if score > best:
+            best, EVENT = score, c
+    EVENT = EVENT if best >= 0.2 else None
+metric("event-type column (decides which columns a row fills)", EVENT or "(none)")
+
+TOOL = None
+cands = [c for c in df.columns if c not in (GROUP, EVENT, ROW_KEY) and c not in id_like and c not in unique_cols
+         and kinds[c] in ("categorical", "text", "identifier") and df[c].nunique() >= 3]
+cands = [c for c in cands if (~df[c].dropna().astype(str).str.contains(r"\s")).mean() >= 0.95]
+if EVENT:
+    cands = [c for c in cands if df.loc[df[c].notna(), EVENT].value_counts(normalize=True).max() >= 0.95]
+if cands:
+    TOOL = max(cands, key=lambda c: df[c].nunique())
+metric("tool-name column", TOOL or "(none)")
+IN_COL = next((c for c in df.columns if re.search(INPUT_COL, c, re.I)), None)
+OUT_COL = next((c for c in df.columns if re.search(OUTPUT_COL, c, re.I)), None)
+ERR_COL = next((c for c in df.columns if re.search(ERROR_COL, c, re.I)), None)
+metric("tool input / output / error columns", f"{IN_COL} / {OUT_COL} / {ERR_COL}")
+
+grp = df[GROUP].astype(str) if GROUP else pd.Series(df.index.astype(str), index=df.index)
+n_groups = grp.nunique()
+metric("interactions", n_groups)
+per_group = grp.value_counts()
+metric("rows per interaction (min / median / max)", f"{per_group.min()} / {int(per_group.median())} / {per_group.max()}")
+
+# %% EDA - column profile
+
+log.info("=" * 80)
+log.info("4. EDA - column profile")
+grain = {}
+if GROUP:
+    nun = df.drop(columns=[GROUP]).astype(object).where(df.drop(columns=[GROUP]).notna()).astype(str).replace("nan", np.nan).groupby(grp).nunique()
+    fill_rate = df.drop(columns=[GROUP]).notna().mean()
+    grain = ((nun <= 1).mean() * (fill_rate >= 0.9)).to_dict()
+rows = []
+for c in df.columns:
+    nn = df[c].dropna()
+    txt = nn.astype(str)
+    rows.append({"column": c, "group": c.split(".")[0], "pandas_dtype": str(df[c].dtype), "kind": kinds[c],
+                 "level": "interaction" if c == GROUP or grain.get(c, 0) >= GROUP_LEVEL_SHARE else "event",
+                 "non_null": int(df[c].notna().sum() + placeholder.get(c, 0)), "placeholders": int(placeholder.get(c, 0)), "usable": len(nn),
+                 "missing_pct": round(1 - len(nn) / len(df), 3), "unique": int(txt.nunique()),
+                 "unique_pct": round(txt.nunique() / len(nn), 3) if len(nn) else np.nan,
+                 "avg_chars": round(txt.str.len().mean(), 1) if len(nn) else np.nan,
+                 "max_chars": int(txt.str.len().max()) if len(nn) else 0, "example": txt.iloc[0][:150] if len(nn) else ""})
+profile = pd.DataFrame(rows)
+kind_counts = profile["kind"].value_counts().rename_axis("kind").reset_index(name="n_columns")
+metric("columns by kind", ", ".join(f"{r.kind} {r.n_columns}" for r in kind_counts.itertuples()))
+if GROUP:
+    lvl = profile[profile.level == "interaction"].column.tolist()
+    metric("columns fixed per interaction", f"{len(lvl)}: {', '.join(lvl[:12])}")
+
+missing = profile[["column", "kind", "level", "non_null", "placeholders", "usable", "missing_pct"]].sort_values("missing_pct", ascending=False)
+if EVENT:
+    by_event = df.notna().groupby(df[EVENT]).mean().T.round(3)
+    by_event.columns = [f"filled_in_{v}" for v in by_event.columns]
+    missing = missing.merge(by_event.rename_axis("column").reset_index(), on="column", how="left")
+heavy_ph = profile[profile.placeholders > 0.2 * len(df)]
+if len(heavy_ph):
+    finding(f"{len(heavy_ph)} columns hold placeholders like 'None' or '{{}}' in over 20% of rows: {', '.join(heavy_ph.column[:8])}")
+
+# %% EDA - numbers, categories, dates
+
+log.info("=" * 80)
+log.info("5. EDA - numeric, categorical, datetime")
+num_cols = [c for c in df.columns if kinds[c] in ("numeric", "numeric_text")]
+num = df[num_cols].apply(pd.to_numeric, errors="coerce")
+if num_cols:
+    numeric = num.describe(percentiles=[0.05, 0.25, 0.5, 0.75, 0.95]).T
+    numeric["skew"] = num.skew()
+    numeric = numeric.round(3).rename_axis("column").reset_index()
+else:
+    numeric = pd.DataFrame(columns=["column"])
+show(numeric, "   numeric summary")
+
+cat_rows = []
+for c in [c for c in df.columns if kinds[c] in ("categorical", "boolean", "constant")]:
+    level = profile.set_index("column").at[c, "level"]
+    s = df.groupby(grp)[c].first() if level == "interaction" else df[c]
+    vc = s.astype(object).where(s.notna(), "(missing)").astype(str).value_counts()
+    for v, n in vc.head(args.top_values).items():
+        cat_rows.append({"column": c, "counted_per": level, "distinct_values": int(s.dropna().nunique()), "value": v,
+                         "count": int(n), "pct": round(n / len(s), 3)})
+categorical = pd.DataFrame(cat_rows, columns=["column", "counted_per", "distinct_values", "value", "count", "pct"])
+show(categorical, "   top values (interaction-level columns counted once per interaction)", 40)
+
+dt_cols = [c for c in df.columns if kinds[c] == "datetime"]
+dt_rows, per_day = [], []
+for c in dt_cols:
+    t = to_datetime(df[c].astype(str))
+    dt_rows.append({"column": c, "parsed": int(t.notna().sum()), "min": str(t.min()), "max": str(t.max()),
+                    "span_days": round((t.max() - t.min()).total_seconds() / 86400, 2) if t.notna().any() else np.nan})
+    per_day += [{"column": c, "day": d, "rows": int(n)} for d, n in t.dt.date.value_counts().sort_index().items()]
+datetimes = pd.DataFrame(dt_rows, columns=["column", "parsed", "min", "max", "span_days"])
+per_day = pd.DataFrame(per_day, columns=["column", "day", "rows"])
+for r in datetimes.itertuples():
+    metric(f"date range of {r.column}", f"{r.min} -> {r.max} ({r.span_days} days)")
+TIME = max(dt_cols, key=lambda c: df[c].notna().sum()) if dt_cols else None
+
+# %% EDA - nested JSON columns
+
+log.info("=" * 80)
+log.info("6. EDA - nested JSON columns")
+json_cols = [c for c in df.columns if kinds[c].startswith("json")]
+js_rows, path_rows = [], []
+for c in json_cols:
+    p = parsed(c)
+    ok = p.map(lambda x: isinstance(x, (list, dict)))
+    lens = p.map(lambda x: len(x) if isinstance(x, (list, dict)) else np.nan).astype(float)
+    hits, leaf_types, examples, depth = Counter(), defaultdict(Counter), {}, 0
+    for obj in p[ok]:
+        seen = set()
+        for path, leaf in walk(obj):
+            seen.add(path)
+            leaf_types[path][type(leaf).__name__] += 1
+            depth = max(depth, path.count(".") + path.count("[]"))
+            if path not in examples and not is_empty(leaf):
+                examples[path] = str(leaf)[:120]
+        hits.update(seen)
+    n_ok = int(ok.sum())
+    js_rows.append({"column": c, "kind": kinds[c], "rows_with_value": int(df[c].notna().sum()), "parsed": n_ok,
+                    "parse_failed": int(df[c].notna().sum()) - n_ok, "items_median": lens.median(), "items_max": lens.max(),
+                    "distinct_key_paths": len(hits), "max_depth": depth, "paths_in_every_row": sum(1 for v in hits.values() if v == n_ok)})
+    for path, h in hits.most_common(args.top_paths):
+        path_rows.append({"column": c, "path": path or "(root)", "rows_with_path": h, "share_of_rows": round(h / n_ok, 3) if n_ok else np.nan,
+                          "leaf_types": ", ".join(f"{k} {v}" for k, v in leaf_types[path].most_common()), "example": examples.get(path, "")})
+json_struct = pd.DataFrame(js_rows)
+json_paths = pd.DataFrame(path_rows, columns=["column", "path", "rows_with_path", "share_of_rows", "leaf_types", "example"])
+show(json_struct, "   JSON columns")
+for r in json_struct.itertuples() if len(json_struct) else []:
+    if r.parse_failed:
+        finding(f"'{r.column}' is JSON in most rows but {r.parse_failed} rows could not be parsed.")
+
+# %% EDA - interactions
+
+log.info("=" * 80)
+log.info("7. EDA - one row per interaction")
+gp = pd.DataFrame({"rows": per_group})
+if EVENT:
+    gp = gp.join(pd.crosstab(grp, df[EVENT]).add_prefix("rows_"))
+msg_cols = [c for c in json_cols if kinds[c] == "json_list"]
+for c in msg_cols:
+    roles = parsed(c).map(lambda L: [str(next((m[k] for k in ROLE_KEYS if isinstance(m, dict) and k in m), "?")).lower() for m in L] if isinstance(L, list) else [])
+    if roles.map(len).sum() == 0 or (roles.explode() == "?").mean() > 0.5:
+        continue
+    turns = roles.explode().dropna()
+    gp = gp.join(pd.crosstab(grp.loc[turns.index].values, turns.values).add_prefix(f"{c}_"), how="left")
+    metric(f"turns in '{c}' by role", {k: int(v) for k, v in Counter(turns).items()})
+if TIME:
+    t = to_datetime(df[TIME].astype(str))
+    dur = (t.groupby(grp).max() - t.groupby(grp).min()).dt.total_seconds()
+    gp["duration_s"] = dur.round(1)
+    metric(f"interaction duration from {TIME} (median / p90 / max s)", f"{dur.median():.0f} / {dur.quantile(0.9):.0f} / {dur.max():.0f}")
+level_cols = [c for c in profile[(profile.level == "interaction") & profile.kind.isin(["categorical", "boolean"])].column if c != GROUP]
+gp = gp.join(df.groupby(grp)[level_cols].first()) if level_cols else gp
+
+# %% EDA - tool calls
+
+log.info("=" * 80)
+log.info("8. EDA - tool calls")
+tool_summary = errors = input_keys = pd.DataFrame()
+if TOOL:
+    tr = df[df[TOOL].notna()].copy()
+    tr["_group"] = grp.loc[tr.index]
+    tr["outcome"] = [outcome(e, o) for e, o in zip(raw.loc[tr.index, ERR_COL] if ERR_COL else [None] * len(tr),
+                                                  raw.loc[tr.index, OUT_COL] if OUT_COL else [None] * len(tr))]
+    txt = (raw.loc[tr.index, ERR_COL].fillna("").astype(str) if ERR_COL else "") + " " + (raw.loc[tr.index, OUT_COL].fillna("").astype(str) if OUT_COL else "")
+    tr["http_status"] = txt.str.extract(HTTP_STATUS, flags=re.I)[0]
+    tr["signature"] = [signature(e if not is_empty(e) and str(e).strip() not in ("None", "") else o)
+                       for e, o in zip(raw.loc[tr.index, ERR_COL] if ERR_COL else [None] * len(tr), raw.loc[tr.index, OUT_COL] if OUT_COL else [None] * len(tr))]
+    metric("tool calls", len(tr))
+    metric("distinct tools", tr[TOOL].nunique())
+    oc = tr["outcome"].value_counts(normalize=True)
+    metric("tool call outcomes", ", ".join(f"{k} {v:.0%}" for k, v in oc.items()))
+    metric("HTTP status codes seen", {k: int(v) for k, v in tr["http_status"].value_counts().items()})
+    if oc.get("failed", 0) >= 0.3:
+        finding(f"{oc['failed']:.0%} of tool calls failed outright (API errors, unknown tools, invalid parameters).")
+
+    g = tr.groupby(TOOL)
+    tool_summary = pd.DataFrame({"calls": g.size(), "interactions": g["_group"].nunique()})
+    tool_summary["share_of_interactions"] = (tool_summary.interactions / n_groups).round(3)
+    tool_summary = tool_summary.join(pd.crosstab(tr[TOOL], tr["outcome"], normalize="index").round(3).add_suffix("_pct"))
+    tool_summary["http_statuses"] = g["http_status"].agg(lambda s: ", ".join(f"{k} x{v}" for k, v in s.value_counts().items()))
+    tool_summary["top_message"] = g["signature"].agg(lambda s: s.value_counts().index[0] if len(s) else "")
+    tool_summary = tool_summary.sort_values("calls", ascending=False).rename_axis("tool").reset_index()
+    show(tool_summary[["tool", "calls", "share_of_interactions"] + [c for c in tool_summary if c.endswith("_pct")]], "   tools", 40)
+    always = tool_summary[tool_summary.share_of_interactions >= 0.8]
+    if len(always):
+        finding(f"{len(always)} tools run in 80%+ of interactions regardless of the case: {', '.join(always.tool[:10])}")
+    never_ok = tool_summary[tool_summary.get("returned_pct", pd.Series(0, index=tool_summary.index)).fillna(0) == 0]
+    if len(never_ok):
+        finding(f"{len(never_ok)} tools never returned usable data in this sample: {', '.join(never_ok.tool[:10])}")
+
+    bad = tr[tr.outcome.isin(["failed", "skipped", "empty"])]
+    errors = bad.groupby(["outcome", "signature"]).agg(calls=(TOOL, "size"), interactions=("_group", "nunique"),
+                                                      tools=(TOOL, lambda s: ", ".join(s.value_counts().index[:6])),
+                                                      http_status=("http_status", lambda s: ", ".join(s.dropna().unique()[:4]))).reset_index()
+    errors = errors.sort_values("calls", ascending=False)
+    show(errors.head(15), "   most common failure / empty messages")
+
+    rep = tr.assign(_in=raw.loc[tr.index, IN_COL].astype(str) if IN_COL else "").duplicated(["_group", TOOL, "_in"])
+    gp = gp.join(tr.groupby("_group").agg(tool_calls=(TOOL, "size"), distinct_tools=(TOOL, "nunique"),
+                                          tool_sequence=(TOOL, lambda s: " -> ".join(s.astype(str)))), how="left")
+    gp = gp.join(pd.crosstab(tr["_group"], tr["outcome"]).add_prefix("tools_"), how="left")
+    gp["repeated_calls"] = tr[rep].groupby("_group").size().reindex(gp.index).fillna(0).astype(int)
+    if rep.sum():
+        finding(f"{int(rep.sum())} tool calls repeat the same tool with the same input inside one interaction.")
+
+    if IN_COL:
+        ik = []
+        for tool, s in parsed(IN_COL).loc[tr.index].groupby(tr[TOOL]):
+            cnt, empt = Counter(), Counter()
+            for d in s:
+                for k, v in (d.items() if isinstance(d, dict) else []):
+                    cnt[k] += 1
+                    empt[k] += is_empty(v) or str(v).strip().lower() in ("none", "null", "nan")
+            ik += [{"tool": tool, "input_key": k, "calls_with_key": n, "calls": len(s), "empty_value_pct": round(empt[k] / n, 3),
+                    "example": next((str(d[k])[:80] for d in s if isinstance(d, dict) and not is_empty(d.get(k))), "")} for k, n in cnt.items()]
+        input_keys = pd.DataFrame(ik)
+        if len(input_keys):
+            ek = input_keys[input_keys.empty_value_pct > 0]
+            if len(ek):
+                finding(f"{len(ek)} tool parameters are sometimes sent empty, e.g. {', '.join((ek.tool + '.' + ek.input_key).head(6))}")
+gp = gp.rename_axis(GROUP or "row").reset_index()
+show(gp.describe().T.round(1).reset_index(), "   interaction summary stats")
+
+# %% EDA - text lengths and correlations
+
+log.info("=" * 80)
+log.info("9. EDA - text lengths")
+txt_rows = []
+for c in [c for c in df.columns if kinds[c] in ("free_text", "text", "json_list", "json_dict")]:
+    s = df[c].dropna().astype(str)
+    ch = s.str.len()
+    txt_rows.append({"column": c, "kind": kinds[c], "rows": len(s), "chars_p50": ch.median(), "chars_p90": ch.quantile(0.9),
+                     "chars_max": ch.max(), "share_of_file_chars": 0.0, "cells_over_excel_limit": int((ch > EXCEL_CELL_LIMIT).sum())})
+text_len = pd.DataFrame(txt_rows)
+if len(text_len):
+    total = df.astype(str).apply(lambda col: col.str.len().sum()).sum()
+    text_len["share_of_file_chars"] = [round(df[c].dropna().astype(str).str.len().sum() / total, 3) for c in text_len.column]
+    text_len = text_len.sort_values("share_of_file_chars", ascending=False)
+    top = text_len.iloc[0]
+    metric("largest column", f"{top.column} ({top.share_of_file_chars:.0%} of all characters)")
+    big = text_len[text_len.cells_over_excel_limit > 0]
+    if len(big):
+        finding(f"{int(big.cells_over_excel_limit.sum())} cells exceed Excel's cell limit; cut in the workbook, complete in tables/*.csv: {', '.join(big.column[:6])}")
+show(text_len, "   text lengths")
+
+num_gp = gp.select_dtypes("number")
+num_gp = num_gp.loc[:, num_gp.nunique() > 1]
+corr = num_gp.corr(method="spearman").round(2) if num_gp.shape[1] >= 2 else pd.DataFrame()
+sample = raw.head(args.sample_rows).astype(str).apply(lambda col: col.str[:300])
+
+# %% Visualise
+
+log.info("=" * 80)
+log.info("10. CHARTS")
+BLUE, LIGHT, INK, GRID = "#2a78d6", "#9ec5f4", "#1f1f1e", "#e8e7e2"
+OUTCOME_COLOUR = {"returned": "#1baf7a", "empty": "#eda100", "skipped": "#9a9990", "failed": "#e34948"}
+plt.rcParams.update({"font.size": 9, "axes.titlesize": 11, "axes.titlelocation": "left", "axes.titlecolor": INK})
+
+
+def save(fig, name):
+    fig.savefig(OUT / "charts" / f"{name}.png", dpi=170, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    log.info(f"   chart -> {name}.png")
+
+
+def tidy(ax, axis="x"):
+    ax.spines[["top", "right"]].set_visible(False)
+    ax.grid(axis=axis, color=GRID)
+    ax.set_axisbelow(True)
+
+
+m = profile.sort_values("missing_pct", ascending=False).head(40).iloc[::-1]
+if m.missing_pct.max() > 0:
+    fig, ax = plt.subplots(figsize=(9, max(3, 0.25 * len(m) + 1)))
+    ph = m.placeholders / len(df)
+    ax.barh(m.column.str[-60:], m.missing_pct - ph, color=BLUE, label="truly missing")
+    ax.barh(m.column.str[-60:], ph, left=m.missing_pct - ph, color=LIGHT, label="placeholder ('None', '{}' ...)")
+    ax.set_xlim(0, 1)
+    ax.set_title("Most incomplete columns (share of rows)")
+    ax.legend(frameon=False, fontsize=8)
+    ax.tick_params(axis="y", labelsize=7)
+    tidy(ax)
+    save(fig, "01_missing_by_column")
+
+if EVENT:
+    fill = df.notna().groupby(df[EVENT]).mean().T
+    fig, ax = plt.subplots(figsize=(0.9 * fill.shape[1] + 4, 0.28 * len(fill) + 1.5))
+    im = ax.imshow(fill.values, cmap="Blues", vmin=0, vmax=1, aspect="auto")
+    ax.set_xticks(range(fill.shape[1]), fill.columns, rotation=30, ha="right")
+    ax.set_yticks(range(len(fill)), [c[-45:] for c in fill.index], fontsize=7)
+    ax.set_title(f"Which columns each row type fills ({EVENT})")
+    fig.colorbar(im, ax=ax, fraction=0.04)
+    save(fig, "02_fill_by_row_type")
+
+fig, ax = plt.subplots(figsize=(7, 3))
+ax.hist(gp["rows"], bins=25, color=BLUE, edgecolor="white")
+ax.set_title("Rows per interaction")
+tidy(ax, "y")
+save(fig, "03_rows_per_interaction")
+
+if len(tool_summary):
+    ts = tool_summary.head(30).iloc[::-1]
+    fig, ax = plt.subplots(figsize=(9, 0.28 * len(ts) + 1.5))
+    left = np.zeros(len(ts))
+    for o, col in OUTCOME_COLOUR.items():
+        if f"{o}_pct" in ts:
+            v = (ts[f"{o}_pct"].fillna(0) * ts["calls"]).values
+            ax.barh(ts.tool.str[-45:], v, left=left, color=col, label=o)
+            left += v
+    ax.set_title("Tool calls by outcome (top 30 tools)")
+    ax.legend(frameon=False, fontsize=8, loc="lower right")
+    ax.tick_params(axis="y", labelsize=7)
+    tidy(ax)
+    save(fig, "04_tool_outcomes")
+
+if len(errors):
+    e = errors.head(15).iloc[::-1]
+    fig, ax = plt.subplots(figsize=(10, 0.35 * len(e) + 1.5))
+    ax.barh([s[:80] for s in e.signature], e.calls, color=[OUTCOME_COLOUR[o] for o in e.outcome])
+    ax.set_title("Most common failure / empty messages (red failed, amber empty, grey skipped)")
+    ax.tick_params(axis="y", labelsize=7)
+    tidy(ax)
+    save(fig, "05_top_error_messages")
+
+if "tool_calls" in gp:
+    fig, ax = plt.subplots(figsize=(7, 3))
+    ax.hist(gp["tool_calls"].dropna(), bins=25, color=BLUE, edgecolor="white")
+    ax.set_title("Tool calls per interaction")
+    tidy(ax, "y")
+    save(fig, "06_tool_calls_per_interaction")
+
+if len(per_day):
+    for c, g in per_day.groupby("column"):
+        fig, ax = plt.subplots(figsize=(8, 3))
+        ax.bar(g.day.astype(str), g.rows, color=BLUE)
+        ax.set_title(f"Rows per day ({c})")
+        ax.tick_params(axis="x", rotation=45, labelsize=7)
+        tidy(ax, "y")
+        save(fig, f"07_rows_per_day_{re.sub(r'[^A-Za-z0-9]+', '_', c)[:40]}")
+
+if corr.shape[1] >= 3:
+    fig, ax = plt.subplots(figsize=(0.45 * corr.shape[1] + 3, 0.4 * corr.shape[0] + 2))
+    im = ax.imshow(corr.values, cmap="RdBu_r", vmin=-1, vmax=1)
+    ax.set_xticks(range(corr.shape[1]), [c[-35:] for c in corr.columns], rotation=45, ha="right", fontsize=7)
+    ax.set_yticks(range(corr.shape[0]), [c[-35:] for c in corr.index], fontsize=7)
+    ax.set_title("Spearman correlation of per-interaction counts")
+    fig.colorbar(im, ax=ax, fraction=0.03)
+    save(fig, "08_correlation")
+
+# %% Report
+
+log.info("=" * 80)
+log.info("11. EXCEL")
+add_sheet("Summary", pd.DataFrame(SUMMARY, columns=["metric", "value"]).astype(str))
+add_sheet("Findings", pd.DataFrame(FINDINGS, columns=["finding"]))
+add_sheet("DF_Info", info)
+add_sheet("Column_Profile", profile)
+add_sheet("Missing_Values", missing)
+add_sheet("Keys", keys)
+add_sheet("Embedded_Record", redundancy)
+add_sheet("Lifted_Columns", envelope)
+add_sheet("Categorical_Values", categorical)
+add_sheet("Numeric_Summary", numeric)
+add_sheet("Datetime_Range", datetimes)
+add_sheet("Rows_per_Day", per_day)
+add_sheet("JSON_Structure", json_struct)
+add_sheet("JSON_Key_Paths", json_paths)
+add_sheet("Interactions", gp)
+add_sheet("Tool_Summary", tool_summary)
+add_sheet("Tool_Errors", errors)
+add_sheet("Tool_Input_Keys", input_keys)
+add_sheet("Text_Lengths", text_len)
+add_sheet("Correlation", corr.rename_axis("field").reset_index() if len(corr) else corr)
+add_sheet("Sample_Rows", sample)
+
+from openpyxl import load_workbook
+from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
+from openpyxl.formatting.rule import ColorScaleRule
+from openpyxl.styles import Alignment, Font, PatternFill
+
+xlsx = OUT / f"{SRC.stem}_EDA.xlsx"
+with pd.ExcelWriter(xlsx, engine="openpyxl") as xw:
+    for name, frame in SHEETS.items():
+        frame.map(lambda v: ILLEGAL_CHARACTERS_RE.sub("", v)[:32000] if isinstance(v, str) else v).to_excel(xw, sheet_name=name, index=False)
+fills = {"failed": "F4CCCC", "empty": "FCE5CD", "skipped": "EFEFEF", "returned": "D9EAD3", "interaction": "CFE2F3"}
+wb = load_workbook(xlsx)
+for ws in wb.worksheets:
+    ws.freeze_panes = "B2" if ws.title in ("Correlation", "Interactions") else "A2"
+    if ws.max_row > 1:
+        ws.auto_filter.ref = ws.dimensions
+    for j, cell in enumerate(ws[1], start=1):
+        cell.font, cell.fill = Font(bold=True, color="FFFFFF"), PatternFill("solid", fgColor="1C5CAB")
+        cell.alignment = Alignment(vertical="center", wrap_text=True)
+        width = max(len(str(ws.cell(i, j).value or "")) for i in range(1, min(ws.max_row, 200) + 1))
+        ws.column_dimensions[cell.column_letter].width = max(9, min(70, width + 2))
+        if cell.value in ("outcome", "level"):
+            for i in range(2, ws.max_row + 1):
+                f = fills.get(ws.cell(i, j).value)
+                if f:
+                    ws.cell(i, j).fill = PatternFill("solid", fgColor=f)
+        if (str(cell.value).endswith("_pct") or cell.value in ("share_of_rows", "share_of_interactions", "pct", "equal_share")) and ws.max_row > 1:
+            ws.conditional_formatting.add(f"{cell.column_letter}2:{cell.column_letter}{ws.max_row}",
+                                          ColorScaleRule(start_type="num", start_value=0, start_color="FFFFFF", end_type="num", end_value=1, end_color="2A78D6"))
+    if ws.title == "Correlation" and ws.max_row > 1:
+        ws.conditional_formatting.add(f"B2:{ws.cell(ws.max_row, ws.max_column).coordinate}",
+                                      ColorScaleRule(start_type="num", start_value=-1, start_color="E34948", mid_type="num", mid_value=0,
+                                                     mid_color="FFFFFF", end_type="num", end_value=1, end_color="2A78D6"))
+wb.save(xlsx)
+log.info(f"   Excel  -> {xlsx} ({len(SHEETS)} sheets)")
+log.info(f"   Charts -> {OUT / 'charts'}")
+log.info(f"   Tables -> {OUT / 'tables'}")

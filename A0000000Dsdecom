@@ -1,0 +1,971 @@
+# %%
+import argparse
+import ast
+import json
+import logging
+import os
+import re
+import sys
+import time
+import warnings
+from collections import Counter
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from sklearn.cluster import KMeans
+from sklearn.decomposition import TruncatedSVD
+from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS, CountVectorizer, TfidfVectorizer
+from sklearn.manifold import TSNE
+from sklearn.metrics import adjusted_rand_score, calinski_harabasz_score, davies_bouldin_score, silhouette_samples, silhouette_score
+from sklearn.neighbors import NearestNeighbors
+from sklearn.preprocessing import normalize
+
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
+
+ROLE_PATTERNS = {
+    "interaction": r"^interaction_id$",
+    "cid": r"^cid$",
+    "L1": r"^intent$|classification\.intent$",
+    "event": r"^source$",
+    "agent": r"^agent$",
+    "function": r"^function_name$",
+    "input": r"^(input|inputs|args|arguments|parameters)$",
+    "output": r"^(output|outputs|result|response)$",
+    "error": r"^(error|errors|exception)$",
+    "messages": r"(^|\.)messages$",
+    "feedback": r"^feedback$",
+}
+REQUIRED_ROLES = ("interaction", "function")
+USER_ROLES = {"user", "human", "humanmessage", "customer"}
+ASSISTANT_ROLES = {"assistant", "ai", "aimessage", "bot"}
+ROLE_KEYS = ("type", "role")
+
+BLANK = {"", "none", "null", "nan", "n/a", "na", "[]", "{}"}
+FAILED = r"\berror\b|exception|traceback|unknown tool|['\"]status['\"]\s*:\s*[45]\d\d|\b(invalid|forbidden|unauthori[sz]ed|timed? ?out|can only be|must be|not allowed)\b"
+SKIPPED = r"\b(skipped|unavailable|not applicable)\b"
+EMPTY = r"^\W*(none|null|nan)?\W*$|\bno (data|tickets?|records?|results?|rows?|events?|alarms?|outages?)\b|\bnot found\b|no relevant"
+ID_VALUE = r"^(?=.*\d)[\w\-.:+ ]{6,}$"
+MOJIBAKE = r"[Â-ô][\u0080-¿ŒœŠšŸŽžƒˆ˜–—‘-„†-•…‰‹›€™]{1,3}"
+NOISE_TEXT = r"https?://\S+|\S+@\S+|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+TOKEN = r"(?u)\b[^\W\d_]{2,}\b"
+FIELD_LABEL = r"(?:^|[\n,;|])\s*([A-Za-z][A-Za-z_/]*(?: [A-Za-z_/]+){0,2})\s*:"
+
+ALWAYS_ON_SHARE = 0.80
+FIELD_LABEL_SHARE = 0.20
+OVERFREQUENT_SHARE = 0.80
+MIN_DF = 2
+LSA_DIMS = 50
+TARGET_KEYS = 3
+EVIDENCE_GROUNDED = 0.5
+
+D2_K = (2, 10)
+K_RULE_OF_THUMB = True
+D3_K = (2, 5)
+D4_K = (2, 8)
+MIN_CLUSTER = 3
+D3_MIN_PARENT = 10
+D3_MIN_SILHOUETTE = 0.10
+N_INIT = 20
+KNN = 5
+STRONG_SILHOUETTE, LOOSE_SILHOUETTE = 0.25, 0.0
+STRONG_KNN, LOOSE_KNN = 0.6, 0.4
+STABLE_JACCARD, PATTERN_JACCARD = 0.75, 0.60
+TOP_TERMS = 3
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--file", default=None)
+parser.add_argument("--pattern", default="interactions_*samples*.csv")
+parser.add_argument("--map", nargs="*", default=[], help="override a column role, e.g. --map agent=agent_name")
+parser.add_argument("--bootstraps", type=int, default=100)
+parser.add_argument("--seed", type=int, default=42)
+args, _ = parser.parse_known_args()
+SEED = args.seed
+
+
+def search_dirs():
+    roots = [os.environ.get(k) for k in ("OneDriveCommercial", "OneDrive")]
+    here = [Path.cwd()] + ([Path(__file__).resolve().parent] if "__file__" in globals() else [])
+    dirs = here + [Path(r) / "Downloads" for r in roots if r] + [Path.home() / "Downloads"]
+    return [d for d in dict.fromkeys(dirs) if d.is_dir()]
+
+
+def locate():
+    if args.file:
+        return Path(args.file)
+    matches = [p for d in search_dirs() for p in d.glob(args.pattern)]
+    if not matches:
+        raise FileNotFoundError(f"No file matching {args.pattern} in {search_dirs()}")
+    return max(matches, key=lambda p: p.stat().st_mtime)
+
+
+SRC = locate()
+OUT = SRC.parent / f"{SRC.stem}_decomposition"
+for sub in ("charts", "tables", "handoff"):
+    (OUT / sub).mkdir(parents=True, exist_ok=True)
+for old in (OUT / "charts").glob("*.png"):
+    old.unlink()
+
+log = logging.getLogger("nora_decomposition")
+log.setLevel(logging.INFO)
+log.handlers.clear()
+log.propagate = False
+_fmt = logging.Formatter("%(asctime)s | %(message)s", "%H:%M:%S")
+for _h in (logging.StreamHandler(sys.stdout), logging.FileHandler(OUT / "run.log", mode="w", encoding="utf-8")):
+    _h.setFormatter(_fmt)
+    log.addHandler(_h)
+
+SHEETS, SUMMARY, FINDINGS = {}, [], []
+PHASE = ["P0"]
+
+
+def banner(title):
+    PHASE[0] = title.split()[0]
+    log.info("=" * 90)
+    log.info(title)
+
+
+def metric(name, value):
+    SUMMARY.append((PHASE[0], name, str(value)))
+    log.info(f"   {name}: {value}")
+
+
+def finding(text):
+    FINDINGS.append((PHASE[0], text))
+    log.info(f"   FINDING: {text}")
+
+
+def add_sheet(name, frame):
+    SHEETS[name[:31]] = frame
+    frame.to_csv(OUT / "tables" / f"{name}.csv", index=False)
+
+
+def show(frame, title, rows=30):
+    log.info(f"{title}: (empty)" if frame is None or not len(frame) else f"{title}\n{frame.head(rows).to_string(index=False)}")
+
+
+def blank(v):
+    if v is None or (isinstance(v, float) and np.isnan(v)):
+        return True
+    if isinstance(v, (list, dict)):
+        return len(v) == 0
+    return isinstance(v, str) and v.strip().lower() in BLANK
+
+
+def parse_json(value, depth=0):
+    if depth > 6:
+        return value
+    if isinstance(value, str):
+        s = value.strip()
+        if s[:1] in ("[", "{"):
+            for loader in (json.loads, ast.literal_eval):
+                try:
+                    return parse_json(loader(s), depth + 1)
+                except (ValueError, SyntaxError, TypeError, MemoryError, RecursionError):
+                    continue
+        return value
+    if isinstance(value, list):
+        return [parse_json(v, depth + 1) for v in value]
+    if isinstance(value, dict):
+        return {k: parse_json(v, depth + 1) for k, v in value.items()}
+    return value
+
+
+def _repair(m):
+    raw = bytearray()
+    for ch in m.group(0):
+        try:
+            raw += ch.encode("cp1252")
+        except UnicodeEncodeError:
+            if ord(ch) > 255:
+                return m.group(0)
+            raw.append(ord(ch))
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return m.group(0)
+
+
+def fix_mojibake(v):
+    return re.sub(MOJIBAKE, _repair, v) if isinstance(v, str) else v
+
+
+def slug(text):
+    return re.sub(r"[^A-Za-z0-9]+", "_", str(text)).strip("_")[:60]
+
+
+def identity(x):
+    return x
+
+
+# %% Phase 1 - data collection
+
+banner("P1 - DATA COLLECTION: read the export and resolve column roles")
+t0 = time.time()
+for enc in ("utf-8", "utf-8-sig", "cp1252", "latin-1"):
+    try:
+        df = pd.read_csv(SRC, encoding=enc, low_memory=False)
+        break
+    except UnicodeDecodeError:
+        continue
+df.columns = [str(c).strip() for c in df.columns]
+COL = {r: next((c for c in df.columns if re.search(p, c, re.I)), None) for r, p in ROLE_PATTERNS.items()}
+for pair in args.map:
+    role, _, col = pair.partition("=")
+    COL[role.strip()] = col.strip()
+for role, col in COL.items():
+    log.info(f"   {role:<12} -> {col}")
+missing = [r for r in REQUIRED_ROLES if not COL.get(r) or COL[r] not in df.columns]
+if missing:
+    raise KeyError(f"Could not find columns for {missing}; pass them with --map role=column. Columns: {list(df.columns)}")
+metric("file", f"{SRC.name} ({len(df):,} rows x {df.shape[1]} columns, {enc})")
+metric("interactions", df[COL["interaction"]].nunique())
+if COL.get("event"):
+    metric("rows by type", {k: int(v) for k, v in df[COL["event"]].value_counts().items()})
+
+# %% Phase 2 - cleaning and one record per interaction
+
+banner("P2 - CLEANING AND PREPARATION: one record per interaction")
+text_cols = [c for c in df.columns if pd.api.types.is_string_dtype(df[c]) or df[c].dtype == object]
+fixed = 0
+for c in text_cols:
+    hit = df[c].astype(str).str.contains(MOJIBAKE, regex=True, na=False)
+    if hit.any():
+        df.loc[hit, c] = df.loc[hit, c].map(fix_mojibake)
+        fixed += int(hit.sum())
+metric("cells with broken characters repaired", fixed)
+
+
+def outcome(err, out):
+    e = "" if blank(err) else str(err)
+    o = "" if blank(out) else str(out)
+    if re.search(FAILED, f"{e} {o}", re.I):
+        return "failed"
+    if re.search(SKIPPED, f"{e} {o}", re.I):
+        return "skipped"
+    if not e and re.search(EMPTY, o, re.I):
+        return "empty"
+    return "returned"
+
+
+def free_text(d):
+    if not isinstance(d, dict):
+        return []
+    out = []
+    for v in d.values():
+        if isinstance(v, str) and len(v.split()) >= 3 and sum(ch.isdigit() for ch in v) < 0.5 * len(v):
+            out.append(v.strip())
+    return out
+
+
+def id_like(v):
+    vals = v if isinstance(v, list) else [v]
+    return any(isinstance(x, (str, int, float)) and not isinstance(x, bool) and re.match(ID_VALUE, str(x).strip()) for x in vals)
+
+
+def turns(obj):
+    out = []
+    for m in obj if isinstance(obj, list) else []:
+        if not isinstance(m, dict):
+            continue
+        role = str(next((m[k] for k in ROLE_KEYS if k in m), "")).lower()
+        body = m["data"] if isinstance(m.get("data"), dict) else m
+        text = body.get("content", body.get("text", ""))
+        if isinstance(text, list):
+            text = " ".join(t.get("text", "") if isinstance(t, dict) else str(t) for t in text)
+        out.append((role, str(text or "")))
+    return out
+
+
+gcol = COL["interaction"]
+df[gcol] = df[gcol].astype(str)
+is_call = df[COL["function"]].notna() | (df[COL["agent"]].notna() if COL.get("agent") else False)
+c = df[is_call]
+calls = pd.DataFrame({
+    "interaction_id": c[gcol].values,
+    "agent": c[COL["agent"]].values if COL.get("agent") else None,
+    "function": c[COL["function"]].values,
+    "input": c[COL["input"]].map(parse_json).values if COL.get("input") else None,
+    "outcome": [outcome(e, o) for e, o in zip(c[COL["error"]] if COL.get("error") else [None] * len(c),
+                                               c[COL["output"]] if COL.get("output") else [None] * len(c))],
+})
+calls["agent"] = calls["agent"].where(calls["agent"].map(lambda v: not blank(v)))
+owner = calls.dropna(subset=["agent", "function"]).groupby("function")["agent"].agg(lambda s: s.value_counts().index[0])
+calls["owner"] = calls["agent"].fillna(calls["function"].map(owner))
+metric("calls (agent or function rows)", len(calls))
+metric("call outcomes", {k: f"{v:.0%}" for k, v in calls["outcome"].value_counts(normalize=True).items()})
+
+inter = df.groupby(gcol, sort=False).agg(**{r: (COL[r], "first") for r in ("cid", "L1") if COL.get(r)})
+inter.index.name = "interaction_id"
+n = len(inter)
+if COL.get("messages"):
+    msgs = df[df[COL["messages"]].notna()].groupby(gcol)[COL["messages"]].agg(lambda s: [t for v in s for t in turns(parse_json(v))])
+else:
+    msgs = pd.Series(dtype=object)
+msgs = msgs.reindex(inter.index).map(lambda x: x if isinstance(x, list) else [])
+inter["user_text"] = msgs.map(lambda m: "\n".join(t for r, t in m if r in USER_ROLES and t.strip()))
+inter["assistant_text"] = msgs.map(lambda m: " ".join(t for r, t in m if r in ASSISTANT_ROLES and t.strip()))
+inter["final_assistant"] = msgs.map(lambda m: next((t for r, t in reversed(m) if r in ASSISTANT_ROLES and t.strip()), ""))
+form = calls.groupby("interaction_id")["input"].agg(lambda s: list(dict.fromkeys(t for d in s for t in free_text(d))))
+inter["form_text"] = form.reindex(inter.index).map(lambda x: "\n".join(x) if isinstance(x, list) else "")
+inter["problem_text"] = ["\n".join(dict.fromkeys(p for p in (u, f) if p)) for u, f in zip(inter.user_text, inter.form_text)]
+metric("interactions with user text / form text / assistant text",
+       f"{(inter.user_text != '').sum()} / {(inter.form_text != '').sum()} / {(inter.assistant_text != '').sum()} of {n}")
+
+agent_share = calls.dropna(subset=["agent"]).groupby("agent")["interaction_id"].nunique() / n
+function_share = calls.groupby("function")["interaction_id"].nunique() / n
+AO_AGENTS = set(agent_share[agent_share >= ALWAYS_ON_SHARE].index)
+AO_FUNCTIONS = set(function_share[function_share >= ALWAYS_ON_SHARE].index)
+calls["domain"] = ~calls["owner"].isin(AO_AGENTS) & ~calls["function"].isin(AO_FUNCTIONS)
+always_on = pd.concat([
+    pd.DataFrame({"kind": "agent", "name": agent_share.index, "share_of_interactions": agent_share.values.round(3)}),
+    pd.DataFrame({"kind": "function", "name": function_share.index, "share_of_interactions": function_share.values.round(3)}),
+])
+always_on["always_on"] = always_on["share_of_interactions"] >= ALWAYS_ON_SHARE
+always_on = always_on.sort_values(["kind", "share_of_interactions"], ascending=[True, False])
+metric("always-on agents (excluded from decomposition)", sorted(AO_AGENTS))
+metric("always-on functions (excluded from decomposition)", sorted(AO_FUNCTIONS))
+finding(f"{len(AO_AGENTS)} agents and {len(AO_FUNCTIONS)} functions run in {ALWAYS_ON_SHARE:.0%}+ of interactions whatever the case; "
+        "they describe the platform, not the task, so they are left out of the clustering.")
+
+dom = calls[calls["domain"]]
+inter["domain_agents"] = dom.dropna(subset=["agent"]).groupby("interaction_id")["agent"].agg(lambda s: sorted(set(s))).reindex(inter.index)
+inter["domain_functions"] = dom.dropna(subset=["function"]).groupby("interaction_id")["function"].agg(lambda s: sorted(set(s))).reindex(inter.index)
+for col in ("domain_agents", "domain_functions"):
+    inter[col] = inter[col].map(lambda x: x if isinstance(x, list) else [])
+
+raw_keys = Counter()
+key_rows = []
+for r in calls.itertuples():
+    if isinstance(r.input, dict):
+        for k, v in r.input.items():
+            if not blank(v) and id_like(v):
+                key_rows.append((r.interaction_id, r.domain, k))
+                raw_keys[re.sub(r"[^a-z0-9]", "", str(k).lower())] += 1
+
+
+def norm_key(k):
+    k = re.sub(r"[^a-z0-9]", "", str(k).lower())
+    return k[:-1] if k.endswith("s") and k[:-1] in raw_keys else k
+
+
+keys = pd.DataFrame(key_rows, columns=["interaction_id", "domain", "key"])
+keys["key"] = keys["key"].map(norm_key)
+
+
+def target_of(g):
+    src = g[g.domain] if g.domain.any() else g
+    return " + ".join(k for k, _ in Counter(src["key"]).most_common(TARGET_KEYS))
+
+
+inter["D4_target"] = keys.groupby("interaction_id").apply(target_of).reindex(inter.index).fillna("(no identifier in tool inputs)")
+ev = dom.groupby("interaction_id")["outcome"].agg(lambda s: (s == "returned").mean()).reindex(inter.index)
+inter["domain_evidence_returned"] = ev.round(3)
+inter["evidence_status"] = np.select([ev.isna(), ev >= EVIDENCE_GROUNDED, ev > 0], ["no domain calls", "grounded", "partial"], "ungrounded")
+metric("evidence status", {k: int(v) for k, v in inter["evidence_status"].value_counts().items()})
+
+if COL.get("feedback"):
+    fb = df[df[COL["feedback"]].notna()].groupby(gcol)[COL["feedback"]].first().map(parse_json).reindex(inter.index)
+    flat = pd.DataFrame([{k: v for k, v in d.items() if isinstance(v, (str, int, float, bool))} if isinstance(d, dict) else {} for d in fb], index=inter.index)
+    for k in flat.columns:
+        if 2 <= flat[k].nunique() <= 10:
+            inter[f"feedback.{k}"] = flat[k]
+    metric("feedback fields kept (2-10 distinct values)", [c for c in inter.columns if c.startswith("feedback.")])
+
+if "L1" in inter:
+    l1 = inter["L1"].value_counts()
+    metric("L1 (classification taken from the data as given)", {k: int(v) for k, v in l1.items()})
+    if len(l1) == 1:
+        finding(f"L1 is '{l1.index[0]}' for all {n} interactions, so the decomposition below cannot lean on the intent label; "
+                "all structure has to come from what the interaction itself contains.")
+
+inter = inter.reset_index()
+phase2 = inter.assign(domain_agents=inter.domain_agents.map(", ".join), domain_functions=inter.domain_functions.map(", ".join))
+phase2.to_csv(OUT / "handoff" / "phase2_interactions.csv", index=False)
+calls.drop(columns=["input"]).to_csv(OUT / "handoff" / "phase2_calls.csv", index=False)
+log.info("   handoff -> handoff/phase2_interactions.csv, phase2_calls.csv")
+
+# %% Phase 3 - feature spaces
+
+
+banner("P3 - FEATURES: vocabulary filters and one vector space per decomposition level")
+
+
+def stop_layers(docs, name):
+    labels = Counter()
+    for d in docs:
+        labels.update({w for lab in re.findall(FIELD_LABEL, d, re.M) for w in re.findall(r"[a-z]{2,}", lab.lower())})
+    field = {w for w, k in labels.items() if k >= FIELD_LABEL_SHARE * len(docs)}
+    base = set(ENGLISH_STOP_WORDS) | field
+    cv = CountVectorizer(stop_words=sorted(base), token_pattern=TOKEN, binary=True)
+    try:
+        X = cv.fit_transform(docs)
+        share = np.asarray(X.sum(0)).ravel() / len(docs)
+        over = {t for t, s in zip(cv.get_feature_names_out(), share) if s > OVERFREQUENT_SHARE}
+    except ValueError:
+        over = set()
+    log.info(f"   {name}: {len(field)} form-label words, {len(over)} over-frequent words removed {sorted(field | over)[:20]}")
+    return base | over
+
+
+def reduce(X):
+    k = min(LSA_DIMS, X.shape[1] - 1, X.shape[0] - 1)
+    if k < 2:
+        return normalize(X.toarray()), 1.0
+    svd = TruncatedSVD(n_components=k, random_state=SEED)
+    return normalize(svd.fit_transform(X)), float(svd.explained_variance_ratio_.sum())
+
+
+def text_space(docs, stop):
+    docs = [re.sub(NOISE_TEXT, " ", d) if d.strip() else "emptytext" for d in docs]
+    for min_df in (MIN_DF, 1):
+        try:
+            vec = TfidfVectorizer(stop_words=sorted(stop), token_pattern=TOKEN, ngram_range=(1, 2), min_df=min_df, sublinear_tf=True)
+            X = vec.fit_transform(docs)
+            break
+        except ValueError:
+            continue
+    Z, var = reduce(X)
+    return Z, X.shape[1], var
+
+
+def bag_space(lists):
+    lists = [x if x else ["(none)"] for x in lists]
+    X = TfidfVectorizer(analyzer=identity, lowercase=False, binary=True).fit_transform(lists)
+    Z, var = reduce(X) if X.shape[1] > LSA_DIMS else (normalize(X.toarray()), 1.0)
+    return Z, X.shape[1], var
+
+
+def blocks(*mats):
+    return normalize(np.hstack([normalize(m) for m in mats]))
+
+
+STOP_PROBLEM = stop_layers(inter["problem_text"].tolist(), "problem text")
+STOP_EXPECT = stop_layers(inter["final_assistant"].tolist(), "assistant answer")
+Zp, vp, varp = text_space(inter["problem_text"].tolist(), STOP_PROBLEM)
+Za, va, _ = bag_space(inter["domain_agents"].tolist())
+Z2 = blocks(Zp, Za)
+Zf_all, vf, _ = bag_space(inter["domain_functions"].tolist())
+Z4, v4, var4 = text_space(inter["final_assistant"].tolist(), STOP_EXPECT)
+metric("D2 space", f"problem text {vp} terms -> {Zp.shape[1]} LSA dims ({varp:.0%} variance) + {va} domain agents")
+metric("D3 space", f"{vf} domain functions (refit inside every D2 cluster)")
+metric("D4 space", f"assistant answer {v4} terms -> {Z4.shape[1]} LSA dims ({var4:.0%} variance)")
+
+# %% Phase 4 - D2 major clusters
+
+
+banner("P4 - D2: major clusters (what the case is about and which specialist agents it needs)")
+
+
+def fit_level(Z, k_range, level, scope, cap=False):
+    rows, fits = [], {}
+    hi = min(k_range[1], len(Z) - 1, int(np.sqrt(len(Z) / 2)) if cap else len(Z))
+    for k in range(k_range[0], hi + 1):
+        km = KMeans(n_clusters=k, n_init=N_INIT, random_state=SEED).fit(Z)
+        sizes = np.bincount(km.labels_, minlength=k)
+        row = {"level": level, "scope": scope, "k": k, "smallest_cluster": int(sizes.min()), "valid": bool(sizes.min() >= MIN_CLUSTER)}
+        if row["valid"] and len(np.unique(Z, axis=0)) > k:
+            row.update(silhouette=silhouette_score(Z, km.labels_, metric="cosine"), calinski_harabasz=calinski_harabasz_score(Z, km.labels_),
+                       davies_bouldin=davies_bouldin_score(Z, km.labels_))
+            fits[k] = km
+        else:
+            row["valid"] = False
+        rows.append(row)
+    tab = pd.DataFrame(rows)
+    for col in ("silhouette", "calinski_harabasz", "davies_bouldin"):
+        if col not in tab:
+            tab[col] = np.nan
+    ok = tab[tab.valid]
+    if ok.empty:
+        tab["votes"], tab["chosen"] = 0, False
+        return None, tab
+    votes = Counter([int(ok.loc[ok.silhouette.idxmax(), "k"]), int(ok.loc[ok.calinski_harabasz.idxmax(), "k"]), int(ok.loc[ok.davies_bouldin.idxmin(), "k"])])
+    sil = ok.set_index("k")["silhouette"]
+    best = max(votes, key=lambda k: (votes[k], sil[k]))
+    tab["votes"] = tab["k"].map(votes).fillna(0).astype(int)
+    tab["chosen"] = tab["k"] == best
+    return fits[best], tab
+
+
+def by_size(labels):
+    order = [c for c, _ in Counter(labels).most_common()]
+    return np.array([order.index(c) for c in labels])
+
+
+def ctfidf(groups, labels, stop=None, bag=False, top=TOP_TERMS):
+    classes = sorted(set(labels))
+    if bag:
+        joined = [[t for g, l in zip(groups, labels) if l == c for t in g] or ["(none)"] for c in classes]
+        cv = CountVectorizer(analyzer=identity, lowercase=False)
+    else:
+        joined = [" ".join(re.sub(NOISE_TEXT, " ", g) for g, l in zip(groups, labels) if l == c) or "emptytext" for c in classes]
+        cv = CountVectorizer(stop_words=sorted(stop or []), token_pattern=TOKEN, ngram_range=(1, 2))
+    try:
+        X = cv.fit_transform(joined).toarray().astype(float)
+    except ValueError:
+        return {c: [] for c in classes}
+    tf = X / X.sum(1, keepdims=True).clip(min=1)
+    idf = np.log(1 + (X.sum() / len(classes)) / np.maximum(X.sum(0), 1))
+    W, terms = tf * idf, cv.get_feature_names_out()
+    out = {}
+    for i, c in enumerate(classes):
+        picked, words = [], set()
+        for j in np.argsort(-W[i]):
+            if W[i, j] <= 0 or len(picked) == top:
+                break
+            parts = set(str(terms[j]).split())
+            if not bag and parts <= words:
+                continue
+            picked.append(str(terms[j]))
+            words |= parts
+        out[c] = picked
+    return out
+
+
+def signature(lists, members, top=3):
+    overall = Counter(t for x in lists for t in set(x))
+    inside = Counter(t for i in members for t in set(lists[i]))
+    rows = []
+    for t, k in inside.items():
+        sup, lift = k / len(members), (k / len(members)) / (overall[t] / len(lists))
+        rows.append((t, sup, lift))
+    rows.sort(key=lambda r: (-(r[1] >= 0.5), -r[2], -r[1]))
+    return rows[:top]
+
+
+def representatives(Z, labels, c, ids, k=3):
+    idx = np.where(labels == c)[0]
+    centre = normalize(Z[idx].mean(0, keepdims=True))
+    return [ids[i] for i in idx[np.argsort(-(Z[idx] @ centre.T).ravel())][:k]]
+
+
+prefix = os.path.commonprefix(sorted(agent_share.index)) if len(agent_share) > 1 else ""
+short = lambda a: a[len(prefix):] if len(prefix) >= 3 else a
+ids = inter["interaction_id"].tolist()
+
+km2, sel2 = fit_level(Z2, D2_K, "D2", "all", cap=K_RULE_OF_THUMB)
+if km2 is None:
+    lab2 = np.zeros(n, dtype=int)
+    finding("No k in the D2 range gave clusters of at least MIN_CLUSTER interactions; D2 falls back to one group.")
+else:
+    lab2 = by_size(km2.labels_)
+show(sel2, "   D2 model selection (majority vote of silhouette max, Calinski-Harabasz max, Davies-Bouldin min)")
+terms2 = ctfidf(inter["problem_text"].tolist(), lab2, STOP_PROBLEM)
+D2 = {}
+for c in sorted(set(lab2)):
+    members = np.where(lab2 == c)[0]
+    sig = signature(inter["domain_agents"].tolist(), members)
+    lead = [short(t) for t, sup, lift in sig if sup >= 0.5 and lift >= 1.5][:2]
+    label = " + ".join(lead) + (" | " if lead else "") + " / ".join(terms2[c]) if (lead or terms2[c]) else "(no distinctive terms)"
+    D2[c] = {"id": f"D2_{c + 1:02d}", "label": label, "size": len(members), "top_terms": terms2[c],
+             "signature": [f"{short(t)} ({sup:.0%}, lift {lift:.1f})" for t, sup, lift in sig],
+             "representatives": representatives(Z2, lab2, c, ids)}
+inter["D2_id"] = [D2[c]["id"] for c in lab2]
+inter["D2_label"] = [D2[c]["label"] for c in lab2]
+show(pd.DataFrame(D2.values())[["id", "size", "label"]], "   D2 clusters")
+metric("D2 clusters", len(D2))
+inter.to_csv(OUT / "handoff" / "phase4_D2.csv", index=False)
+
+# %% Phase 5 - D3 sub-clusters inside each D2
+
+
+banner("P5 - D3: sub-clusters inside each D2 cluster (how the case was worked: which specific functions ran)")
+lab3 = np.empty(n, dtype=object)
+sel3, D3, SPACES3 = [], {}, {}
+fn_lists = inter["domain_functions"].tolist()
+for c in sorted(set(lab2)):
+    pid = D2[c]["id"]
+    members = np.where(lab2 == c)[0]
+    reason, km3 = "", None
+    if len(members) < D3_MIN_PARENT:
+        reason = f"only {len(members)} interactions (< {D3_MIN_PARENT})"
+    else:
+        Z3, _, _ = bag_space([fn_lists[i] for i in members])
+        if len(np.unique(Z3, axis=0)) < 2:
+            reason = "all interactions ran the same functions"
+        else:
+            km3, tab = fit_level(Z3, (D3_K[0], min(D3_K[1], len(members) // MIN_CLUSTER)), "D3", pid)
+            sel3.append(tab)
+            if km3 is None:
+                reason = "no split with clusters of at least MIN_CLUSTER interactions"
+            elif tab.loc[tab.chosen, "silhouette"].iloc[0] < D3_MIN_SILHOUETTE:
+                reason = f"best split silhouette {tab.loc[tab.chosen, 'silhouette'].iloc[0]:.2f} < {D3_MIN_SILHOUETTE}"
+                km3 = None
+    if km3 is None:
+        sub = np.zeros(len(members), dtype=int)
+    else:
+        sub = by_size(km3.labels_)
+        SPACES3[pid] = (Z3, sub, members)
+    sub_terms = ctfidf([fn_lists[i] for i in members], sub, bag=True, top=2)
+    for s in sorted(set(sub)):
+        sid = f"D3_{c + 1:02d}_{s + (0 if km3 is None else 1):02d}"
+        sm = members[sub == s]
+        if km3 is None:
+            label = f"single pattern ({reason})"
+        else:
+            label = " + ".join(sub_terms[s]) or "(no distinctive function)"
+        sig = signature(fn_lists, sm)
+        D3[sid] = {"id": sid, "parent": pid, "label": label, "size": len(sm), "top_functions": sub_terms[s],
+                   "signature": [f"{t} ({sup:.0%}, lift {lift:.1f})" for t, sup, lift in sig], "split": km3 is not None}
+        lab3[sm] = sid
+    log.info(f"   {pid} (n={len(members)}): " + (f"split into {len(set(sub))}" if km3 is not None else f"kept whole - {reason}"))
+inter["D3_id"] = lab3
+inter["D3_label"] = [D3[s]["label"] for s in lab3]
+sel3 = pd.concat(sel3, ignore_index=True) if sel3 else pd.DataFrame()
+metric("D3 sub-clusters", f"{len(D3)} ({sum(d['split'] for d in D3.values())} from real splits)")
+inter.to_csv(OUT / "handoff" / "phase5_D3.csv", index=False)
+
+# %% Phase 6 - D4 target and expectation
+
+
+banner("P6 - D4: target (what the plan acts on) and expectation (what the agent drove the case to)")
+km4, sel4 = fit_level(Z4, D4_K, "D4", "all", cap=K_RULE_OF_THUMB)
+lab4 = np.zeros(n, dtype=int) if km4 is None else by_size(km4.labels_)
+show(sel4, "   D4 model selection")
+terms4 = ctfidf(inter["final_assistant"].tolist(), lab4, STOP_EXPECT)
+D4 = {}
+for c in sorted(set(lab4)):
+    members = np.where(lab4 == c)[0]
+    D4[c] = {"id": f"D4_{c + 1:02d}", "label": " / ".join(terms4[c]) or "(no distinctive terms)", "size": len(members),
+             "top_terms": terms4[c], "targets": dict(Counter(inter.loc[members, "D4_target"]).most_common(3)),
+             "evidence": dict(Counter(inter.loc[members, "evidence_status"])), "representatives": representatives(Z4, lab4, c, ids)}
+inter["D4_expectation_id"] = [D4[c]["id"] for c in lab4]
+inter["D4_expectation_label"] = [D4[c]["label"] for c in lab4]
+show(pd.DataFrame(D4.values())[["id", "size", "label", "targets"]], "   D4 expectation clusters")
+metric("D4 expectation clusters", len(D4))
+metric("D4 distinct targets", inter["D4_target"].nunique())
+inter.to_csv(OUT / "handoff" / "phase6_D4.csv", index=False)
+
+# %% Phase 7 - evaluation
+
+
+banner("P7 - EVALUATION: natural structure, stability and how strongly each interaction belongs")
+
+
+def point_quality(Z, lab):
+    lab = np.asarray(lab)
+    if len(set(lab)) < 2:
+        return np.full(len(lab), np.nan), np.full(len(lab), np.nan), np.array(["single cluster"] * len(lab), dtype=object)
+    sil = silhouette_samples(Z, lab, metric="cosine")
+    k = min(KNN, len(Z) - 1)
+    nb = NearestNeighbors(n_neighbors=k + 1, metric="cosine").fit(Z).kneighbors(Z, return_distance=False)
+    nb = np.array([[j for j in row if j != i][:k] for i, row in enumerate(nb)])
+    agree = (lab[nb] == lab[:, None]).mean(1)
+    align = np.where((sil >= STRONG_SILHOUETTE) & (agree >= STRONG_KNN), "strong",
+                     np.where((sil < LOOSE_SILHOUETTE) | (agree < LOOSE_KNN), "loose", "moderate"))
+    return sil, agree, align.astype(object)
+
+
+def jaccard_stability(Z, lab, B):
+    k, rng = len(set(lab)), np.random.default_rng(SEED)
+    acc = [[] for _ in range(k)]
+    for b in range(B):
+        idx = rng.choice(len(Z), len(Z), replace=True)
+        uniq = np.unique(idx)
+        if len(np.unique(Z[idx], axis=0)) <= k:
+            continue
+        new = KMeans(n_clusters=k, n_init=5, random_state=b).fit(Z[idx]).predict(Z[uniq])
+        old = lab[uniq]
+        for c in range(k):
+            A = old == c
+            if A.any():
+                acc[c].append(max((A & (new == d)).sum() / (A | (new == d)).sum() for d in range(k)))
+    return [float(np.mean(a)) if a else np.nan for a in acc]
+
+
+def stability_class(j):
+    return "n/a" if j != j else "stable" if j >= STABLE_JACCARD else "pattern" if j >= PATTERN_JACCARD else "weak"
+
+
+def natural(Z, lab, level):
+    try:
+        from sklearn.cluster import HDBSCAN
+    except ImportError:
+        log.info("   HDBSCAN needs scikit-learn >= 1.3; natural-structure check skipped")
+        return None, {}
+    nat = HDBSCAN(min_cluster_size=max(MIN_CLUSTER, round(0.05 * len(Z)))).fit(Z).labels_
+    keep = nat != -1
+    res = {"level": level, "natural_clusters": len(set(nat[keep])), "noise_share": round(float((~keep).mean()), 3),
+           "kmeans_k": len(set(lab)),
+           "ARI_kmeans_vs_natural": round(adjusted_rand_score(lab[keep], nat[keep]), 3) if keep.sum() > 1 and len(set(nat[keep])) > 1 else np.nan}
+    return nat, res
+
+
+nat_rows = []
+nat2, r = natural(Z2, lab2, "D2")
+nat_rows.append(r)
+nat4, r = natural(Z4, lab4, "D4")
+nat_rows.append(r)
+natural_tab = pd.DataFrame([r for r in nat_rows if r])
+show(natural_tab, "   density-based natural clusters (HDBSCAN) vs the chosen k-means partition")
+
+for level, Z, lab, cid in (("D2", Z2, lab2, "D2_id"), ("D4", Z4, lab4, "D4_expectation_id")):
+    sil, agree, align = point_quality(Z, lab)
+    inter[f"{level}_silhouette"], inter[f"{level}_knn_agreement"], inter[f"{level}_alignment"] = np.round(sil, 3), np.round(agree, 3), align
+inter["D3_silhouette"], inter["D3_knn_agreement"], inter["D3_alignment"] = np.nan, np.nan, "not split"
+for pid, (Z3, sub, members) in SPACES3.items():
+    sil, agree, align = point_quality(Z3, sub)
+    inter.loc[members, "D3_silhouette"], inter.loc[members, "D3_knn_agreement"], inter.loc[members, "D3_alignment"] = np.round(sil, 3), np.round(agree, 3), align
+
+stab_rows = []
+for level, Z, lab, book in (("D2", Z2, lab2, D2), ("D4", Z4, lab4, D4)):
+    js = jaccard_stability(Z, lab, args.bootstraps) if len(set(lab)) > 1 else [np.nan]
+    for c, j in zip(sorted(set(lab)), js):
+        book[c]["bootstrap_jaccard"], book[c]["stability"] = round(j, 3) if j == j else None, stability_class(j)
+for pid, (Z3, sub, members) in SPACES3.items():
+    js = jaccard_stability(Z3, sub, args.bootstraps)
+    for s, j in zip(sorted(set(sub)), js):
+        sid = f"{pid.replace('D2', 'D3')}_{s + 1:02d}"
+        D3[sid]["bootstrap_jaccard"], D3[sid]["stability"] = round(j, 3), stability_class(j)
+for d in D3.values():
+    d.setdefault("bootstrap_jaccard", None)
+    d.setdefault("stability", "not split")
+
+for level, book, col in (("D2", D2.values(), "D2_id"), ("D3", D3.values(), "D3_id"), ("D4", D4.values(), "D4_expectation_id")):
+    for d in book:
+        m = inter[inter[col] == d["id"]]
+        d["mean_silhouette"] = round(float(m[f"{level}_silhouette"].mean()), 3) if m[f"{level}_silhouette"].notna().any() else None
+        d["strong_share"] = round(float((m[f"{level}_alignment"] == "strong").mean()), 3)
+    stab = Counter(d["stability"] for d in book)
+    align = inter[f"{level}_alignment"].value_counts(normalize=True)
+    metric(f"{level} cluster stability (bootstrap Jaccard, B={args.bootstraps})", dict(stab))
+    metric(f"{level} interaction alignment", {k: f"{v:.0%}" for k, v in align.items()})
+
+weak = [d["id"] for d in list(D2.values()) + list(D3.values()) + list(D4.values()) if d["stability"] == "weak"]
+if weak:
+    finding(f"{len(weak)} clusters dissolve under resampling (Jaccard < {PATTERN_JACCARD}): {', '.join(weak)}; treat their labels as provisional.")
+for r in nat_rows:
+    if r and r["ARI_kmeans_vs_natural"] == r["ARI_kmeans_vs_natural"]:
+        finding(f"{r['level']}: density-based clustering finds {r['natural_clusters']} natural groups ({r['noise_share']:.0%} unassigned); "
+                f"agreement with the k-means partition ARI = {r['ARI_kmeans_vs_natural']}.")
+
+# %% Phase 8 - outputs
+
+banner("P8 - OUTPUTS: decomposition table, cluster dictionary, JSON")
+feedback_cols = [c for c in inter.columns if c.startswith("feedback.")]
+decomposition = inter[["interaction_id"] + [c for c in ("cid", "L1") if c in inter] +
+                      ["D2_id", "D2_label", "D2_alignment", "D3_id", "D3_label", "D3_alignment",
+                       "D4_target", "D4_expectation_id", "D4_expectation_label", "D4_alignment", "evidence_status"]].copy()
+decomposition["domain_agents"] = inter["domain_agents"].map(lambda x: ", ".join(short(a) for a in x))
+decomposition["domain_functions"] = inter["domain_functions"].map(", ".join)
+decomposition["problem_text"] = inter["problem_text"].str[:300]
+decomposition["final_answer"] = inter["final_assistant"].str[:300]
+for c in feedback_cols:
+    decomposition[c] = inter[c]
+decomposition = decomposition.sort_values(["D2_id", "D3_id", "D4_expectation_id"])
+
+dict_rows = []
+for level, book in (("D2", D2.values()), ("D3", D3.values()), ("D4", D4.values())):
+    for d in book:
+        dict_rows.append({"level": level, "cluster_id": d["id"], "parent": d.get("parent", ""), "label": d["label"], "size": d["size"],
+                          "share": round(d["size"] / n, 3), "top_terms": ", ".join(d.get("top_terms", d.get("top_functions", []))),
+                          "signature": "; ".join(d.get("signature", [])) or json.dumps(d.get("targets", {})),
+                          "mean_silhouette": d.get("mean_silhouette"), "strong_share": d.get("strong_share"),
+                          "bootstrap_jaccard": d.get("bootstrap_jaccard"), "stability": d.get("stability"),
+                          "representative_interactions": ", ".join(d.get("representatives", []))})
+cluster_dictionary = pd.DataFrame(dict_rows)
+selection = pd.concat([sel2, sel3, sel4], ignore_index=True).round(4)
+crosstab = pd.crosstab(inter["D2_id"], inter["D4_expectation_id"]).rename_axis(None, axis=1).reset_index()
+targets = pd.crosstab(inter["D4_target"], inter["D4_expectation_id"]).rename_axis(None, axis=1).reset_index()
+
+nested = {"meta": {"file": SRC.name, "interactions": n, "L1": {k: int(v) for k, v in inter["L1"].value_counts().items()} if "L1" in inter else {},
+                   "always_on_agents": sorted(AO_AGENTS), "always_on_functions": sorted(AO_FUNCTIONS), "seed": SEED},
+          "D2": {}, "D4": {}, "interactions": {}}
+for d in D2.values():
+    nested["D2"][d["id"]] = {**{k: v for k, v in d.items() if k != "id"}, "D3": {s["id"]: {k: v for k, v in s.items() if k not in ("id", "parent")}
+                                                                            for s in D3.values() if s["parent"] == d["id"]}}
+for d in D4.values():
+    nested["D4"][d["id"]] = {k: v for k, v in d.items() if k != "id"}
+for r in decomposition.itertuples(index=False):
+    nested["interactions"][r.interaction_id] = {"cid": getattr(r, "cid", None), "L1": getattr(r, "L1", None), "D2": r.D2_id, "D3": r.D3_id,
+                                                "D4": {"target": r.D4_target, "expectation": r.D4_expectation_id, "evidence": r.evidence_status}}
+with open(OUT / "decomposition_dictionary.json", "w", encoding="utf-8") as fh:
+    json.dump(nested, fh, indent=2, default=str)
+log.info("   JSON -> decomposition_dictionary.json")
+
+# %% Phase 9 - visualise
+
+banner("P9 - CHARTS")
+SERIES = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#4a3aa7", "#e34948"]
+INK, INK2, MUTED, GRID = "#1f1f1e", "#5f5e58", "#9a9990", "#e8e7e2"
+ALIGN_COLOUR = {"strong": "#2a78d6", "moderate": "#9ec5f4", "loose": "#d9d8d2"}
+plt.rcParams.update({"font.size": 9, "axes.titlesize": 11, "axes.titlelocation": "left", "axes.titlecolor": INK,
+                     "axes.edgecolor": MUTED, "xtick.color": INK2, "ytick.color": INK2})
+
+
+def save(fig, name):
+    fig.savefig(OUT / "charts" / f"{name}.png", dpi=170, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    log.info(f"   chart -> {name}.png")
+
+
+def embed(Z):
+    return TSNE(n_components=2, perplexity=max(2, min(30, (len(Z) - 1) / 3)), metric="cosine", init="pca", random_state=SEED).fit_transform(Z)
+
+
+def scatter(ax, xy, labels, title, legend=True):
+    labels = np.asarray(labels, dtype=object)
+    names = [c for c, _ in Counter(labels).most_common() if c != "noise"]
+    if "noise" in set(labels):
+        m = labels == "noise"
+        ax.scatter(xy[m, 0], xy[m, 1], s=26, c=MUTED, marker="x", linewidths=1, label=f"no group (n={m.sum()})")
+    for i, name in enumerate(names):
+        m = labels == name
+        if i < len(SERIES):
+            ax.scatter(xy[m, 0], xy[m, 1], s=34, c=SERIES[i], edgecolors="white", linewidths=1.5, label=f"{name} (n={m.sum()})")
+        else:
+            ax.scatter(xy[m, 0], xy[m, 1], s=34, facecolors="none", edgecolors=INK2, linewidths=1.2, label=f"{name} (n={m.sum()})")
+        cx, cy = np.median(xy[m], axis=0)
+        ax.annotate(str(name), (cx, cy), fontsize=7.5, color=INK, ha="center", va="center",
+                    bbox=dict(boxstyle="round,pad=0.2", fc="white", ec=MUTED, lw=0.5, alpha=0.9))
+    ax.set_title(title, fontsize=10)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    if legend:
+        ax.legend(frameon=False, fontsize=7, loc="upper left", bbox_to_anchor=(1.0, 1.0))
+
+
+xy2 = embed(Z2)
+fig, axes = plt.subplots(1, 2, figsize=(17, 6), gridspec_kw={"wspace": 0.45})
+scatter(axes[0], xy2, ["noise" if v == -1 else f"natural {v + 1}" for v in nat2] if nat2 is not None else ["n/a"] * n,
+        "Step 1 - natural groups (HDBSCAN, x = no group, hollow = group 9+)")
+scatter(axes[1], xy2, inter["D2_id"], "Step 2 - D2 clusters (k-means, k by metric vote)")
+fig.suptitle("t-SNE view of the D2 space (layout only; distances between groups are not meaningful)", x=0.01, ha="left", fontsize=10, color=INK2)
+save(fig, "01_D2_natural_vs_kmeans")
+
+for level, tab in (("D2", sel2), ("D4", sel4)):
+    ok = tab[tab.valid]
+    if ok.empty:
+        continue
+    fig, axes = plt.subplots(1, 3, figsize=(12, 3))
+    for ax, (col, better) in zip(axes, (("silhouette", "higher"), ("calinski_harabasz", "higher"), ("davies_bouldin", "lower"))):
+        ax.plot(ok.k, ok[col], color=SERIES[0], lw=2, marker="o", ms=5)
+        ch = ok[ok.chosen]
+        ax.scatter(ch.k, ch[col], s=90, facecolors="none", edgecolors=SERIES[1], linewidths=2, zorder=3, label="chosen k")
+        ax.set_title(f"{col.replace('_', '-')} ({better} is better)", fontsize=9)
+        ax.set_xlabel("k")
+        ax.spines[["top", "right"]].set_visible(False)
+        ax.grid(color=GRID)
+    axes[0].legend(frameon=False, fontsize=8)
+    fig.suptitle(f"{level} - choosing the number of clusters", x=0.01, ha="left")
+    fig.tight_layout()
+    save(fig, f"02_{level}_model_selection")
+
+parents = sorted(set(lab2))
+cols = min(3, len(parents))
+fig, axes = plt.subplots(int(np.ceil(len(parents) / cols)), cols, figsize=(5.2 * cols, 4 * np.ceil(len(parents) / cols)), squeeze=False)
+for ax, c in zip(axes.flat, parents):
+    pid = D2[c]["id"]
+    if pid in SPACES3:
+        Z3, sub, members = SPACES3[pid]
+        xy = TruncatedSVD(n_components=2, random_state=SEED).fit_transform(Z3) if Z3.shape[1] > 2 else Z3[:, :2]
+        xy = xy + np.random.default_rng(SEED).normal(0, 0.02 * (np.ptp(xy, axis=0) + 1e-9), xy.shape)
+        scatter(ax, xy, inter.loc[members, "D3_id"].values, f"{pid} (n={len(members)}) - {len(set(sub))} sub-clusters", legend=False)
+        ax.legend(frameon=False, fontsize=7, loc="best")
+    else:
+        ax.text(0.5, 0.5, f"{pid} (n={D2[c]['size']})\nkept whole", ha="center", va="center", color=INK2, transform=ax.transAxes)
+        ax.set_xticks([])
+        ax.set_yticks([])
+for ax in list(axes.flat)[len(parents):]:
+    ax.axis("off")
+fig.suptitle("D3 sub-clusters inside each D2 cluster (2-D projection of that cluster's own function space, jittered so identical function sets stay visible)", x=0.01, ha="left")
+fig.tight_layout()
+save(fig, "03_D3_within_D2")
+
+fig, ax = plt.subplots(figsize=(10, 6))
+scatter(ax, embed(Z4), inter["D4_expectation_id"], "D4 expectation clusters in the assistant-answer space (t-SNE)")
+save(fig, "04_D4_expectations")
+
+ct = pd.crosstab(inter["D2_id"], inter["D4_expectation_id"])
+fig, ax = plt.subplots(figsize=(0.8 * ct.shape[1] + 3, 0.45 * ct.shape[0] + 1.5))
+im = ax.imshow(ct.values, cmap="Blues", aspect="auto")
+ax.set_xticks(range(ct.shape[1]), ct.columns)
+ax.set_yticks(range(ct.shape[0]), ct.index)
+for i in range(ct.shape[0]):
+    for j in range(ct.shape[1]):
+        if ct.values[i, j]:
+            ax.text(j, i, ct.values[i, j], ha="center", va="center", fontsize=8, color="white" if ct.values[i, j] > ct.values.max() * 0.55 else INK)
+ax.set_title("Interactions per D2 cluster (rows) and D4 expectation (columns)")
+save(fig, "05_D2_x_D4")
+
+fig, ax = plt.subplots(figsize=(8, 2.6))
+lv = ["D2", "D3", "D4"]
+left = np.zeros(len(lv))
+for a, colour in ALIGN_COLOUR.items():
+    v = np.array([(inter[f"{l}_alignment"] == a).mean() for l in lv])
+    ax.barh(lv, v, left=left, color=colour, label=a, edgecolor="white", linewidth=2)
+    left += v
+ax.barh(lv, 1 - left, left=left, color="#f0efec", label="not split / single", edgecolor="white", linewidth=2)
+ax.set_xlim(0, 1)
+ax.invert_yaxis()
+ax.legend(frameon=False, fontsize=8, ncol=4, loc="upper left", bbox_to_anchor=(0, -0.15))
+ax.set_title("How strongly interactions belong to their cluster")
+ax.spines[["top", "right"]].set_visible(False)
+save(fig, "06_alignment")
+
+st = cluster_dictionary[cluster_dictionary.bootstrap_jaccard.notna()]
+if len(st):
+    fig, ax = plt.subplots(figsize=(9, 0.3 * len(st) + 1.5))
+    ax.barh(st.cluster_id, st.bootstrap_jaccard, color=SERIES[0], height=0.6)
+    for x, lab in ((PATTERN_JACCARD, "pattern"), (STABLE_JACCARD, "stable")):
+        ax.axvline(x, color=MUTED, ls="--", lw=1)
+        ax.text(x, -0.9, lab, fontsize=7, color=INK2, ha="center")
+    ax.set_xlim(0, 1)
+    ax.invert_yaxis()
+    ax.set_title(f"Cluster stability under resampling (bootstrap Jaccard, B={args.bootstraps})")
+    ax.spines[["top", "right"]].set_visible(False)
+    save(fig, "07_stability")
+
+# %% Phase 10 - Excel report
+
+banner("P10 - EXCEL")
+add_sheet("Summary", pd.DataFrame(SUMMARY, columns=["phase", "metric", "value"]))
+add_sheet("Findings", pd.DataFrame(FINDINGS, columns=["phase", "finding"]))
+add_sheet("Decomposition", decomposition)
+add_sheet("Cluster_Dictionary", cluster_dictionary)
+add_sheet("Model_Selection", selection)
+add_sheet("Natural_Structure", natural_tab)
+add_sheet("D2_x_D4", crosstab)
+add_sheet("Target_x_Expectation", targets)
+add_sheet("Always_On", always_on)
+add_sheet("Quality_per_Interaction", inter[["interaction_id", "D2_id", "D2_silhouette", "D2_knn_agreement", "D2_alignment",
+                                             "D3_id", "D3_silhouette", "D3_knn_agreement", "D3_alignment",
+                                             "D4_expectation_id", "D4_silhouette", "D4_knn_agreement", "D4_alignment",
+                                             "domain_evidence_returned", "evidence_status"]])
+
+from openpyxl import load_workbook
+from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
+from openpyxl.formatting.rule import ColorScaleRule
+from openpyxl.styles import Alignment, Font, PatternFill
+
+xlsx = OUT / f"{SRC.stem}_decomposition.xlsx"
+with pd.ExcelWriter(xlsx, engine="openpyxl") as xw:
+    for name, frame in SHEETS.items():
+        frame.map(lambda v: ILLEGAL_CHARACTERS_RE.sub("", v)[:32000] if isinstance(v, str) else v).to_excel(xw, sheet_name=name, index=False)
+fills = {"strong": "CFE2F3", "moderate": "EAF2FB", "loose": "F4CCCC", "stable": "D9EAD3", "pattern": "FFF2CC", "weak": "F4CCCC",
+         "grounded": "D9EAD3", "partial": "FFF2CC", "ungrounded": "F4CCCC"}
+wb = load_workbook(xlsx)
+for ws in wb.worksheets:
+    ws.freeze_panes = "B2"
+    if ws.max_row > 1:
+        ws.auto_filter.ref = ws.dimensions
+    for j, cell in enumerate(ws[1], start=1):
+        cell.font, cell.fill = Font(bold=True, color="FFFFFF"), PatternFill("solid", fgColor="1C5CAB")
+        cell.alignment = Alignment(vertical="center", wrap_text=True)
+        width = max(len(str(ws.cell(i, j).value or "")) for i in range(1, min(ws.max_row, 150) + 1))
+        ws.column_dimensions[cell.column_letter].width = max(9, min(60, width + 2))
+        if str(cell.value).endswith(("alignment", "stability", "evidence_status")):
+            for i in range(2, ws.max_row + 1):
+                f = fills.get(ws.cell(i, j).value)
+                if f:
+                    ws.cell(i, j).fill = PatternFill("solid", fgColor=f)
+        if cell.value in ("mean_silhouette", "strong_share", "bootstrap_jaccard", "share", "silhouette") and ws.max_row > 1:
+            ws.conditional_formatting.add(f"{cell.column_letter}2:{cell.column_letter}{ws.max_row}",
+                                          ColorScaleRule(start_type="num", start_value=0, start_color="FFFFFF", end_type="num", end_value=1, end_color="2A78D6"))
+wb.save(xlsx)
+log.info(f"   Excel  -> {xlsx} ({len(SHEETS)} sheets)")
+log.info(f"   JSON   -> {OUT / 'decomposition_dictionary.json'}")
+log.info(f"   Charts -> {OUT / 'charts'}")
+log.info(f"Finished in {time.time() - t0:.0f}s")

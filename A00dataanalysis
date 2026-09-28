@@ -1,0 +1,101 @@
+# %%
+import os
+import sys
+from pathlib import Path
+
+import pandas as pd
+
+FILE_PATTERN = "intent_labels_sample_for_understand_interactions*.csv"
+
+
+def downloads_dirs():
+    roots = [os.environ.get(k) for k in ("OneDriveCommercial", "OneDrive")]
+    dirs = [Path(r) / "Downloads" for r in roots if r]
+    dirs.append(Path.home() / "Downloads")
+    return [d for d in dirs if d.is_dir()]
+
+
+def locate_csv():
+    args = [a for a in sys.argv[1:] if a.lower().endswith(".csv")]
+    if args:
+        return Path(args[0])
+    matches = [p for d in downloads_dirs() for p in d.glob(FILE_PATTERN)]
+    if not matches:
+        searched = ", ".join(str(d) for d in downloads_dirs()) or "no Downloads folder found"
+        raise FileNotFoundError(f"No file matching {FILE_PATTERN} in: {searched}")
+    return max(matches, key=lambda p: p.stat().st_mtime)
+
+
+csv_path = locate_csv()
+if not csv_path.is_file():
+    raise FileNotFoundError(f"CSV not found: {csv_path.resolve()}")
+print(f"Using: {csv_path}")
+
+out_dir = csv_path.parent / f"{csv_path.stem}_profile"
+out_dir.mkdir(exist_ok=True)
+
+
+def read_csv_any_encoding(path):
+    for enc in ("utf-8", "utf-8-sig", "cp1252", "latin-1"):
+        try:
+            return pd.read_csv(path, encoding=enc, low_memory=False), enc
+        except UnicodeDecodeError:
+            continue
+    raise ValueError(f"Could not decode {path} with common encodings")
+
+
+df, encoding = read_csv_any_encoding(csv_path)
+
+# %%
+file_mb = csv_path.stat().st_size / 1024**2
+mem_mb = df.memory_usage(deep=True).sum() / 1024**2
+
+print(f"File           : {csv_path.name}")
+print(f"Encoding       : {encoding}")
+print(f"File size      : {file_mb:,.2f} MB")
+print(f"In-memory size : {mem_mb:,.2f} MB")
+print(f"Rows           : {len(df):,}")
+print(f"Columns        : {df.shape[1]:,}")
+print(f"Duplicate rows : {df.duplicated().sum():,}")
+print(f"Fully empty rows    : {df.isna().all(axis=1).sum():,}")
+print(f"Fully empty columns : {df.isna().all().sum():,}")
+
+# %%
+def sample_value(s):
+    non_null = s.dropna()
+    if non_null.empty:
+        return ""
+    return str(non_null.iloc[0])[:80]
+
+
+profile = pd.DataFrame({
+    "column": df.columns,
+    "dtype": df.dtypes.astype(str).values,
+    "non_null": df.notna().sum().values,
+    "null_pct": (df.isna().mean() * 100).round(2).values,
+    "unique": df.nunique(dropna=True).values,
+    "sample": [sample_value(df[c]) for c in df.columns],
+})
+profile["unique_pct"] = (profile["unique"] / len(df) * 100).round(2)
+
+pd.set_option("display.max_rows", None)
+pd.set_option("display.width", 200)
+pd.set_option("display.max_colwidth", 60)
+print(profile.to_string(index=False))
+
+# %%
+print(profile["dtype"].value_counts().to_string())
+
+print("\nLikely identifiers (unique on every non-null row):")
+print(profile.loc[(profile["unique"] == profile["non_null"]) & (profile["non_null"] > 0), "column"].tolist())
+
+print("\nConstant columns (single value):")
+print(profile.loc[profile["unique"] == 1, "column"].tolist())
+
+print("\nMostly empty columns (>90% null):")
+print(profile.loc[profile["null_pct"] > 90, "column"].tolist())
+
+# %%
+profile.to_csv(out_dir / "column_profile.csv", index=False)
+df.head(20).to_csv(out_dir / "head_20.csv", index=False)
+print(f"Saved to {out_dir}")

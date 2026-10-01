@@ -1,0 +1,1492 @@
+# %%
+import argparse
+import ast
+import json
+import logging
+import os
+import random
+import re
+import sys
+import time
+import warnings
+from collections import Counter
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from scipy.cluster.hierarchy import fcluster, linkage
+from scipy.spatial.distance import squareform
+from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS, TfidfVectorizer
+from sklearn.manifold import TSNE
+from sklearn.metrics import adjusted_rand_score, silhouette_score
+from sklearn.model_selection import KFold
+from sklearn.neighbors import NearestNeighbors
+from sklearn.preprocessing import normalize
+
+try:
+    import igraph as ig
+except ImportError:
+    ig = None
+
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
+
+ROLE_PATTERNS = {
+    "interaction": r"^interaction_id$",
+    "cid": r"^cid$",
+    "record": r"^record_id$",
+    "log": r"^source$",
+    "L1": r"^intent$|classification\.intent$",
+    "agent": r"^agent$",
+    "function": r"^function_name$",
+    "input": r"^(input|inputs|args|arguments|parameters)$",
+    "output": r"^(output|outputs|result|response)$",
+    "error": r"^(error|errors|exception)$",
+    "messages": r"(^|\.)messages$",
+    "feedback": r"^feedback$",
+}
+USER_ROLES = {"user", "human", "humanmessage", "customer"}
+ASSISTANT_ROLES = {"assistant", "ai", "aimessage", "bot"}
+TIME_KEY = r"(^|_)(ts|timestamp|time|created_at|start_time)$"
+BLANK = {"", "none", "null", "nan", "n/a", "na", "[]", "{}"}
+MOJIBAKE = r"[Â-ô][\u0080-¿ŒœŠšŸŽžƒˆ˜–—‘-„†-•…‰‹›€™]{1,3}"
+FAILED = r"\berror\b|exception|traceback|unknown tool|['\"]status['\"]\s*:\s*[45]\d\d|\b(invalid|forbidden|unauthori[sz]ed|timed? ?out|can only be|must be|not allowed)\b"
+EMPTY = r"^\W*(none|null|nan)?\W*$|\bno (data|tickets?|records?|results?|rows?|events?|alarms?|outages?)\b|\bnot found\b|\bunavailable\b|no relevant"
+ID_VALUE = r"^(?=.*\d)[\w\-.:+]{6,}$"
+ROOT_CAUSE = r"root cause\W*(?:of[^.]*?\b(?:is|was)\b|is|was)?\W*(.{20,240}?[.!?])(?:\s|$)"
+DEVICE_KEY = r"device"
+SYSTEM_PREFIX = r"^([A-Za-z]+)-"
+NEVER_WORKS = 0.90
+BATTERY_STEP = "Standard diagnostics battery"
+RESULT_RANK = {"returned": 0, "empty": 1, "failed": 2}
+
+ALWAYS_ON_SHARE = 0.80      # used in 80%+ of cases: platform routine, not part of the case's decomposition
+NAME_AFFIX_MIN = 3          # a token that starts 3+ tool names is a naming prefix (snowflake-, nsm-, get_)
+KNN = 10
+SNN_PRUNE = 1 / 15
+RESOLUTIONS = np.round(np.arange(0.1, 2.01, 0.1), 2)
+SUBSAMPLE = 0.8
+STABILITY_TOLERANCE = 0.05
+MIN_FAMILY = 5
+D3_MIN_PARENT = 10
+D3_MIN_SIZE = 3
+D3_MAX = 6
+D3_MIN_SILHOUETTE = 0.10
+CORE_SHARE = 0.5
+HIGH, MEDIUM = 0.75, 0.50
+FOLDS = 5
+MIN_INTENT_CASES = 5      # intent clusters smaller than this are grouped as 'other intents' in charts and flagged as indicative in tables
+TOP_INTENTS = 8            # intent clusters drawn individually on the map (marker shapes)
+PERMUTATIONS = 500
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--file", default=None)
+parser.add_argument("--pattern", default="interactions_*samples*.csv")
+parser.add_argument("--map", nargs="*", default=[], help="override a column role, e.g. --map agent=agent_name")
+parser.add_argument("--runs", type=int, default=50, help="subsamples for the stability scan on the full data")
+parser.add_argument("--cv-runs", type=int, default=20, help="subsamples for the stability scan inside each validation fold")
+parser.add_argument("--seed", type=int, default=42)
+parser.add_argument("--intent", default=None, help="intent team workbook (CID, Source_Intent-L1, Intent-L2, SubIntent-L3, Likely_Theme-L4); found automatically if it sits next to the interactions file")
+args, _ = parser.parse_known_args()
+SEED = args.seed
+
+
+def locate():
+    if args.file:
+        return Path(args.file)
+    roots = [os.environ.get(k) for k in ("OneDriveCommercial", "OneDrive")]
+    here = [Path.cwd()] + ([Path(__file__).resolve().parent] if "__file__" in globals() else [])
+    dirs = [d for d in dict.fromkeys(here + [Path(r) / "Downloads" for r in roots if r] + [Path.home() / "Downloads"]) if d.is_dir()]
+    matches = [p for d in dirs for p in d.glob(args.pattern)]
+    if not matches:
+        raise FileNotFoundError(f"No file matching {args.pattern} in {dirs}")
+    return max(matches, key=lambda p: p.stat().st_mtime)
+
+
+SRC = locate()
+OUT = SRC.parent / f"{SRC.stem}_task_decomposition"
+for sub in ("charts", "diagnostics"):
+    (OUT / sub).mkdir(parents=True, exist_ok=True)
+for old in list((OUT / "charts").glob("*.png")) + list((OUT / "diagnostics").glob("*")):
+    old.unlink()
+
+log = logging.getLogger("nora_task_decomposition")
+log.setLevel(logging.INFO)
+log.handlers.clear()
+log.propagate = False
+for handler in (logging.StreamHandler(sys.stdout), logging.FileHandler(OUT / "diagnostics" / "run.log", mode="w", encoding="utf-8")):
+    handler.setFormatter(logging.Formatter("%(asctime)s | %(message)s", "%H:%M:%S"))
+    log.addHandler(handler)
+
+OVERVIEW, FINDINGS = [], []
+
+
+def section(title):
+    log.info("-" * 90)
+    log.info(title)
+
+
+def note(name, value):
+    OVERVIEW.append((name, str(value)))
+    log.info(f"   {name}: {value}")
+
+
+def finding(text):
+    FINDINGS.append(text)
+    log.info(f"   FINDING: {text}")
+
+
+def blank(v):
+    if v is None or (isinstance(v, float) and np.isnan(v)):
+        return True
+    if isinstance(v, (list, dict)):
+        return len(v) == 0
+    return isinstance(v, str) and v.strip().lower() in BLANK
+
+
+def load_json(value):
+    if not isinstance(value, str) or value.strip()[:1] not in ("[", "{"):
+        return value
+    for loader in (json.loads, ast.literal_eval):
+        try:
+            return loader(value)
+        except (ValueError, SyntaxError, TypeError, MemoryError, RecursionError):
+            continue
+    return value
+
+
+def _repair(m):
+    raw = bytearray()
+    for ch in m.group(0):
+        try:
+            raw += ch.encode("cp1252")
+        except UnicodeEncodeError:
+            if ord(ch) > 255:
+                return m.group(0)
+            raw.append(ord(ch))
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return m.group(0)
+
+
+def band(x):
+    return "n/a" if x != x else "high" if x >= HIGH else "medium" if x >= MEDIUM else "low"
+
+
+def identity(x):
+    return x
+
+
+def mode(values):
+    values = [v for v in values if not blank(v)]
+    return Counter(values).most_common(1)[0][0] if values else ""
+
+
+# %% Phase 1 - data collection
+
+section("PHASE 1  Data collection")
+t0 = time.time()
+for enc in ("utf-8", "utf-8-sig", "cp1252", "latin-1"):
+    try:
+        df = pd.read_csv(SRC, encoding=enc, low_memory=False)
+        break
+    except UnicodeDecodeError:
+        continue
+df.columns = [str(c).strip() for c in df.columns]
+TEXT_COLS = [c for c in df.columns if not pd.api.types.is_numeric_dtype(df[c])]
+COL = {r: next((c for c in df.columns if re.search(p, c, re.I)), None) for r, p in ROLE_PATTERNS.items()}
+for pair in args.map:
+    role, _, col = pair.partition("=")
+    COL[role.strip()] = col.strip()
+missing = [r for r in ("interaction", "function") if COL.get(r) not in df.columns]
+if missing:
+    raise KeyError(f"Could not find columns for {missing}; pass them with --map role=column. Columns: {list(df.columns)}")
+log.info("   column roles: " + ", ".join(f"{r}={c}" for r, c in COL.items()))
+note("Source file", f"{SRC.name} ({len(df):,} rows)")
+note("Interactions", df[COL["interaction"]].nunique())
+
+# %% Phase 2 - cleaning and preparation: every call becomes a sub-task
+
+section("PHASE 2  Cleaning and preparation: calls -> sub-tasks -> one ordered plan per interaction")
+for c in TEXT_COLS:
+    hit = df[c].astype(str).str.contains(MOJIBAKE, regex=True, na=False)
+    if hit.any():
+        df.loc[hit, c] = df.loc[hit, c].map(lambda v: re.sub(MOJIBAKE, _repair, v) if isinstance(v, str) else v)
+
+gcol = COL["interaction"]
+df[gcol] = df[gcol].astype(str)
+
+
+def as_seconds(values):
+    t = pd.to_numeric(values, errors="coerce")
+    if t.notna().sum() < 0.5 * values.notna().sum():
+        stamp = pd.to_datetime(values, errors="coerce", utc=True, format="mixed")
+        t = (stamp - stamp.min()).dt.total_seconds()
+    return t
+
+
+candidates = [(c, as_seconds(df[c])) for c in df.columns if re.search(TIME_KEY, c, re.I)]
+for c in TEXT_COLS:
+    sample = df[c].dropna().head(200).map(load_json)
+    dicts = [d for d in sample if isinstance(d, dict)]
+    key = next((k for k, _ in Counter(k for d in dicts for k in d).most_common() if re.search(TIME_KEY, str(k), re.I)), None)
+    if dicts and len(dicts) >= 0.5 * len(sample) and key:
+        parsed = df[c].map(load_json)
+        candidates.append((f"{c}.{key}", as_seconds(parsed.map(lambda d: d.get(key) if isinstance(d, dict) else None))))
+time_col, stamp = max(candidates, key=lambda x: x[1].notna().sum(), default=(None, pd.Series(np.nan, index=df.index)))
+df["_t"] = stamp
+df["_row"] = np.arange(len(df))
+df = df.sort_values([gcol, "_t", "_row"], na_position="last", kind="stable").reset_index(drop=True)
+log.info(f"   event order taken from: {time_col or 'file order'} ({df['_t'].notna().mean():.0%} of rows timestamped, file order breaks ties)")
+
+
+def outcome(err, out):
+    e, o = ("" if blank(v) else str(v) for v in (err, out))
+    if re.search(FAILED, f"{e} {o}", re.I):
+        return "failed"
+    if not e and re.search(EMPTY, o[:400], re.I):
+        return "empty"
+    return "returned"
+
+
+def targets(inp):
+    if not isinstance(inp, dict):
+        return []
+    keys = []
+    for k, v in inp.items():
+        vals = v if isinstance(v, list) else [v]
+        if any(isinstance(x, (str, int, float)) and not isinstance(x, bool) and re.match(ID_VALUE, str(x).strip()) for x in vals):
+            keys.append(re.sub(r"[^a-z0-9]", "", str(k).lower()))
+    return keys
+
+
+has_agent = df[COL["agent"]].notna() if COL.get("agent") else pd.Series(False, index=df.index)
+rows = df[df[COL["function"]].notna() | has_agent]
+calls = pd.DataFrame({
+    "interaction_id": rows[gcol].values,
+    "agent": rows[COL["agent"]].values if COL.get("agent") else np.nan,
+    "function": rows[COL["function"]].values,
+    "input": rows[COL["input"]].map(load_json).values if COL.get("input") else None,
+    "call_id": rows[COL["record"]].astype(str).values if COL.get("record") else "",
+    "log": rows[COL["log"]].astype(str).values if COL.get("log") else "calls",
+    "result": [outcome(e, o) for e, o in zip(rows[COL["error"]] if COL.get("error") else [None] * len(rows),
+                                              rows[COL["output"]] if COL.get("output") else [None] * len(rows))],
+})
+calls["agent"] = calls["agent"].where(~calls["agent"].map(blank))
+calls["function"] = calls["function"].where(~calls["function"].map(blank))
+calls["target"] = calls["input"].map(targets)
+stem = Counter(k for ks in calls["target"] for k in ks)
+calls["target"] = calls["target"].map(lambda ks: sorted({k[:-1] if k.endswith("s") and k[:-1] in stem else k for k in ks}))
+
+
+def tidy(names, protect=(), casing=None):
+    parts = {nm: re.findall(r"[A-Za-z0-9]+", nm) for nm in names}
+    lead = Counter(p[0].lower() for p in parts.values() if len(p) > 1)
+    prefixes = {t for t, k in lead.items() if k >= NAME_AFFIX_MIN} - set(protect)
+    out = {}
+    for nm, p in parts.items():
+        keep = [t for t in p if t.lower() not in prefixes and t.lower() not in ENGLISH_STOP_WORDS] or p[-1:]
+        words = [casing.get(t.lower(), t.lower()) if casing is not None else t for t in keep]
+        out[nm] = words[0][:1].upper() + words[0][1:] + (" " + " ".join(words[1:]) if len(words) > 1 else "") if words else nm
+    return out
+
+
+AGENT = tidy(sorted(calls["agent"].dropna().unique()))
+area_words = {w.lower() for v in AGENT.values() for w in v.split()}
+casing = {w.lower(): w for v in AGENT.values() for w in v.split() if w != w.lower()}
+STEP = tidy(sorted(calls["function"].dropna().unique()), protect=area_words, casing=casing)
+calls["specialist"] = calls["agent"].map(AGENT)
+calls["step"] = calls["function"].map(STEP)
+owner = calls.dropna(subset=["specialist", "step"]).groupby("step")["specialist"].agg(mode)
+spec_names = {v.lower().removesuffix(" agent"): v for v in AGENT.values()}
+
+
+def handoff(step):
+    low = str(step).lower()
+    return spec_names.get(low.removesuffix(" agent")) if low.endswith(" agent") else None
+
+
+runs_step = calls.dropna(subset=["specialist", "step"]).groupby("step")["specialist"].agg(Counter).to_dict()
+present = calls.dropna(subset=["specialist"]).groupby("interaction_id")["specialist"].agg(set).to_dict()
+for iid, st_ in zip(calls["interaction_id"], calls["step"]):
+    if handoff(st_):
+        present.setdefault(iid, set()).add(handoff(st_))
+attributed, current, last = [], {}, {}
+for iid, spec, step in zip(calls["interaction_id"], calls["specialist"], calls["step"]):
+    if isinstance(spec, str):
+        last[iid] = spec
+        attributed.append(spec)
+        continue
+    target = handoff(step)
+    if target:
+        current[iid] = target
+    here = [a for a, _ in runs_step.get(step, Counter()).most_common() if a in present.get(iid, set())]
+    attributed.append(target or (here[0] if here else None) or current.get(iid) or last.get(iid) or "unattributed")
+calls["owner"] = attributed
+calls["system"] = calls["function"].map(lambda f: re.match(SYSTEM_PREFIX, f).group(1).lower() if isinstance(f, str) and re.match(SYSTEM_PREFIX, f) else "")
+calls["kind"] = calls["step"].map(lambda st: "hand-off to specialist" if handoff(st) else "tool call")
+
+inter = df.groupby(gcol, sort=False).agg(**{r: (COL[r], "first") for r in ("cid", "L1") if COL.get(r)})
+inter.index.name = "interaction_id"
+IDS = inter.index.tolist()
+n = len(IDS)
+
+steps_df = calls.dropna(subset=["step"])
+
+
+def one_sub_task(g):
+    per_log = g.groupby("log").size()
+    main = g[g["log"] == per_log.idxmax()]
+    prefixed = [f for f in dict.fromkeys(g["function"]) if re.match(SYSTEM_PREFIX, f) and not f.lower().startswith("unknown-")]
+    systems = [x for x in dict.fromkeys(g["system"]) if x and x != "unknown"]
+    return pd.Series({"kind": g["kind"].iloc[0], "agent": mode(g["owner"]),
+                      "tool_name": prefixed[0] if prefixed else g["function"].iloc[0], "system": systems[0] if systems else "",
+                      "target": ", ".join(sorted({k for ks in g["target"] for k in ks})),
+                      "result": min(g["result"], key=RESULT_RANK.get), "calls": int(per_log.max()),
+                      "logged_in": ", ".join(sorted(per_log.index)),
+                      "call_ids": ", ".join(x for x in dict.fromkeys(main["call_id"]) if x and x != "nan")})
+
+
+sub_tasks = steps_df.groupby(["interaction_id", "step"], sort=False)[steps_df.columns.drop(["interaction_id", "step"])].apply(one_sub_task).reset_index()
+dup_share = (sub_tasks["logged_in"].str.contains(",")).mean()
+if dup_share > 0.5:
+    log.info(f"   {dup_share:.0%} of sub-tasks are logged in more than one history table; counted once (calls = the larger log's count)")
+fail_rate = steps_df.groupby("step")["result"].agg(lambda s: (s == "failed").mean())
+broken = fail_rate[fail_rate >= NEVER_WORKS].sort_values(ascending=False)
+SEQ = steps_df.groupby("interaction_id")["step"].agg(lambda s: list(dict.fromkeys(s))).reindex(IDS).map(lambda x: x if isinstance(x, list) else []).tolist()
+AGENTS = calls.dropna(subset=["specialist"]).groupby("interaction_id")["specialist"].agg(lambda s: sorted(set(s))).reindex(IDS).map(lambda x: x if isinstance(x, list) else []).tolist()
+note("Distinct tools -> readable sub-task names", f"{calls['function'].nunique()} -> {len(set(STEP.values()))}")
+note("Sub-tasks per interaction (median, all tiers)", int(np.median([len(s) for s in SEQ])))
+
+
+def turns(value, roles):
+    obj = load_json(value)
+    out = []
+    for m in obj if isinstance(obj, list) else []:
+        if isinstance(m, dict) and str(m.get("type", m.get("role", ""))).lower() in roles:
+            body = m["data"] if isinstance(m.get("data"), dict) else m
+            text = body.get("content", body.get("text", ""))
+            out.append(" ".join(t.get("text", "") if isinstance(t, dict) else str(t) for t in text) if isinstance(text, list) else str(text or ""))
+    return out
+
+
+def root_cause(texts):
+    for text in reversed(texts):
+        m = re.search(ROOT_CAUSE, re.sub(r"[#*`]+", " ", text), re.I | re.S)
+        if m:
+            cause = re.sub(r"^(the )?root cause\b[^.]*?\b(is|was|appears to be)\b\s*", "", re.sub(r"\s+", " ", m.group(1)).strip(), flags=re.I)
+            return cause[:1].upper() + cause[1:]
+    return ""
+
+
+if COL.get("messages"):
+    msgs = df[df[COL["messages"]].notna()].groupby(gcol)[COL["messages"]]
+    user = msgs.agg(lambda s: [t for v in s for t in turns(v, USER_ROLES)])
+    answers = msgs.agg(lambda s: [t for v in s for t in turns(v, ASSISTANT_ROLES)])
+    inter["problem_statement"] = [" | ".join(user.get(i, []))[:500] for i in IDS]
+    inter["root_cause"] = [root_cause(answers.get(i, [])) for i in IDS]
+DEVICE_COL = None
+if COL.get("feedback"):
+    fb = df[df[COL["feedback"]].notna()].groupby(gcol)[COL["feedback"]].first().map(load_json)
+    keys = Counter(k for d in fb if isinstance(d, dict) for k, v in d.items() if re.search(DEVICE_KEY, str(k), re.I) and not blank(v))
+    if keys:
+        key = keys.most_common(1)[0][0]
+        DEVICE_COL = f"feedback.{key}"
+        inter[DEVICE_COL] = [str(fb.get(i).get(key, "")) if isinstance(fb.get(i), dict) and not blank(fb.get(i).get(key)) else "" for i in IDS]
+if "L1" in inter and inter["L1"].nunique() == 1:
+    finding(f"L1 is '{inter['L1'].iloc[0]}' for all {n} interactions. It is carried through as given and plays no part in the decomposition.")
+
+pd.DataFrame([{"tool_name": f, "sub_task": s} for f, s in STEP.items()]).to_csv(OUT / "diagnostics" / "tool_to_sub_task.csv", index=False)
+pd.DataFrame([{"agent": a, "specialist": s} for a, s in AGENT.items()]).to_csv(OUT / "diagnostics" / "agent_names.csv", index=False)
+
+# %% Phase 3 - the decomposition model (fit on any subset, apply to any other)
+
+
+def snn_graph(Z):
+    k = min(KNN, len(Z) - 1)
+    nn = NearestNeighbors(n_neighbors=k + 1, metric="cosine").fit(Z).kneighbors(Z, return_distance=False)
+    A = np.zeros((len(Z), len(Z)))
+    A[np.repeat(np.arange(len(Z)), k + 1), nn.ravel()] = 1
+    shared = A @ A.T
+    W = shared / (2 * (k + 1) - shared)
+    W[W < SNN_PRUNE] = 0
+    np.fill_diagonal(W, 0)
+    i, j = np.nonzero(np.triu(W))
+    return list(zip(i.tolist(), j.tolist())), W[i, j].tolist()
+
+
+def communities(Z, gamma, seed):
+    edges, weights = snn_graph(Z)
+    if ig is not None:
+        random.seed(seed)
+        g = ig.Graph(n=len(Z), edges=edges)
+        return np.array(g.community_leiden("modularity", weights, gamma, 0.01, None, -1).membership)
+    import networkx as nx
+    g = nx.Graph()
+    g.add_nodes_from(range(len(Z)))
+    g.add_weighted_edges_from((a, b, w) for (a, b), w in zip(edges, weights))
+    lab = np.zeros(len(Z), dtype=int)
+    for k, members in enumerate(nx.community.louvain_communities(g, weight="weight", resolution=gamma, seed=seed)):
+        lab[list(members)] = k
+    return lab
+
+
+def families(Z, runs, seed):
+    m = len(Z)
+    rng = np.random.default_rng(seed)
+    subsets = [np.sort(rng.choice(m, max(2, int(SUBSAMPLE * m)), replace=False)) for _ in range(runs)]
+    scan, full, subs = [], {}, {}
+    for gamma in RESOLUTIONS:
+        lab = communities(Z, gamma, seed)
+        sub = [communities(Z[s], gamma, seed + r) for r, s in enumerate(subsets)]
+        ari = [adjusted_rand_score(lab[s], ls) for s, ls in zip(subsets, sub)]
+        sizes = np.bincount(lab)
+        scan.append({"resolution": gamma, "families": int((sizes >= MIN_FAMILY).sum()), "stability_mean_ari": round(float(np.mean(ari)), 4)})
+        full[gamma], subs[gamma] = lab, sub
+    scan = pd.DataFrame(scan)
+    valid = scan[scan.families >= 2]
+    if valid.empty:
+        scan["chosen"] = False
+        return np.zeros(m, dtype=int), np.ones(m), None, scan, np.zeros(m, dtype=bool)
+    near = valid[valid.stability_mean_ari >= valid.stability_mean_ari.max() - STABILITY_TOLERANCE]
+    gamma = near.sort_values(["families", "stability_mean_ari"], ascending=False).iloc[0]["resolution"]
+    scan["chosen"] = scan["resolution"] == gamma
+    lab = full[gamma].copy()
+    sizes = np.bincount(lab)
+    big = [k for k in range(len(sizes)) if sizes[k] >= MIN_FAMILY] or [int(np.argmax(sizes))]
+    rare = ~np.isin(lab, big)
+    cent = {k: normalize(Z[lab == k].mean(0, keepdims=True)).ravel() for k in big}
+    for i in np.where(~np.isin(lab, big))[0]:
+        lab[i] = max(big, key=lambda k: Z[i] @ cent[k])
+    order = [k for k, _ in Counter(lab).most_common()]
+    lab = np.array([order.index(k) for k in lab])
+    together, sampled = np.zeros((m, m)), np.zeros((m, m))
+    for s, ls in zip(subsets, subs[gamma]):
+        together[np.ix_(s, s)] += ls[:, None] == ls[None, :]
+        sampled[np.ix_(s, s)] += 1
+    co = np.where(sampled > 0, together / np.maximum(sampled, 1), np.nan)
+    conf = np.array([np.nanmean([co[i, j] for j in np.where(lab == lab[i])[0] if j != i]) if (lab == lab[i]).sum() > 1 else 1.0 for i in range(m)])
+    return lab, conf, gamma, scan, rare
+
+
+def template(member_plans):
+    count = Counter(s for p in member_plans for s in set(p))
+    core = [s for s, v in count.items() if v / max(len(member_plans), 1) >= CORE_SHARE]
+    pos = {s: np.median([p.index(s) / max(len(p) - 1, 1) for p in member_plans if s in p]) for s in core}
+    return sorted(core, key=lambda s: (pos[s], -count[s], s)), count
+
+
+def plan_tokens(p):
+    return (list(p) + [f"{a} > {b}" for a, b in zip(p, p[1:])]) or ["(no case-specific sub-tasks)"]
+
+
+def fit(idx, runs, seed=SEED):
+    idx = np.asarray(idx)
+    m = len(idx)
+    a_share = Counter(a for i in idx for a in AGENTS[i])
+    s_share = Counter(s for i in idx for s in SEQ[i])
+    routine_agents = {a for a, v in a_share.items() if v / m >= ALWAYS_ON_SHARE}
+    routine_steps = {s for s, v in s_share.items() if v / m >= ALWAYS_ON_SHARE}
+    spec = [[a for a in AGENTS[i] if a not in routine_agents] for i in idx]
+    steps = [[s for s in SEQ[i] if s not in routine_steps] for i in idx]
+
+    vec = TfidfVectorizer(analyzer=identity, lowercase=False, binary=True)
+    X = vec.fit_transform([["agent:" + a for a in sp] + ["task:" + s for s in st] or ["(none)"] for sp, st in zip(spec, steps)])
+    Z = normalize(X.toarray())
+    lab2, conf2, gamma, scan, rare = families(Z, runs, seed)
+    signature = {}
+    for k in set(lab2):
+        mem = np.where(lab2 == k)[0]
+        core_a = frozenset(a for a, v in Counter(a for i in mem for a in spec[i]).items() if v / len(mem) >= CORE_SHARE)
+        core_s = frozenset(x for x, v in Counter(x for i in mem for x in steps[i]).items() if v / len(mem) >= CORE_SHARE)
+        signature.setdefault((core_a, core_s), []).append(k)
+    remap = {k: ks[0] for ks in signature.values() for k in ks}
+    if len(set(remap.values())) < len(set(lab2)):
+        lab2 = np.array([remap[k] for k in lab2])
+        order = [k for k, _ in Counter(lab2).most_common()]
+        lab2 = np.array([order.index(k) for k in lab2])
+
+    battery = set()
+    if len(set(lab2)) > 1:
+        core_in = Counter()
+        for k in set(lab2):
+            mem = np.where(lab2 == k)[0]
+            for s, v in Counter(x for i in mem for x in set(steps[i])).items():
+                core_in[s] += v / len(mem) >= CORE_SHARE
+        battery = {s for s, c in core_in.items() if c >= max(2, int(np.ceil(len(set(lab2)) / 2)))}
+
+    def collapse(st):
+        out = []
+        for s in st:
+            s = BATTERY_STEP if s in battery else s
+            if s not in out:
+                out.append(s)
+        return out
+
+    plans = [collapse(st) for st in steps]
+    fams, lab3, sel = {}, np.empty(m, dtype=object), []
+    for k in sorted(set(lab2)):
+        mem = np.where(lab2 == k)[0]
+        work = np.array([i for i in mem if plans[i]], dtype=int)
+        empty = np.array([i for i in mem if not plans[i]], dtype=int)
+        sub, reason, fvec, D = np.zeros(len(work), dtype=int), "", None, None
+        if len(work):
+            fvec = TfidfVectorizer(analyzer=identity, lowercase=False, binary=True).fit([plan_tokens(plans[i]) for i in work])
+            Y = fvec.transform([plan_tokens(plans[i]) for i in work])
+            D = np.clip(1 - (Y @ Y.T).toarray(), 0, None)
+            np.fill_diagonal(D, 0)
+        if len(work) < D3_MIN_PARENT:
+            reason = f"only {len(work)} cases with case-specific sub-tasks"
+        elif np.allclose(D, 0):
+            reason = "every case ran the same sub-tasks"
+        else:
+            tree, best = linkage(squareform(D, checks=False), method="average"), (None, -1)
+            for kk in range(2, D3_MAX + 1):
+                cut = fcluster(tree, kk, criterion="maxclust") - 1
+                sizes = np.bincount(cut)
+                big = [c for c in range(len(sizes)) if sizes[c] >= D3_MIN_SIZE]
+                if len(big) < 2:
+                    continue
+                for i in np.where(~np.isin(cut, big))[0]:
+                    cut[i] = min(big, key=lambda c: D[i, cut == c].mean())
+                sil = silhouette_score(D, cut, metric="precomputed")
+                sel.append({"family": k, "plans": len(set(cut)), "silhouette": round(sil, 4)})
+                if sil > best[1] + 1e-9:
+                    best = (cut.copy(), sil)
+            if best[0] is None:
+                reason = "no split left two plans with 3+ cases"
+            elif best[1] < D3_MIN_SILHOUETTE:
+                reason = f"best split was weak (silhouette {best[1]:.2f})"
+            else:
+                order = [c for c, _ in Counter(best[0]).most_common()]
+                sub = np.array([order.index(c) for c in best[0]])
+        plan_list = []
+        for p in sorted(set(sub)) if len(work) else []:
+            members = work[sub == p]
+            core, _ = template([plans[i] for i in members])
+            cent = normalize(np.asarray(fvec.transform([plan_tokens(plans[i]) for i in members]).mean(0))).ravel()
+            plan_list.append({"members": members, "core": core, "centroid": cent, "empty": False})
+            lab3[members] = f"{k}.{len(plan_list) - 1}"
+        if len(empty):
+            plan_list.append({"members": empty, "core": [], "centroid": None, "empty": True})
+            lab3[empty] = f"{k}.{len(plan_list) - 1}"
+        fam_core, _ = template([plans[i] for i in mem])
+        fams[k] = {"members": mem, "plans": plan_list, "vec": fvec, "reason": reason, "core": fam_core,
+                   "centroid": normalize(Z[mem].mean(0, keepdims=True)).ravel()}
+    global_core, _ = template(plans)
+    return {"idx": idx, "routine_agents": routine_agents, "routine_steps": routine_steps, "battery": battery, "collapse": collapse,
+            "vec": vec, "Z": Z, "lab2": lab2, "conf2": conf2, "rare": rare, "gamma": gamma, "scan": scan, "fams": fams, "lab3": lab3,
+            "plans": plans, "spec": spec, "global_core": global_core, "selection": sel}
+
+
+def assign(model, idx):
+    out = []
+    for i in idx:
+        sp = [a for a in AGENTS[i] if a not in model["routine_agents"]]
+        st = [s for s in SEQ[i] if s not in model["routine_steps"]]
+        z = normalize(model["vec"].transform([["agent:" + a for a in sp] + ["task:" + s for s in st] or ["(none)"]]).toarray()).ravel()
+        k = max(model["fams"], key=lambda f: z @ model["fams"][f]["centroid"])
+        fam, plan = model["fams"][k], model["collapse"](st)
+        options = [(j, p) for j, p in enumerate(fam["plans"]) if p["empty"] == (not plan)] or list(enumerate(fam["plans"]))
+        if plan and fam["vec"] is not None and len(options) > 1:
+            y = normalize(fam["vec"].transform([plan_tokens(plan)]).toarray()).ravel()
+            j = max(options, key=lambda o: -1 if o[1]["centroid"] is None else y @ o[1]["centroid"])[0]
+        else:
+            j = options[0][0]
+        out.append((k, j, plan))
+    return out
+
+
+# %% Phase 4 - isolated validation: does the decomposition generalise to interactions it never saw?
+
+section("PHASE 4  Validation: 5-fold, every test fold kept out of every fitting step")
+
+
+def overlap(pred, actual):
+    p, a = set(pred), set(actual)
+    if not p and not a:
+        return 1.0, 1.0, 1.0
+    if not p or not a:
+        return 0.0, 0.0, 0.0
+    hit = len(p & a)
+    prec, rec = hit / len(p), hit / len(a)
+    return prec, rec, (2 * prec * rec / (prec + rec)) if hit else 0.0
+
+
+def order_agreement(pred, actual):
+    both = [s for s in pred if s in actual]
+    pairs = [(a, b) for x, a in enumerate(both) for b in both[x + 1:]]
+    return np.mean([actual.index(a) < actual.index(b) for a, b in pairs]) if pairs else np.nan
+
+
+rows_v = []
+for fold, (train, test) in enumerate(KFold(n_splits=min(FOLDS, n), shuffle=True, random_state=SEED).split(np.arange(n)), start=1):
+    model = fit(train, args.cv_runs, SEED + fold)
+    for i, (k, j, plan) in zip(test, assign(model, test)):
+        fam = model["fams"][k]
+        for level, pred in (("D2 + D3 (full decomposition)", fam["plans"][j]["core"]), ("D2 only (family template)", fam["core"]),
+                            ("Baseline: one template for all cases", model["global_core"])):
+            prec, rec, f1 = overlap(pred, plan)
+            f1_specific = overlap([x for x in pred if x != BATTERY_STEP], [x for x in plan if x != BATTERY_STEP])[2]
+            rows_v.append({"fold": fold, "interaction_id": IDS[i], "level": level, "precision": prec, "recall": rec, "f1": f1,
+                           "f1_case_specific": f1_specific, "order_agreement": order_agreement(pred, plan)})
+    log.info(f"   fold {fold}: trained on {len(train)}, tested on {len(test)} unseen interactions, {len(model['fams'])} families learnt")
+val = pd.DataFrame(rows_v)
+levels = ["D2 + D3 (full decomposition)", "D2 only (family template)", "Baseline: one template for all cases"]
+summary_v = val.groupby("level")[["precision", "recall", "f1", "f1_case_specific", "order_agreement"]].mean().reindex(levels)
+per_fold = val.groupby(["level", "fold"])["f1"].mean().unstack().reindex(levels)
+summary_v["f1_fold_sd"] = per_fold.std(axis=1)
+summary_v = summary_v.round(3).reset_index()
+log.info(f"   held-out results\n{summary_v.to_string(index=False)}")
+val.to_csv(OUT / "diagnostics" / "validation_per_interaction.csv", index=False)
+full_f1, base_f1 = summary_v.set_index("level").loc[levels[0], "f1"], summary_v.set_index("level").loc[levels[2], "f1"]
+finding(f"On interactions the model never saw, the learnt decomposition predicts which sub-tasks a case will run with F1 {full_f1:.2f}, "
+        f"against {base_f1:.2f} for a single template applied to every case.")
+
+# %% Phase 5 - final decomposition on all interactions
+
+section("PHASE 5  Decomposition on all interactions")
+ENGINE = "Leiden (igraph)" if ig is not None else "Louvain (networkx) - pip install igraph to use Leiden"
+log.info(f"   community engine: {ENGINE}")
+M = fit(np.arange(n), args.runs)
+lab2, plans = M["lab2"], M["plans"]
+if 1 < len(set(lab2)) < n:
+    note("D2 internal quality (silhouette on the case-specific work, cosine)", f"{silhouette_score(M['Z'], lab2, metric='cosine'):.2f}")
+M["scan"].to_csv(OUT / "diagnostics" / "d2_resolution_scan.csv", index=False)
+pd.DataFrame(M["selection"]).to_csv(OUT / "diagnostics" / "d3_split_selection.csv", index=False)
+log.info(f"   resolution scan\n{M['scan'].to_string(index=False)}")
+
+routine_list = sorted(M["routine_steps"])
+note("Tier 1 - routine preamble (every case)", f"{len(routine_list)} sub-tasks via {', '.join(sorted(M['routine_agents'])) or 'platform'}")
+note("Tier 2 - shared diagnostics battery (common in at least half the families)", f"{len(M['battery'])} sub-tasks: {', '.join(sorted(M['battery'])) or 'none'}")
+note("Tier 3 - case-specific sub-tasks", len({s for p in plans for s in p if s != BATTERY_STEP}))
+if M["routine_steps"]:
+    finding(f"Every interaction opens with the same {len(routine_list)} context sub-tasks. This preamble is identical whatever the case, so it is part of every "
+            "decomposition and does not distinguish one from another.")
+if M["battery"]:
+    finding(f"{len(M['battery'])} diagnostic queries are run by most cases in two or more families; they are reported as one '{BATTERY_STEP}' sub-task.")
+
+named_spec = [sorted(set(M["spec"][i]) | {h for h in map(handoff, plans[i]) if h and h not in M["routine_agents"]}) for i in range(n)]
+spec_all = Counter(a for sp in named_spec for a in sp)
+fam_share = {k: {a: v / len(f["members"]) for a, v in Counter(a for i in f["members"] for a in named_spec[i]).items()} for k, f in M["fams"].items()}
+routed = [k for k in fam_share if any(v >= CORE_SHARE for v in fam_share[k].values())]
+connectors = {a for a in spec_all if len(routed) > 1 and all(fam_share[k].get(a, 0) >= CORE_SHARE for k in routed)}
+task_all = Counter(s for p in plans for s in set(p))
+
+
+def lift_rank(shares, overall, exclude=()):
+    ranked = sorted(((x, sup, sup / (overall[x] / n)) for x, sup in shares.items() if x not in exclude), key=lambda r: (-r[1] * r[2], r[0]))
+    return [x for x, sup, lift in ranked if sup >= CORE_SHARE and lift >= 1.2]
+
+
+ROUTER = mode(calls.loc[calls["kind"] == "hand-off to specialist", "specialist"])
+not_specialists = connectors | ({ROUTER} if ROUTER else set()) | set(M["routine_agents"])
+D2, D3 = {}, {}
+for k, f in M["fams"].items():
+    mem = f["members"]
+    lead = lift_rank(fam_share[k], spec_all, connectors)[:3]
+    if not lead:
+        lead = ["No specialist routed"] if np.mean([not named_spec[i] for i in mem]) >= CORE_SHARE else ["Mixed specialists"]
+    tshare = {s: v / len(mem) for s, v in Counter(s for i in mem for s in set(plans[i])).items()}
+    signature = [t for t in lift_rank(tshare, task_all, {BATTERY_STEP}) if handoff(t) not in lead][:1]
+    if not signature and not lift_rank(tshare, task_all):
+        signature = ["no case-specific sub-tasks"] if np.mean([not plans[i] for i in mem]) >= CORE_SHARE else [BATTERY_STEP.lower() + " only"]
+    did = f"D2_{k + 1:02d}"
+    D2[k] = {"id": did, "name": " + ".join(lead) + (f" | {signature[0]}" if signature else ""), "cases": len(mem),
+             "specialists": ", ".join([f"{a} {v:.0%}" for a, v in sorted(fam_share[k].items(), key=lambda r: -r[1]) if a not in not_specialists][:4]),
+             "confidence": float(M["conf2"][mem].mean()), "template": " → ".join(f["core"])}
+    siblings = f["plans"]
+    inside = Counter(s for p in siblings for i in p["members"] for s in set(plans[i]))
+    for j, p in enumerate(siblings):
+        pm = p["members"]
+        sid = f"D3_{k + 1:02d}_{j + 1:02d}"
+        if p["empty"]:
+            name = "No case-specific sub-tasks"
+        else:
+            cnt = Counter(s for i in pm for s in set(plans[i]))
+            rest = sum(len(q["members"]) for q in siblings if not q["empty"]) - len(pm)
+            lift = {s: v / len(pm) - ((inside[s] - v) / rest if rest else task_all[s] / n) for s, v in cnt.items()}
+            ranked = [s for s in sorted(lift, key=lambda s: (-lift[s], s)) if cnt[s] / len(pm) >= CORE_SHARE]
+            key = [s for s in ranked if s != BATTERY_STEP][:2] or ranked[:1]
+            name = " + ".join(sorted(key, key=lambda s: p["core"].index(s) if s in p["core"] else 99)) or "Varied sub-tasks"
+        D3[sid] = {"id": sid, "parent": did, "name": name, "cases": len(pm), "core": p["core"],
+                   "template": " → ".join(p["core"]) or ("(routine preamble only)" if p["empty"] else "(no sub-task shared by half the cases)"),
+                   "split": len([q for q in siblings if not q["empty"]]) > 1, "reason": f["reason"], "members": pm}
+
+seen_names = Counter()
+for k, d in D2.items():
+    seen_names[d["name"]] += 1
+    if seen_names[d["name"]] > 1:
+        mem = M["fams"][k]["members"]
+        others = [i for i in range(n) if D2[lab2[i]]["name"] == d["name"] and lab2[i] != k]
+        share_in = Counter(s for i in mem for s in set(plans[i]))
+        share_out = Counter(s for i in others for s in set(plans[i]))
+        extra = sorted((s for s in share_in if s != BATTERY_STEP and share_in[s] / len(mem) >= 0.25),
+                       key=lambda s: (-(share_in[s] / len(mem) - share_out[s] / max(len(others), 1)), s))
+        d["name"] = d["name"].split(" | ")[0] + (f" | {extra[0]}" if extra else f" | variant {seen_names[d['name']]}")
+inter["D2_id"] = [D2[k]["id"] for k in lab2]
+inter["D2_name"] = [D2[k]["name"] for k in lab2]
+inter["D2_confidence"] = np.round(M["conf2"], 3)
+inter["D2_note"] = np.where(M["rare"], "rare pattern: too few similar cases for its own family, placed in the nearest one", "")
+if M["rare"].any():
+    finding(f"{int(M['rare'].sum())} interactions follow a pattern seen in fewer than {MIN_FAMILY} cases; they are placed in the nearest family and flagged in D2_note.")
+if len(broken):
+    finding(f"{len(broken)} sub-tasks fail in {NEVER_WORKS:.0%}+ of their calls, so the plans that include them never get that result: "
+            + ", ".join(f"{s} ({v:.0%})" for s, v in broken.head(8).items()) + ".")
+d3_of = {i: sid for sid, d in D3.items() for i in d["members"]}
+inter["D3_id"] = [d3_of[i] for i in range(n)]
+inter["D3_name"] = [D3[d3_of[i]]["name"] for i in range(n)]
+inter["D3_confidence"] = [round(overlap(D3[d3_of[i]]["core"], plans[i])[2], 3) for i in range(n)]
+inter["plan"] = [" → ".join(p) for p in plans]
+for d in list(D2.values()) + list(D3.values()):
+    m = inter["D2_id" if d["id"].startswith("D2") else "D3_id"] == d["id"]
+    d["confidence"] = float(inter.loc[m, "D2_confidence" if d["id"].startswith("D2") else "D3_confidence"].mean())
+    d["examples"] = inter.index[m][:3].tolist()
+for d in D2.values():
+    log.info(f"   {d['id']}  {d['cases']:>3} cases  conf {d['confidence']:.2f}  {d['name']}")
+    for s in [s for s in D3.values() if s["parent"] == d["id"]]:
+        log.info(f"      {s['id']}  {s['cases']:>3} cases  fit {s['confidence']:.2f}  {s['name']}  ::  {s['template']}")
+note("D2 decomposition families", len(D2))
+note("D3 sub-task plans", f"{len(D3)} across {len(D2)} families")
+note("Held-out F1: full decomposition / family only / single template", " / ".join(f"{v:.2f}" for v in summary_v["f1"]))
+for label, col in (("D2", "D2_confidence"), ("D3", "D3_confidence")):
+    b = inter[col].map(band).value_counts(normalize=True)
+    note(f"{label} confidence bands", ", ".join(f"{x} {b.get(x, 0):.0%}" for x in ("high", "medium", "low")))
+
+# %% Phase 6 - sub-task level labels: agent, tool, target, result, expected result
+
+section("PHASE 6  Sub-task labels")
+tier = {s: "1 routine preamble" for s in M["routine_steps"]}
+tier.update({s: "2 shared diagnostics battery" for s in M["battery"]})
+usual = sub_tasks.groupby("step")["result"].agg(lambda s: f"{s.value_counts().index[0]} ({s.value_counts(normalize=True).iloc[0]:.0%} of cases)")
+st = sub_tasks.copy()
+st["order"] = st.groupby("interaction_id").cumcount() + 1
+st["tier"] = st["step"].map(tier).fillna("3 case-specific")
+st["expected_result"] = st["step"].map(usual)
+st["as_expected"] = [r == e.split(" ")[0] for r, e in zip(st["result"], st["expected_result"])]
+pos = {i: p for p, i in enumerate(IDS)}
+st["D2_id"] = st["interaction_id"].map(lambda i: inter.at[i, "D2_id"])
+st["D3_id"] = st["interaction_id"].map(lambda i: inter.at[i, "D3_id"])
+st = st.rename(columns={"step": "sub_task"})
+sub_task_sheet = st[["interaction_id", "D2_id", "D3_id", "order", "tier", "kind", "agent", "sub_task", "tool_name", "system", "target",
+                     "result", "expected_result", "as_expected", "calls", "call_ids"]]
+
+tmpl_rows = []
+for s in D3.values():
+    mem_ids = [IDS[i] for i in s["members"]]
+    part = st[st["interaction_id"].isin(mem_ids)]
+    for o, task in enumerate(s["core"], start=1):
+        if task == BATTERY_STEP:
+            tp = part[part["sub_task"].isin(M["battery"])]
+        else:
+            tp = part[part["sub_task"] == task]
+        tmpl_rows.append({"D2_id": s["parent"], "D3_id": s["id"], "D3_name": s["name"], "order": o, "sub_task": task,
+                          "kind": mode(tp["kind"]), "agent": mode(tp["agent"]), "system": mode(tp["system"]),
+                          "tool_name": mode(tp["tool_name"]) if task != BATTERY_STEP else f"{len(M['battery'])} shared queries",
+                          "target": mode(tp["target"]),
+                          "done_by_share_of_cases": round(tp["interaction_id"].nunique() / max(len(mem_ids), 1), 2),
+                          "expected_result": f"{mode(tp['result'])} ({(tp['result'] == mode(tp['result'])).mean():.0%} of cases)" if len(tp) else ""})
+templates = pd.DataFrame(tmpl_rows)
+log.info(f"   {len(sub_task_sheet)} sub-task rows, {len(templates)} template steps")
+
+# %% Phase 7 - outputs
+
+section("PHASE 7  Outputs")
+inter = inter.reset_index()
+inter["D2_band"] = inter["D2_confidence"].map(band)
+inter["D3_band"] = inter["D3_confidence"].map(band)
+
+# how many agent calls and API function calls each interaction made
+tools_st = st[st["kind"] == "tool call"]
+hand_st = st[st["kind"].str.startswith("hand-off")]
+by_i = pd.DataFrame(index=IDS)
+by_i["api_calls"] = tools_st.groupby("interaction_id")["calls"].sum()
+by_i["distinct_apis"] = tools_st.groupby("interaction_id").size()
+by_i["apis_failed"] = tools_st[tools_st["result"] == "failed"].groupby("interaction_id").size()
+by_i["case_api_calls"] = tools_st[tools_st["tier"].str.startswith("3")].groupby("interaction_id")["calls"].sum()
+by_i["hand_offs"] = hand_st.groupby("interaction_id")["calls"].sum()
+agent_rows = calls[calls["function"].isna() & calls["specialist"].notna()]
+ACTIVATION_FALLBACK = agent_rows.empty
+if ACTIVATION_FALLBACK:
+    agent_rows = calls.dropna(subset=["specialist"]).drop_duplicates(["interaction_id", "specialist"])
+    log.info("   no agent-only rows in the log, so an agent call is counted once per agent per interaction")
+activations = agent_rows.groupby(["interaction_id", "specialist"]).size().rename("activations")
+api_by_agent = tools_st.groupby(["interaction_id", "agent"])["calls"].sum().rename("api_calls")
+api_by_agent.index.names = ["interaction_id", "specialist"]
+per_agent = pd.concat([activations, api_by_agent], axis=1).fillna(0).astype(int).reset_index()
+by_i["agent_calls"] = per_agent.groupby("interaction_id")["activations"].sum()
+by_i["agents_used"] = per_agent.groupby("interaction_id").size()
+by_i = by_i.fillna(0).astype(int)
+by_i["retries"] = by_i["api_calls"] - by_i["distinct_apis"]
+agent_breakdown = (per_agent.sort_values(["interaction_id", "activations", "api_calls"], ascending=[True, False, False])
+                   .groupby("interaction_id")[["specialist", "activations", "api_calls"]]
+                   .apply(lambda g: " · ".join(f"{r.specialist}: {r.activations} call{'' if r.activations == 1 else 's'}, {r.api_calls} APIs" for r in g.itertuples())))
+for col in by_i.columns:
+    inter[col] = inter["interaction_id"].map(by_i[col]).fillna(0).astype(int)
+inter["agent_breakdown"] = inter["interaction_id"].map(agent_breakdown).fillna("")
+note("Agent calls per interaction (median / max)", f"{int(inter['agent_calls'].median())} / {int(inter['agent_calls'].max())}")
+note("API function calls per interaction (median / max)", f"{int(inter['api_calls'].median())} / {int(inter['api_calls'].max())}")
+note("API calls that were retries of the same function (share)", f"{inter['retries'].sum() / max(inter['api_calls'].sum(), 1):.0%}")
+note("Total agent calls / API function calls in the file", f"{int(inter['agent_calls'].sum()):,} / {int(inter['api_calls'].sum()):,}")
+
+tool_tbl = tools_st.groupby("sub_task").agg(
+    tool_name=("tool_name", mode), system=("system", mode), agent=("agent", mode), tier=("tier", mode), total_calls=("calls", "sum"),
+    interactions_using=("interaction_id", "nunique"), calls_per_use=("calls", "mean"), retried_share=("calls", lambda x: (x > 1).mean()),
+    returned=("result", lambda x: (x == "returned").mean()), empty=("result", lambda x: (x == "empty").mean()),
+    failed=("result", lambda x: (x == "failed").mean()), expected_result=("expected_result", mode)).reset_index()
+tool_tbl.insert(0, "rank", tool_tbl["total_calls"].rank(ascending=False, method="first").astype(int))
+tool_tbl["share_of_interactions"] = (tool_tbl["interactions_using"] / n).round(3)
+api_counts = tool_tbl.sort_values("rank").round({"calls_per_use": 2, "retried_share": 3, "returned": 3, "empty": 3, "failed": 3})
+handoffs_in = hand_st.assign(target=hand_st["sub_task"].map(handoff)).groupby("target")["calls"].sum()
+agent_tbl = per_agent.groupby("specialist").agg(interactions_using=("interaction_id", "nunique"), agent_calls=("activations", "sum"), api_calls_by_agent=("api_calls", "sum")).reset_index()
+agent_tbl["agent_calls_per_interaction"] = (agent_tbl["agent_calls"] / agent_tbl["interactions_using"]).round(2)
+agent_tbl["api_calls_per_interaction"] = (agent_tbl["api_calls_by_agent"] / agent_tbl["interactions_using"]).round(2)
+agent_tbl["distinct_apis"] = agent_tbl["specialist"].map(tools_st.groupby("agent")["sub_task"].nunique()).fillna(0).astype(int)
+agent_tbl["hand_off_calls_received"] = agent_tbl["specialist"].map(handoffs_in).fillna(0).astype(int)
+agent_tbl["api_failed_share"] = agent_tbl["specialist"].map(tools_st.groupby("agent")["result"].agg(lambda x: (x == "failed").mean())).fillna(0).round(3)
+agent_tbl["tier"] = np.where(agent_tbl["specialist"].isin(M["routine_agents"]), "routine preamble (every case)", "case-specific")
+agent_tbl.insert(0, "share_of_interactions", (agent_tbl.pop("interactions_using") / n).round(3))
+agent_counts = agent_tbl.sort_values(["share_of_interactions", "agent_calls"], ascending=False).reset_index(drop=True)
+case_targets = st[st["tier"] == "3 case-specific"].groupby("interaction_id")["target"].agg(lambda s: ", ".join(sorted({k for v in s for k in v.split(", ") if k})))
+case_results = st[st["tier"] == "3 case-specific"].groupby("interaction_id")["result"].agg(lambda s: " / ".join(f"{k} {int((s == k).sum())}" for k in RESULT_RANK))
+inter["targets"] = inter["interaction_id"].map(case_targets).fillna("")
+inter["sub_task_results"] = inter["interaction_id"].map(case_results).fillna("")
+context = [c for c in (DEVICE_COL, "root_cause") if c and c in inter and inter[c].astype(str).str.strip().ne("").any()]
+base = ["interaction_id"] + [c for c in ("cid", "L1") if c in inter]
+decomposition = inter[base + ["D2_id", "D2_name", "D2_confidence", "D2_band", "D3_id", "D3_name", "D3_confidence", "D3_band",
+                              "plan", "targets", "sub_task_results", "D2_note"] + context].sort_values(["D2_id", "D3_id", "D3_confidence"], ascending=[True, True, False])
+
+
+
+def step_line(g):
+    out, battery_seen = [], False
+    for r in g.sort_values("order").itertuples():
+        if r.tier.startswith("1"):
+            continue
+        if r.tier.startswith("2"):
+            if not battery_seen:
+                n_q = int(g["tier"].str.startswith("2").sum())
+                out.append(f"{BATTERY_STEP} ({n_q} queries)")
+                battery_seen = True
+            continue
+        out.append(f"hand-off → {r.sub_task}" if r.kind.startswith("hand-off") else f"{r.sub_task} [{r.system or 'api'} · {r.result}]")
+    return "  →  ".join(f"{k}. {x}" for k, x in enumerate(out, start=1)) or "(routine preamble only)"
+
+
+def api_line(g):
+    tools = g[g["kind"] == "tool call"]
+    by_sys = tools["system"].replace("", "other").value_counts()
+    return f"{len(tools)} APIs: " + " · ".join(f"{k} {v}" for k, v in by_sys.items())
+
+
+seq = st.groupby("interaction_id")[st.columns.drop("interaction_id")].apply(step_line)
+apis = st.groupby("interaction_id")[st.columns.drop("interaction_id")].apply(api_line)
+spec_named = {IDS[i]: ", ".join(a for a in named_spec[i] if a not in not_specialists) or "none" for i in range(n)}
+view = pd.DataFrame({
+    "Interaction_ID": inter["interaction_id"],
+    "CID": inter["cid"] if "cid" in inter else inter["interaction_id"],
+    "User_Message": inter["problem_statement"] if "problem_statement" in inter else "",
+    "Source_Intent-L1": inter["L1"] if "L1" in inter else "",
+    "Decomposition_Family-D2": inter["D2_name"],
+    "SubTask_Plan-D3": inter["D3_name"],
+    "Specialists": inter["interaction_id"].map(spec_named),
+    "Agent_Calls": inter["agent_calls"], "Agents_Called": inter["agent_breakdown"],
+    "API_Calls": inter["api_calls"], "Distinct_APIs": inter["distinct_apis"], "Retries": inter["retries"], "APIs_Failed": inter["apis_failed"],
+    "SubTask_Sequence": inter["interaction_id"].map(seq).fillna("(routine preamble only)"),
+    "Targets": inter["targets"],
+    "APIs_Called": inter["interaction_id"].map(apis).fillna(""),
+    "SubTask_Outcome": inter["sub_task_results"],
+    "Confidence-D2/D3": inter["D2_band"] + " / " + inter["D3_band"],
+    "Root_Cause": inter["root_cause"] if "root_cause" in inter else "",
+    "_sort": inter["D2_id"] + inter["D3_id"],
+}).sort_values("_sort").drop(columns="_sort")
+
+# intent x decomposition: joined after clustering, so intent never influences the task clusters
+from scipy.stats import chi2_contingency
+from sklearn.metrics import adjusted_mutual_info_score, mutual_info_score
+
+
+def norm_key(s):
+    return s.astype(str).str.strip().str.lower()
+
+
+def find_intent_file():
+    if args.intent:
+        return Path(args.intent)
+    for folder in (SRC.parent, Path.cwd()):
+        hits = sorted(folder.glob("clustered_user_messages*.xls*")) + sorted(folder.glob("clustered_user_messages*.csv"))
+        if hits:
+            return hits[0]
+    return None
+
+
+INTENT_LEVELS = ["L1", "L2", "L3", "L4"]
+intent_file = find_intent_file()
+intent = pd.DataFrame(columns=INTENT_LEVELS)
+if intent_file is not None and intent_file.exists():
+    raw = pd.read_csv(intent_file) if intent_file.suffix == ".csv" else pd.read_excel(intent_file)
+    squashed = {re.sub(r"[^a-z0-9]", "", str(c).lower()): c for c in raw.columns}
+    cid_col = squashed.get("cid")
+    level_col = {lv: next((c for k, c in squashed.items() if k.endswith(lv.lower())), None) for lv in INTENT_LEVELS}
+    if cid_col is None:
+        log.info(f"   intent file {intent_file.name} has no CID column - skipped")
+    else:
+        intent = pd.DataFrame({"_key": norm_key(raw[cid_col])})
+        for lv in INTENT_LEVELS:
+            intent[lv] = raw[level_col[lv]].astype(str).str.strip() if level_col[lv] else ""
+        intent = intent.drop_duplicates("_key").set_index("_key")
+        log.info(f"   intent file: {intent_file.name} ({len(intent)} CIDs, levels found: {[lv for lv in INTENT_LEVELS if level_col[lv]]})")
+else:
+    log.info("   no intent workbook found - intent columns use only the L1 carried in the interaction log (pass --intent <file> to join L2-L4)")
+
+inter_key = norm_key(inter["cid"] if "cid" in inter else inter["interaction_id"])
+in_file = inter_key.isin(intent.index)
+inter_intent = pd.DataFrame({lv: inter_key.map(intent[lv]) if lv in intent else np.nan for lv in INTENT_LEVELS}, index=inter.index)
+if "L1" in inter:
+    inter_intent["L1"] = inter_intent["L1"].fillna(inter["L1"])
+matched = int(in_file.sum())
+note("Interactions matched to the intent team's workbook", f"{matched} of {n}")
+inter_intent = inter_intent.fillna("").astype(str)
+D2_by_id = {d["id"]: d for d in D2.values()}
+
+joint = pd.DataFrame({
+    "Interaction_ID": inter["interaction_id"], "CID": inter["cid"] if "cid" in inter else inter["interaction_id"],
+    "User_Message": inter["problem_statement"] if "problem_statement" in inter else "",
+    "Source_Intent-L1": inter_intent["L1"], "Intent-L2": inter_intent["L2"], "SubIntent-L3": inter_intent["L3"], "Likely_Theme-L4": inter_intent["L4"],
+    "Decomposition_Family-D2": inter["D2_name"], "D2_id": inter["D2_id"], "SubTask_Plan-D3": inter["D3_name"], "D3_id": inter["D3_id"],
+    "Specialists": inter["interaction_id"].map(spec_named),
+    "Agent_Calls": inter["agent_calls"], "Agents_Called": inter["agent_breakdown"],
+    "API_Calls": inter["api_calls"], "Distinct_APIs": inter["distinct_apis"], "Retries": inter["retries"], "APIs_Failed": inter["apis_failed"],
+    "SubTask_Sequence": inter["interaction_id"].map(seq).fillna("(routine preamble only)"),
+    "Confidence-D2/D3": inter["D2_band"] + " / " + inter["D3_band"],
+    "Intent_Source": np.where(in_file, "intent team workbook", "interaction log (L1 only)"),
+}).sort_values(["D2_id", "D3_id"])
+
+usable = [lv for lv in ("L2", "L3", "L4") if lv in intent and in_file.any() and inter_intent.loc[in_file, lv].str.strip().ne("").any()]
+INTENT_LEVEL_USED = next((lv for lv in usable if inter_intent.loc[in_file, lv].nunique() > 1), None)
+
+
+def grouped_intent(level):
+    # intent clusters with fewer than MIN_INTENT_CASES matched interactions are grouped for charts
+    v = inter_intent[level].where(in_file & inter_intent[level].str.strip().ne(""), "")
+    size = v[v != ""].value_counts()
+    small = set(size.index[size < MIN_INTENT_CASES])
+    return v.map(lambda x: "" if x == "" else ("other intents" if x in small else x))
+
+
+def entropy(counts):
+    p = np.asarray(counts, float).ravel()
+    p = p[p > 0] / p.sum()
+    return float(-(p * np.log(p)).sum())
+
+
+def association(a, b):
+    ct = pd.crosstab(a, b).values.astype(float)
+    total = ct.sum()
+    h_a, h_b, h_ab = entropy(ct.sum(1)), entropy(ct.sum(0)), entropy(ct)
+    mi = h_a + h_b - h_ab
+    r, k = ct.shape
+    phi2 = chi2_contingency(ct, correction=False)[0] / total
+    phi2c = max(0.0, phi2 - (k - 1) * (r - 1) / max(total - 1, 1))
+    rc, kc = r - (r - 1) ** 2 / max(total - 1, 1), k - (k - 1) ** 2 / max(total - 1, 1)
+    v = float(np.sqrt(phi2c / max(min(kc - 1, rc - 1), 1e-9)))
+    ca, cb = pd.factorize(a)[0], pd.factorize(b)[0]
+    rng = np.random.default_rng(SEED)
+    obs = mutual_info_score(ca, cb)
+    p = (1 + sum(mutual_info_score(ca, rng.permutation(cb)) >= obs - 1e-12 for _ in range(PERMUTATIONS))) / (1 + PERMUTATIONS)
+    return {"cramers_v_bias_corrected": round(v, 3), "adjusted_mutual_information": round(float(adjusted_mutual_info_score(ca, cb)), 3),
+            "p_value_vs_shuffled_labels": round(p, 4), "intent_explains_decomposition": round(mi / h_b, 3) if h_b else np.nan,
+            "decomposition_explains_intent": round(mi / h_a, 3) if h_a else np.nan}
+
+
+fit_rows = []
+for lv in usable:
+    sel = in_file & inter_intent[lv].str.strip().ne("")
+    for by, label in (("D2_id", "D2 family"), ("D3_id", "D3 plan")):
+        a_, b_ = inter_intent.loc[sel, lv], inter.loc[sel, by]
+        if a_.nunique() > 1 and b_.nunique() > 1:
+            fit_rows.append({"intent_level": lv, "decomposition_level": label, "interactions": int(sel.sum()), "intent_clusters": a_.nunique(),
+                             "decomposition_clusters": b_.nunique(), **association(a_, b_)})
+intent_fit = pd.DataFrame(fit_rows)
+if len(intent_fit):
+    top = intent_fit.iloc[0]
+    note(f"Association between intent {top['intent_level']} and {top['decomposition_level']}",
+         f"AMI {top['adjusted_mutual_information']:.2f}, bias-corrected Cramer's V {top['cramers_v_bias_corrected']:.2f}, p {top['p_value_vs_shuffled_labels']:.3f} "
+         f"vs shuffled labels; knowing the intent removes {top['intent_explains_decomposition']:.0%} of the uncertainty about the family")
+    finding(f"Intent {top['intent_level']} and the {top['decomposition_level']} are linked beyond chance (p {top['p_value_vs_shuffled_labels']:.3f}, adjusted mutual information "
+            f"{top['adjusted_mutual_information']:.2f}). Intent was joined after clustering, so this is measured, not built in. The part intent does not explain is where the "
+            "same request is worked in different ways, which is what the decomposition adds.")
+else:
+    finding("Intent L2-L4 could not be joined (no workbook matched, or only one intent value), so intent columns carry L1 only and no intent-to-plan mapping is reported.")
+
+
+def crosstab(level, by):
+    sel = in_file & inter_intent[level].str.strip().ne("")
+    if not sel.any():
+        return None
+    ct = pd.crosstab(inter_intent.loc[sel, level], inter.loc[sel, by])
+    out = ct.copy()
+    out.insert(0, "cases", ct.sum(axis=1))
+    out.insert(0, "intent_value", ct.index)
+    out.insert(0, "intent_level", level)
+    out["top_" + by] = ct.idxmax(axis=1).values
+    out["top_share"] = (ct.max(axis=1) / ct.sum(axis=1)).round(3).values
+    out["distinct_" + by] = (ct > 0).sum(axis=1).values
+    out["note"] = np.where(ct.sum(axis=1).values < MIN_INTENT_CASES, f"fewer than {MIN_INTENT_CASES} cases: indicative only", "")
+    return out.sort_values("cases", ascending=False).reset_index(drop=True)
+
+
+intent_x_d2 = pd.concat([t for t in (crosstab(lv, "D2_id") for lv in usable) if t is not None], ignore_index=True).fillna(0) if usable else pd.DataFrame()
+intent_x_d3 = pd.concat([t for t in (crosstab(lv, "D3_id") for lv in usable) if t is not None], ignore_index=True).fillna(0) if usable else pd.DataFrame()
+
+map_rows, mix_rows = [], []
+for lv in usable:
+    sel = in_file & inter_intent[lv].str.strip().ne("")
+    for val, grp in inter[sel].groupby(inter_intent.loc[sel, lv]):
+        i_ = grp.index
+        d2v, d3v = grp["D2_id"].value_counts(), grp["D3_id"].value_counts()
+        agents_here = Counter(a for i in i_ for a in named_spec[i] if a not in not_specialists)
+        typical = ", ".join(f"{a} {v / len(i_):.0%}" for a, v in agents_here.most_common(4) if v / len(i_) >= CORE_SHARE) or "none shared by half the cases"
+        share = d2v.iloc[0] / len(i_)
+        map_rows.append({"intent_level": lv, "intent_value": val, "cases": len(i_),
+                         "main_D2_family": f"{d2v.index[0]}  {D2_by_id[d2v.index[0]]['name']}", "main_D2_share": round(share, 3),
+                         "second_D2_family": f"{d2v.index[1]}  {D2_by_id[d2v.index[1]]['name']} ({d2v.iloc[1] / len(i_):.0%})" if len(d2v) > 1 else "",
+                         "mapping": "clear" if share >= 0.7 else "mixed" if share >= 0.5 else "diffuse",
+                         "main_D3_plan": f"{d3v.index[0]}  {D3[d3v.index[0]]['name']}", "typical_plan": D3[d3v.index[0]]["template"],
+                         "typical_specialists": typical, "avg_agent_calls": round(grp["agent_calls"].mean(), 1), "avg_api_calls": round(grp["api_calls"].mean(), 1),
+                         "avg_distinct_apis": round(grp["distinct_apis"].mean(), 1),
+                         "note": f"fewer than {MIN_INTENT_CASES} cases: indicative only" if len(i_) < MIN_INTENT_CASES else "",
+                         "example_CIDs": ", ".join(grp["cid"].astype(str).head(3)) if "cid" in grp else ""})
+intent_map = pd.DataFrame(map_rows).sort_values(["intent_level", "cases"], ascending=[True, False]) if map_rows else pd.DataFrame()
+if INTENT_LEVEL_USED:
+    sel = in_file & inter_intent[INTENT_LEVEL_USED].str.strip().ne("")
+    for did, grp in inter[sel].groupby("D2_id"):
+        mix = inter_intent.loc[grp.index, INTENT_LEVEL_USED].value_counts()
+        mix_rows.append({"D2_id": did, "D2_family": D2_by_id[did]["name"], "cases": len(grp), f"main_intent_{INTENT_LEVEL_USED}": mix.index[0],
+                         "main_intent_share": round(mix.iloc[0] / len(grp), 3), "distinct_intents": len(mix),
+                         "intent_mix": " · ".join(f"{k} {v} ({v / len(grp):.0%})" for k, v in mix.head(5).items()),
+                         "avg_agent_calls": round(grp["agent_calls"].mean(), 1), "avg_api_calls": round(grp["api_calls"].mean(), 1)})
+d2_mix = pd.DataFrame(mix_rows)
+
+
+catalogue = []
+for d in D2.values():
+    kids = [s for s in D3.values() if s["parent"] == d["id"]]
+    catalogue.append({"level": "D2", "id": d["id"], "parent": "", "name": d["name"], "cases": d["cases"], "share": round(d["cases"] / n, 3),
+                      "what_it_means": f"Cases the orchestrator decomposed towards {d['specialists'] or 'no specialist'}. Worked through {len(kids)} plan(s).",
+                      "template": d["template"], "confidence": round(d["confidence"], 3), "strength": band(d["confidence"]),
+                      "avg_agent_calls": round(inter.loc[inter["D2_id"] == d["id"], "agent_calls"].mean(), 1),
+                      "avg_api_calls": round(inter.loc[inter["D2_id"] == d["id"], "api_calls"].mean(), 1),
+                      "example_interactions": ", ".join(d["examples"])})
+    for s in kids:
+        catalogue.append({"level": "D3", "id": s["id"], "parent": d["id"], "name": s["name"], "cases": s["cases"], "share": round(s["cases"] / n, 3),
+                          "what_it_means": f"{s['cases']} cases broken down as: {s['template']}."
+                                           + (f" Different from its sibling plans in: {s['name']}." if s["split"] and s["core"] else "")
+                                           + (f" Family kept as one plan: {s['reason']}." if not s["split"] and s["reason"] and s["core"] else ""),
+                          "template": s["template"], "confidence": round(s["confidence"], 3), "strength": band(s["confidence"]),
+                          "avg_agent_calls": round(inter.loc[inter["D3_id"] == s["id"], "agent_calls"].mean(), 1),
+                          "avg_api_calls": round(inter.loc[inter["D3_id"] == s["id"], "api_calls"].mean(), 1),
+                          "example_interactions": ", ".join(s["examples"])})
+catalogue = pd.DataFrame(catalogue)
+validation = summary_v.rename(columns={"level": "decomposition level tested", "f1": "f1 (sub-tasks predicted vs run)",
+                                       "f1_case_specific": "f1 on case-specific sub-tasks only", "order_agreement": "order agreement",
+                                       "f1_fold_sd": "f1 spread across folds (sd)"})
+overview = pd.DataFrame(OVERVIEW + [("Tier 1 routine preamble (list)", ", ".join(routine_list))], columns=["item", "value"])
+findings = pd.DataFrame({"finding": FINDINGS})
+
+nested = {"source": SRC.name, "interactions": n, "L1": {k: int(v) for k, v in inter["L1"].value_counts().items()} if "L1" in inter else {},
+          "tiers": {"routine_preamble": routine_list, "shared_diagnostics_battery": sorted(M["battery"])}, "validation": summary_v.to_dict("records"), "D2": {}}
+for d in D2.values():
+    nested["D2"][d["id"]] = {"name": d["name"], "cases": d["cases"], "confidence": round(d["confidence"], 3), "specialists": d["specialists"], "D3": {}}
+    for s in [s for s in D3.values() if s["parent"] == d["id"]]:
+        nested["D2"][d["id"]]["D3"][s["id"]] = {"name": s["name"], "cases": s["cases"], "confidence": round(s["confidence"], 3),
+                                                "sub_tasks": templates[templates["D3_id"] == s["id"]].drop(columns=["D2_id", "D3_id", "D3_name"]).to_dict("records")}
+nested["interactions"] = {r.interaction_id: {"cid": getattr(r, "cid", None), "L1": getattr(r, "L1", None), "D2": r.D2_id, "D3": r.D3_id,
+                                             "sub_tasks": sub_task_sheet[sub_task_sheet["interaction_id"] == r.interaction_id]
+                                             .drop(columns=["interaction_id", "D2_id", "D3_id"]).to_dict("records")}
+                          for r in decomposition.itertuples(index=False)}
+by_id = inter.assign(_i=range(len(inter))).set_index("interaction_id")["_i"]
+for iid, rec in nested["interactions"].items():
+    row = inter_intent.iloc[by_id[iid]]
+    rec["intent"] = {lv: row[lv] for lv in INTENT_LEVELS}
+    rec["calls"] = {c: int(inter.at[by_id[iid], c]) for c in ("agent_calls", "api_calls", "distinct_apis", "retries", "apis_failed", "hand_offs")}
+    rec["agents_called"] = inter.at[by_id[iid], "agent_breakdown"]
+with open(OUT / "decomposition_dictionary.json", "w", encoding="utf-8") as fh:
+    json.dump(nested, fh, indent=2, ensure_ascii=False, default=str)
+
+# %% Phase 8 - charts
+
+section("PHASE 8  Charts")
+SERIES = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#4a3aa7", "#e34948"]
+INK, INK2, MUTED, GRID = "#1f1f1e", "#5f5e58", "#9a9990", "#e8e7e2"
+plt.rcParams.update({"font.size": 9, "axes.titlesize": 12, "axes.titlelocation": "left", "axes.titlecolor": INK,
+                     "axes.edgecolor": MUTED, "xtick.color": INK2, "ytick.color": INK2})
+PALETTE = SERIES + ["#8c6d31", "#6b6ecf", "#b5cf6b", "#d6616b", "#17becf", "#bcbd22", "#9467bd", "#7f7f7f"] + [c for c in plt.cm.tab20.colors]
+colour = {d["id"]: PALETTE[i % len(PALETTE)] for i, d in enumerate(D2.values())}
+
+
+def save(fig, path):
+    fig.savefig(path, dpi=170, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    log.info(f"   chart -> {path.relative_to(OUT)}")
+
+
+xy = TSNE(n_components=2, perplexity=max(2, min(30, (n - 1) / 3)), metric="cosine", init="pca", random_state=SEED).fit_transform(M["Z"] + 1e-9)
+xy = xy + np.random.default_rng(SEED).normal(0, 0.01 * np.ptp(xy, axis=0), xy.shape)
+fig, ax = plt.subplots(figsize=(11, 6.5))
+for d in D2.values():
+    m = (inter["D2_id"] == d["id"]).values
+    firm = m & (inter["D2_confidence"] >= MEDIUM).values
+    ax.scatter(xy[firm, 0], xy[firm, 1], s=40, c=colour[d["id"]], edgecolors="white", linewidths=1.5, label=f"{d['id']}  {d['name']}  ({d['cases']})")
+    ax.scatter(xy[m & ~firm, 0], xy[m & ~firm, 1], s=40, facecolors="white", edgecolors=colour[d["id"]], linewidths=1.5)
+    cx, cy = np.median(xy[m], axis=0)
+    ax.annotate(d["id"], (cx, cy), fontsize=8, color=INK, ha="center", va="center", bbox=dict(boxstyle="round,pad=0.25", fc="white", ec=colour[d["id"]], lw=1))
+ax.set_xticks([])
+ax.set_yticks([])
+for s in ax.spines.values():
+    s.set_color(GRID)
+ax.set_title(f"D2 decomposition families - {len(D2)} families across {n} interactions (built from specialists and sub-tasks only)")
+ax.legend(frameon=False, fontsize=8, loc="upper left", bbox_to_anchor=(1.0, 1.0), title="filled = confident, hollow = sits between families", title_fontsize=7.5)
+save(fig, OUT / "charts" / "01_D2_families.png")
+
+MARK = ["o", "s", "^", "D", "v", "P", "X", "h", "<"]
+SYS_COLOUR = {}
+
+
+def wrap(text, width):
+    words, lines, cur = str(text).split(), [], ""
+    for w in words:
+        if len(cur) + len(w) + 1 > width and cur:
+            lines.append(cur)
+            cur = w
+        else:
+            cur = (cur + " " + w).strip()
+    return "\n".join(lines + [cur])
+
+
+if INTENT_LEVEL_USED:
+    il = grouped_intent(INTENT_LEVEL_USED).values
+    order_int = [v for v in pd.Series(il)[pd.Series(il) != ""].value_counts().index]
+    named_int = [v for v in order_int if v != "other intents"][:TOP_INTENTS]
+    shape = {v: MARK[j % len(MARK)] for j, v in enumerate(named_int)}
+    shape["other intents"] = "."
+    d2_of_int = {v: pd.Series(inter["D2_id"].values[il == v]).value_counts() for v in order_int}
+
+    fig = plt.figure(figsize=(17, 9.5))
+    gs = fig.add_gridspec(1, 2, width_ratios=[2.15, 1], wspace=0.02)
+    ax, key = fig.add_subplot(gs[0]), fig.add_subplot(gs[1])
+    for d in D2.values():
+        for v in named_int + ["other intents", ""]:
+            m = ((inter["D2_id"] == d["id"]).values) & (il == v)
+            if not m.any():
+                continue
+            firm = m & (inter["D2_confidence"] >= MEDIUM).values
+            kw = dict(s=70 if v else 40, marker=shape.get(v, "o"), linewidths=1.3)
+            ax.scatter(xy[firm, 0], xy[firm, 1], c=colour[d["id"]], edgecolors="#1f1f1e", **kw)
+            ax.scatter(xy[m & ~firm, 0], xy[m & ~firm, 1], facecolors="white", edgecolors=colour[d["id"]], **kw)
+        mm = (inter["D2_id"] == d["id"]).values
+        cx, cy = np.median(xy[mm], axis=0)
+        ax.annotate(d["id"], (cx, cy), fontsize=9, fontweight="bold", color=INK, ha="center", va="center",
+                    bbox=dict(boxstyle="round,pad=0.25", fc="white", ec=colour[d["id"]], lw=1.4), zorder=5)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    for sp in ax.spines.values():
+        sp.set_color(GRID)
+    ax.set_title(f"One frame: colour = how NORA worked it (D2 family), shape = what the customer asked ({INTENT_LEVEL_USED} intent)", fontsize=12)
+    ax.text(0.01, 0.01, "Dots are placed by sub-tasks only; intent never moves a dot. t-SNE shows whether families separate, not how far apart they are.\n"
+                        "filled = confident, hollow = sits between families", transform=ax.transAxes, fontsize=8, color=INK2, va="bottom")
+
+    key.set_xlim(0, 1)
+    key.set_ylim(0, 1)
+    key.axis("off")
+    lines_total = len(D2) + len(named_int) + 1 + len(order_int) + 6
+    step_y = min(0.036, 0.97 / lines_total)
+    yy = 0.99
+
+    def head(text):
+        global yy
+        key.text(0, yy, text, fontsize=9.5, fontweight="bold", color=INK, va="top")
+        yy -= step_y * 1.15
+
+    head("DECOMPOSITION families (colour)")
+    for d in D2.values():
+        key.scatter([0.02], [yy - step_y * 0.35], s=60, c=colour[d["id"]], edgecolors="#1f1f1e", transform=key.transAxes, clip_on=False)
+        key.text(0.06, yy, f"{d['id']}  {d['name'][:44]}  ({d['cases']})", fontsize=7.8, color=INK2, va="top")
+        yy -= step_y
+    yy -= step_y * 0.6
+    head(f"INTENT clusters {INTENT_LEVEL_USED} (shape)")
+    for v in named_int + (["other intents"] if "other intents" in order_int else []):
+        key.scatter([0.02], [yy - step_y * 0.35], s=60, marker=shape[v], c="#cfcfc9", edgecolors="#1f1f1e", transform=key.transAxes, clip_on=False)
+        key.text(0.06, yy, f"{v[:40]}  ({int((il == v).sum())})", fontsize=7.8, color=INK2, va="top")
+        yy -= step_y
+    yy -= step_y * 0.6
+    head("HOW THEY RELATE: intent -> main family")
+    for v in named_int:
+        top_d2 = d2_of_int[v]
+        key.text(0.0, yy, f"{v[:26]}  ->  {top_d2.index[0]}  {top_d2.iloc[0] / top_d2.sum():.0%}  (of {int(top_d2.sum())})", fontsize=7.8, color=INK2, va="top")
+        yy -= step_y
+    save(fig, OUT / "charts" / "05_one_frame_intent_and_decomposition.png")
+
+    fig, axes = plt.subplots(1, 2, figsize=(15, 7.2))
+    for axx, labels, title in ((axes[0], il, f"What the customer asked ({INTENT_LEVEL_USED}, intent team)"),
+                               (axes[1], (inter["D2_id"] + "  " + inter["D2_name"].str[:38]).values, "How NORA worked it (D2 family)")):
+        names = pd.Series(labels).replace("", "(not matched)")
+        for j, v in enumerate(names.value_counts().index[:14]):
+            m = (names == v).values
+            axx.scatter(xy[m, 0], xy[m, 1], s=40, c=PALETTE[j % len(PALETTE)], edgecolors="white", linewidths=1.2, label=f"{v[:42]} ({m.sum()})")
+        axx.set_xticks([])
+        axx.set_yticks([])
+        axx.set_title(title, fontsize=10.5)
+        axx.legend(frameon=False, fontsize=7.5, loc="upper center", bbox_to_anchor=(0.5, -0.02), ncol=2)
+    save(fig, OUT / "charts" / "10_intent_vs_decomposition_side_by_side.png")
+
+    sel = in_file & inter_intent[INTENT_LEVEL_USED].str.strip().ne("")
+    ct = pd.crosstab(grouped_intent(INTENT_LEVEL_USED)[sel], inter.loc[sel, "D2_id"])
+    ct = ct.loc[ct.sum(axis=1).sort_values(ascending=False).index[:25]]
+    pct = ct.div(ct.sum(axis=1), axis=0)
+    fig, ax = plt.subplots(figsize=(max(6, 0.9 * ct.shape[1] + 4), 0.42 * ct.shape[0] + 2))
+    im = ax.imshow(pct.values, cmap="Blues", vmin=0, vmax=1, aspect="auto")
+    ax.set_xticks(range(ct.shape[1]), ct.columns, fontsize=8)
+    ax.set_yticks(range(ct.shape[0]), [f"{i[:40]} ({int(ct.loc[i].sum())})" for i in ct.index], fontsize=8)
+    for a_ in range(ct.shape[0]):
+        for b_ in range(ct.shape[1]):
+            if ct.values[a_, b_]:
+                ax.text(b_, a_, int(ct.values[a_, b_]), ha="center", va="center", fontsize=7.5, color="white" if pct.values[a_, b_] > 0.6 else INK)
+    ax.set_title(f"Which D2 families does each intent ({INTENT_LEVEL_USED}) use? Cell = cases, shade = share of that intent")
+    fig.colorbar(im, ax=ax, fraction=0.025, pad=0.01)
+    save(fig, OUT / "charts" / "07_intent_x_D2_heatmap.png")
+
+    from matplotlib.patches import PathPatch, Rectangle
+    from matplotlib.path import Path as MPath
+    sel = (in_file & inter_intent[INTENT_LEVEL_USED].str.strip().ne("")).values
+    flow = pd.DataFrame({"intent": il[sel], "d2": inter["D2_id"].values[sel], "d3": inter["D3_id"].values[sel]})
+    d2_order = sorted(flow["d2"].unique())
+    main_d2 = {v: d2_order.index(flow.loc[flow["intent"] == v, "d2"].value_counts().index[0]) for v in flow["intent"].unique()}
+    int_order = sorted(flow["intent"].unique(), key=lambda v: (v == "other intents", main_d2[v], -(flow["intent"] == v).sum()))
+    d3_order = sorted(flow["d3"].unique())
+
+    def layout(order, cnt, gap=0.018):
+        usable_h, total = 1 - gap * (len(order) - 1), sum(cnt[k] for k in order)
+        y_, pos = 1.0, {}
+        for k in order:
+            h = cnt[k] / total * usable_h
+            pos[k] = (y_ - h, y_)
+            y_ -= h + gap
+        return pos, usable_h / total
+
+    cols = [("intent", int_order), ("d2", d2_order), ("d3", d3_order)]
+    lay = {c: layout(o, flow[c].value_counts().to_dict()) for c, o in cols}
+    fig, ax = plt.subplots(figsize=(16, max(7, 0.42 * max(len(int_order), len(d3_order)) + 4)))
+    xs, wd = {"intent": 0.0, "d2": 0.9, "d3": 1.8}, 0.07
+    for (ca, oa), (cb, ob) in zip(cols, cols[1:]):
+        pa, sa = lay[ca]
+        pb, sb = lay[cb]
+        cur_a, cur_b = {k: pa[k][1] for k in oa}, {k: pb[k][1] for k in ob}
+        tab = pd.crosstab(flow[ca], flow[cb])
+        for ka in oa:
+            for kb in ob:
+                c_ = tab.at[ka, kb] if ka in tab.index and kb in tab.columns else 0
+                if not c_:
+                    continue
+                ha, hb = c_ * sa, c_ * sb
+                x0, x1, ya, yb, xm = xs[ca] + wd, xs[cb], cur_a[ka], cur_b[kb], (xs[ca] + wd + xs[cb]) / 2
+                verts = [(x0, ya), (xm, ya), (xm, yb), (x1, yb), (x1, yb - hb), (xm, yb - hb), (xm, ya - ha), (x0, ya - ha), (x0, ya)]
+                codes = [MPath.MOVETO] + [MPath.CURVE4] * 3 + [MPath.LINETO] + [MPath.CURVE4] * 3 + [MPath.CLOSEPOLY]
+                d2_key = kb if cb == "d2" else (ka if ca == "d2" else None)
+                if d2_key is None:
+                    d2_key = D3[kb]["parent"]
+                ax.add_patch(PathPatch(MPath(verts, codes), fc=colour[d2_key], ec="none", alpha=0.45))
+                cur_a[ka] -= ha
+                cur_b[kb] -= hb
+    for c, order in cols:
+        pos, _ = lay[c]
+        for k in order:
+            lo, hi = pos[k]
+            d2_key = k if c == "d2" else D3[k]["parent"] if c == "d3" else None
+            ax.add_patch(Rectangle((xs[c], lo), wd, hi - lo, fc="#44546a" if c == "intent" else colour[d2_key], ec="white", lw=0.8))
+            cnt_k = int((flow[c] == k).sum())
+            if c == "intent":
+                ax.text(xs[c] - 0.02, (lo + hi) / 2, f"{k[:30]}  ({cnt_k})", ha="right", va="center", fontsize=8.5, color=INK)
+            elif c == "d2":
+                ax.text(xs[c] + wd / 2, (lo + hi) / 2, wrap(f"{k}  {D2_by_id[k]['name'][:50]}  ({cnt_k})", 26), ha="center", va="center", fontsize=7.6, color=INK,
+                        bbox=dict(boxstyle="round,pad=0.25", fc="white", ec=colour[k], lw=1.2, alpha=0.95), zorder=6)
+            else:
+                ax.text(xs[c] + wd + 0.02, (lo + hi) / 2, f"{k}  {D3[k]['name'][:46]}  ({cnt_k})", ha="left", va="center", fontsize=8, color=INK2)
+    for c, label in (("intent", f"INTENT cluster ({INTENT_LEVEL_USED})\nfrom the intent team"), ("d2", "DECOMPOSITION family\n(D2)"), ("d3", "DECOMPOSITION plan\n(D3)")):
+        ax.text(xs[c] + wd / 2, 1.05, label, ha="center", va="bottom", fontsize=10, fontweight="bold", color=INK)
+    ax.set_xlim(-0.95, 2.95)
+    ax.set_ylim(-0.02, 1.16)
+    ax.axis("off")
+    ax.set_title("From what the customer asked to how NORA worked it. Band width = number of interactions", loc="left", fontsize=12, pad=14)
+    save(fig, OUT / "charts" / "08_intent_to_plan_flow.png")
+else:
+    log.info("   charts 05, 07, 08 and 10 skipped: no intent level with two or more values matched")
+
+fig, (axl, axr) = plt.subplots(1, 2, figsize=(19, 0.5 * max(len(D2), 8) + 2.5), gridspec_kw={"width_ratios": [1.3, 1], "wspace": 0.45})
+fam = inter.groupby("D2_id").agg(api=("api_calls", "mean"), agent=("agent_calls", "mean"), retry=("retries", "mean"), distinct=("distinct_apis", "mean"), cases=("interaction_id", "size"))
+for j, (did, r) in enumerate(fam.iterrows()):
+    axl.barh(j, r["api"], color=colour[did], height=0.62)
+    axl.text(r["api"] + 0.4, j, f"{r['api']:.1f} APIs ({r['distinct']:.1f} distinct, {r['retry']:.1f} retries) · {r['agent']:.1f} agent calls", va="center", fontsize=8, color=INK2)
+axl.set_yticks(range(len(fam)), [f"{i}  {D2_by_id[i]['name'][:34]} ({int(c)})" for i, c in zip(fam.index, fam["cases"])], fontsize=8)
+axl.set_xlim(0, fam["api"].max() * 2.4)
+axl.invert_yaxis()
+axl.spines[["top", "right"]].set_visible(False)
+axl.set_xlabel("average API function calls per interaction")
+axl.set_title("Calls per interaction by D2 family")
+topt = (api_counts[api_counts["tier"].str.startswith("3")] if api_counts["tier"].str.startswith("3").any() else api_counts).head(15)
+sys_list = sorted(set(topt["system"].replace("", "other")))
+for j, r in enumerate(topt.itertuples()):
+    axr.barh(j, r.total_calls, color=PALETTE[sys_list.index(r.system or "other") % len(PALETTE)], height=0.65)
+    axr.text(r.total_calls + 0.5, j, f"{int(r.total_calls)} calls · {r.interactions_using} interactions", va="center", fontsize=7.5, color=INK2)
+axr.set_yticks(range(len(topt)), [t[:44] for t in topt["sub_task"]], fontsize=8)
+axr.set_xlim(0, topt["total_calls"].max() * 1.45)
+axr.invert_yaxis()
+axr.spines[["top", "right"]].set_visible(False)
+axr.set_xlabel("total calls in the file")
+axr.set_title("Most-called case-specific API functions (routine preamble excluded; colour = system)")
+axr.legend(handles=[plt.Line2D([], [], marker="s", ls="", color=PALETTE[j % len(PALETTE)], label=sname) for j, sname in enumerate(sys_list)], frameon=False, fontsize=8, loc="lower right")
+save(fig, OUT / "charts" / "09_call_counts.png")
+
+fig, ax = plt.subplots(figsize=(11.5, 7))
+for d in D2.values():
+    for s3 in [q for q in D3.values() if q["parent"] == d["id"]]:
+        j = int(s3["id"].split("_")[-1]) - 1
+        m = np.isin(np.arange(n), s3["members"])
+        ax.scatter(xy[m, 0], xy[m, 1], s=46, c=colour[d["id"]], marker=MARK[j % len(MARK)], edgecolors="white", linewidths=1.0)
+        if m.any():
+            cx, cy = np.median(xy[m], axis=0)
+            ax.annotate(s3["id"], (cx, cy), fontsize=7.5, color=INK, ha="center", va="center", bbox=dict(boxstyle="round,pad=0.2", fc="white", ec=colour[d["id"]], lw=0.9))
+ax.legend(handles=[plt.Line2D([], [], marker="o", ls="", color=colour[d["id"]], label=f"{d['id']}  {d['name'][:46]} ({d['cases']})") for d in D2.values()],
+          frameon=False, fontsize=8, loc="upper left", bbox_to_anchor=(1.0, 1.0), title="colour = D2 family, marker shape = D3 plan", title_fontsize=7.5)
+ax.set_xticks([])
+ax.set_yticks([])
+for sp in ax.spines.values():
+    sp.set_color(GRID)
+ax.set_title("D3 plans inside each D2 family (same map as chart 01)")
+save(fig, OUT / "charts" / "06_D3_plans_map.png")
+
+rows_h, ypos, y = [], [], 0
+for d in D2.values():
+    rows_h.append(("head", d))
+    ypos.append(y)
+    y += 1
+    for s in [s for s in D3.values() if s["parent"] == d["id"]]:
+        rows_h.append(("plan", s))
+        ypos.append(y)
+        y += 1
+    y += 0.6
+fig, ax = plt.subplots(figsize=(12, 0.34 * y + 1.2))
+for (kind, d), yy in zip(rows_h, ypos):
+    if kind == "head":
+        ax.text(0, yy, f"{d['id']}  {d['name']}   ({d['cases']} cases)", fontsize=9.5, fontweight="bold", color=INK, va="center")
+    else:
+        ax.barh(yy, d["cases"], color=colour[d["parent"]], height=0.62)
+        ax.text(d["cases"] + 0.4, yy, f"{d['id']}  {d['name']}  ({d['cases']})", fontsize=8, color=INK2, va="center")
+ax.set_ylim(y, -1)
+ax.set_xlim(0, max(d["cases"] for d in D3.values()) * 2.6)
+ax.set_yticks([])
+ax.spines[["top", "right", "left"]].set_visible(False)
+ax.set_xlabel("interactions")
+ax.set_title("Decomposition hierarchy - D2 families (bold) and the D3 plans inside them")
+save(fig, OUT / "charts" / "02_decomposition_hierarchy.png")
+
+plan_ids = [s["id"] for s in D3.values()]
+cols = list(dict.fromkeys(t for s in D3.values() for t in s["core"]))
+if cols:
+    share = pd.DataFrame(0.0, index=plan_ids, columns=cols)
+    for sid in plan_ids:
+        mem = D3[sid]["members"]
+        for t in cols:
+            share.loc[sid, t] = np.mean([t in plans[i] for i in mem])
+    posn = {t: np.median([p.index(t) / max(len(p) - 1, 1) for p in plans if t in p]) for t in cols}
+    share = share[sorted(cols, key=lambda t: posn[t])]
+    fig, ax = plt.subplots(figsize=(max(7, 0.55 * share.shape[1] + 5), 0.42 * share.shape[0] + 2))
+    im = ax.imshow(share.values, cmap="Blues", vmin=0, vmax=1, aspect="auto")
+    ax.set_xticks(range(share.shape[1]), [c[:32] for c in share.columns], rotation=40, ha="right", fontsize=7.5)
+    ax.set_yticks(range(share.shape[0]), [f"{sid}  {D3[sid]['name'][:48]}" for sid in plan_ids], fontsize=7.5)
+    for a in range(share.shape[0]):
+        for b in range(share.shape[1]):
+            v = share.values[a, b]
+            if v >= 0.05:
+                ax.text(b, a, f"{v:.0%}", ha="center", va="center", fontsize=6.5, color="white" if v > 0.6 else INK)
+    for a, sid in enumerate(plan_ids[:-1]):
+        if D3[sid]["parent"] != D3[plan_ids[a + 1]]["parent"]:
+            ax.axhline(a + 0.5, color=INK2, lw=1)
+    ax.set_title("D3 plan templates - share of each plan's cases that ran each sub-task (left to right in typical order)")
+    fig.colorbar(im, ax=ax, fraction=0.025, pad=0.01)
+    save(fig, OUT / "charts" / "03_D3_plan_templates.png")
+
+fig, ax = plt.subplots(figsize=(8, 2.8))
+v = summary_v.set_index("level").reindex(levels[::-1])
+ax.barh(range(3), v["f1"], xerr=v["f1_fold_sd"], color=[MUTED, "#86b6ef", SERIES[0]], height=0.55, error_kw=dict(ecolor=INK2, lw=1, capsize=3))
+for yy, (val_, sd) in enumerate(zip(v["f1"], v["f1_fold_sd"].fillna(0))):
+    ax.text(val_ + sd + 0.03, yy, f"{val_:.2f}", va="center", fontsize=9, color=INK)
+ax.set_yticks(range(3), v.index)
+ax.set_xlim(0, 1.1)
+ax.set_xlabel("F1 on held-out interactions (sub-tasks predicted vs sub-tasks actually run)")
+ax.spines[["top", "right"]].set_visible(False)
+ax.grid(axis="x", color=GRID)
+ax.set_axisbelow(True)
+ax.set_title("Does the decomposition generalise? 5-fold, test folds never seen in fitting")
+save(fig, OUT / "charts" / "04_validation.png")
+
+# %% Phase 9 - Excel
+
+section("PHASE 9  Excel")
+from openpyxl import load_workbook
+from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
+from openpyxl.styles import Alignment, Font, PatternFill
+
+sheets = {"Decomposition_View": view, "Intent_x_Decomposition": joint,
+          **({"Intent_Map": intent_map} if len(intent_map) else {}), **({"D2_Intent_Mix": d2_mix} if len(d2_mix) else {}),
+          **({"Intent_Decomposition_Fit": intent_fit} if len(intent_fit) else {}),
+          "API_Call_Counts": api_counts, "Agent_Call_Counts": agent_counts,
+          **({"Intent_x_D2": intent_x_d2} if len(intent_x_d2) else {}), **({"Intent_x_D3": intent_x_d3} if len(intent_x_d3) else {}),
+          "Overview": overview, "Findings": findings, "Decomposition": decomposition, "Sub_Tasks": sub_task_sheet,
+          "Plan_Templates": templates, "Catalogue": catalogue, "Validation": validation}
+xlsx = OUT / f"{SRC.stem}_task_decomposition.xlsx"
+with pd.ExcelWriter(xlsx, engine="openpyxl") as xw:
+    for name, frame in sheets.items():
+        frame.map(lambda v: ILLEGAL_CHARACTERS_RE.sub("", v)[:32000] if isinstance(v, str) else v).to_excel(xw, sheet_name=name, index=False)
+fills = {"high": "D9EAD3", "clear": "D9EAD3", "mixed": "FFF2CC", "diffuse": "F4CCCC", "medium": "FFF2CC", "low": "F4CCCC", "returned": "D9EAD3", "empty": "FFF2CC", "failed": "F4CCCC"}
+wb = load_workbook(xlsx)
+for ws in wb.worksheets:
+    ws.freeze_panes = "B2"
+    ws.auto_filter.ref = ws.dimensions
+    for j, cell in enumerate(ws[1], start=1):
+        cell.font, cell.fill = Font(bold=True, color="FFFFFF"), PatternFill("solid", fgColor="1C5CAB")
+        cell.alignment = Alignment(vertical="center")
+        width = max(len(str(ws.cell(i, j).value or "")) for i in range(1, min(ws.max_row, 150) + 1))
+        ws.column_dimensions[cell.column_letter].width = max(10, min(70, width + 2))
+        if cell.value in ("D2_band", "D3_band", "strength", "result", "mapping"):
+            for i in range(2, ws.max_row + 1):
+                f = fills.get(ws.cell(i, j).value)
+                if f:
+                    ws.cell(i, j).fill = PatternFill("solid", fgColor=f)
+    if ws.title == "Intent_x_Decomposition":
+        tint = {"Source_Intent-L1": "DDEBF7", "Intent-L2": "DDEBF7", "SubIntent-L3": "DDEBF7", "Likely_Theme-L4": "DDEBF7",
+                "Decomposition_Family-D2": "E2EFDA", "D2_id": "E2EFDA", "SubTask_Plan-D3": "FFF2CC", "D3_id": "FFF2CC", "User_Message": "F2F2F2"}
+        for j, cell in enumerate(ws[1], start=1):
+            if cell.value in tint:
+                for i in range(2, ws.max_row + 1):
+                    ws.cell(i, j).fill = PatternFill("solid", fgColor=tint[cell.value])
+            if cell.value in ("User_Message", "SubTask_Sequence", "Agents_Called"):
+                ws.column_dimensions[cell.column_letter].width = 70
+    if ws.title == "Decomposition_View":
+        tint = {"Source_Intent-L1": "DDEBF7", "Decomposition_Family-D2": "E2EFDA", "SubTask_Plan-D3": "FFF2CC", "User_Message": "F2F2F2"}
+        for j, cell in enumerate(ws[1], start=1):
+            if cell.value in tint:
+                for i in range(2, ws.max_row + 1):
+                    ws.cell(i, j).fill = PatternFill("solid", fgColor=tint[cell.value])
+            if cell.value in ("User_Message", "SubTask_Sequence", "Root_Cause", "Agents_Called"):
+                ws.column_dimensions[cell.column_letter].width = 70
+    if ws.title in ("Overview", "Findings", "Catalogue", "Validation", "Intent_Map", "D2_Intent_Mix", "Intent_Decomposition_Fit"):
+        for row in ws.iter_rows(min_row=2):
+            for cell in row:
+                cell.alignment = Alignment(wrap_text=True, vertical="top")
+wb.save(xlsx)
+log.info(f"   Excel -> {xlsx.name} ({len(sheets)} sheets)")
+log.info(f"   JSON  -> decomposition_dictionary.json")
+log.info(f"Finished in {time.time() - t0:.0f}s")

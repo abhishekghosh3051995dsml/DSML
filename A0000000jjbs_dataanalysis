@@ -1,0 +1,465 @@
+# %%
+import argparse
+import ast
+import io
+import json
+import logging
+import sys
+import time
+from collections import Counter, defaultdict
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--file", default=r"C:\Datascience\interactions.csv")
+parser.add_argument("--out", default=None, help="output folder; defaults to <script folder>/<file>_data_analysis")
+parser.add_argument("--chunk", type=int, default=200_000, help="rows read at a time")
+parser.add_argument("--sample", type=int, default=2_000, help="values per column per chunk used for type checks")
+parser.add_argument("--json-docs", type=int, default=5_000, help="JSON values per column kept for structure discovery")
+parser.add_argument("--seed", type=int, default=42)
+args, _ = parser.parse_known_args()
+
+SRC = Path(args.file)
+HERE = Path(__file__).resolve().parent if "__file__" in globals() else Path.cwd()
+OUT = Path(args.out) if args.out else HERE / f"{SRC.stem}_data_analysis"
+(OUT / "charts").mkdir(parents=True, exist_ok=True)
+CLEAN = SRC.with_name(f"{SRC.stem}_clean.parquet")
+
+BLANK_TOKENS = ["", "none", "null", "nan", "n/a", "na", "[]", "{}"]
+MOJIBAKE = "[Â-ô][\u0080-¿ŒœŠšŸŽžƒˆ˜–—‘-„†-•…‰‹›€™]{1,3}"
+TRACK_LIMIT = 1_000  # distinct values kept for frequency tables; above this a column is reported as high-cardinality
+
+log = logging.getLogger("nora_data_analysis")
+log.setLevel(logging.INFO)
+log.handlers.clear()
+log.propagate = False
+for handler in (logging.StreamHandler(sys.stdout), logging.FileHandler(OUT / "run.log", mode="w", encoding="utf-8")):
+    handler.setFormatter(logging.Formatter("%(asctime)s | %(message)s", "%H:%M:%S"))
+    log.addHandler(handler)
+
+OVERVIEW = []
+
+
+def section(title):
+    log.info("-" * 90)
+    log.info(title)
+
+
+def note(name, value):
+    OVERVIEW.append((name, str(value)))
+    log.info(f"   {name}: {value}")
+
+
+def detect_encoding(path, probe=64 * 1024 * 1024):
+    with path.open("rb") as fh:
+        raw = fh.read(probe)
+    for enc in ("utf-8-sig", "cp1252"):
+        try:
+            raw.decode(enc)
+            return enc
+        except UnicodeDecodeError as e:
+            if enc == "utf-8-sig" and e.start >= len(raw) - 3:
+                return enc
+    return "latin-1"
+
+
+def read(cols=None):
+    with pd.read_csv(SRC, dtype=str, keep_default_na=False, na_filter=False, encoding=ENC, encoding_errors="replace",
+                     chunksize=args.chunk, usecols=[RAW[c] for c in cols] if cols else None) as reader:
+        for ch in reader:
+            ch.columns = [str(c).strip() for c in ch.columns]
+            yield ch
+
+
+def parse_json(value):
+    for loader in (json.loads, ast.literal_eval):
+        try:
+            return loader(value)
+        except (ValueError, SyntaxError, TypeError, MemoryError, RecursionError):
+            continue
+    return None
+
+
+def blank_mask(s):
+    return s.str.strip().str.lower().isin(BLANK_TOKENS)
+
+
+def row_hash(frame):
+    return pd.util.hash_pandas_object(frame, index=False).values
+
+
+def short(v, width=80):
+    v = str(v).replace("\n", " ")
+    return v if len(v) <= width else v[:width] + "…"
+
+
+# %% Phase 1 - data collection: what the file is and what one chunk looks like
+
+section("PHASE 1  Data collection")
+t0 = time.time()
+if not SRC.exists():
+    raise FileNotFoundError(f"{SRC} not found; pass --file <path>")
+ENC = detect_encoding(SRC)
+header = pd.read_csv(SRC, nrows=0, encoding=ENC).columns
+RAW = {str(c).strip(): c for c in header}
+COLS = list(RAW)
+if len(COLS) != len(header):
+    log.info("   WARNING: two columns share the same name after trimming spaces")
+note("File", f"{SRC} ({SRC.stat().st_size / 1024 ** 3:.2f} GB, encoding {ENC})")
+note("Columns", f"{len(COLS)}: {COLS}")
+
+first = next(read())
+buf = io.StringIO()
+first.info(buf=buf, memory_usage="deep", show_counts=True)
+log.info(f"   df.info() on the first {len(first):,} rows (everything read as text so nothing is coerced before profiling)\n{buf.getvalue()}")
+first.head(20).map(lambda v: short(v, 300)).to_csv(OUT / "01_first_rows_preview.csv", index=False)
+chunk_mem = first.memory_usage(deep=True).sum() / len(first)
+del first
+
+# %% Phase 2 - full-file profile: completeness, uniqueness, type, length, encoding damage
+
+section("PHASE 2  Profiling every column across the whole file")
+P = {c: {"n": 0, "blank": Counter(), "hashes": np.empty(0, np.uint64), "lengths": [], "sampled": 0, "num": 0, "dt": 0,
+         "boolean": 0, "json": 0, "json_ok": 0, "spaced": 0, "digit": 0, "integer": 0, "fffd": 0, "moji": 0, "top": Counter(),
+         "top_open": True, "examples": []} for c in COLS}
+JSON_DOCS = defaultdict(list)
+row_hashes, total, n_chunks = np.empty(0, np.uint64), 0, 0
+for ch in read():
+    n_chunks += 1
+    total += len(ch)
+    row_hashes = np.union1d(row_hashes, np.unique(row_hash(ch)))
+    for c in COLS:
+        p, s = P[c], ch[c].str.strip()
+        is_blank = s.str.lower().isin(BLANK_TOKENS)
+        p["blank"].update(s[is_blank].str.lower().value_counts().to_dict())
+        v = s[~is_blank]
+        if v.empty:
+            continue
+        p["n"] += len(v)
+        p["hashes"] = np.union1d(p["hashes"], np.unique(row_hash(v)))
+        p["lengths"].append(v.str.len().values.astype(np.int32))
+        p["fffd"] += int(v.str.contains("\ufffd", regex=False).sum())
+        p["moji"] += int(v.str.contains(MOJIBAKE, regex=True).sum())
+        p["json"] += int(v.str[:1].isin(["[", "{"]).sum())
+        if p["top_open"]:
+            p["top"].update(v.value_counts().to_dict())
+            if len(p["top"]) > TRACK_LIMIT:
+                p["top_open"], p["top"] = False, Counter()
+        smp = v.sample(min(args.sample, len(v)), random_state=args.seed)
+        num = pd.to_numeric(smp, errors="coerce").notna()
+        cand = smp[~num & (smp.str.len() <= 40) & smp.str.contains(r"\d")]
+        js = smp[smp.str[:1].isin(["[", "{"])]
+        p["sampled"] += len(smp)
+        p["num"] += int(num.sum())
+        p["dt"] += int(pd.to_datetime(cand, errors="coerce", utc=True, format="mixed").notna().sum()) if len(cand) else 0
+        p["boolean"] += int(smp.str.lower().isin(["true", "false"]).sum())
+        p["json_ok"] += sum(parse_json(x) is not None for x in js)
+        p["spaced"] += int(smp.str.contains(r"\s").sum())
+        p["digit"] += int(smp.str.contains(r"\d").sum())
+        p["integer"] += int(smp.str.fullmatch(r"-?\d+").sum())
+        if len(JSON_DOCS[c]) < args.json_docs and len(js):
+            JSON_DOCS[c].extend(js.head(args.json_docs - len(JSON_DOCS[c])).tolist())
+        if len(p["examples"]) < 3:
+            p["examples"] += [short(x) for x in v.drop_duplicates().head(3 - len(p["examples"]))]
+    log.info(f"   chunk {n_chunks}: {total:,} rows read")
+
+duplicates = total - len(row_hashes)
+note("Rows", f"{total:,}")
+note("Exact duplicate rows (every column identical)", f"{duplicates:,} ({duplicates / total:.2%})")
+note("Estimated memory if fully loaded as text", f"{chunk_mem * total / 1024 ** 3:.1f} GB")
+
+
+def dominant(p):
+    if p["n"] == 0:
+        return "empty"
+    shares = {k: p[k] / p["sampled"] for k in ("num", "dt", "boolean", "json_ok")}
+    name = {"num": "numeric", "dt": "datetime", "boolean": "boolean", "json_ok": "json"}
+    best = max(shares, key=shares.get)
+    if shares[best] == 1.0:
+        return name[best]
+    if shares[best] > 0:
+        return f"mixed (text + {name[best]} {shares[best]:.0%})"
+    return "text" if p["spaced"] else "text, no spaces"
+
+
+rows = []
+for i, c in enumerate(COLS):
+    p = P[c]
+    lens = np.concatenate(p["lengths"]) if p["lengths"] else np.array([0])
+    sampled = max(p["sampled"], 1)
+    rows.append({"position": i, "column": c, "non_blank": p["n"], "blank_share": round(1 - p["n"] / total, 4),
+                 "blank_tokens_found": dict(p["blank"]) if p["blank"] else "", "unique_values": len(p["hashes"]),
+                 "unique_share": round(len(p["hashes"]) / max(p["n"], 1), 4), "inferred_type": dominant(p),
+                 "numeric_share": round(p["num"] / sampled, 3), "datetime_share": round(p["dt"] / sampled, 3),
+                 "boolean_share": round(p["boolean"] / sampled, 3), "json_share": round(p["json_ok"] / sampled, 3),
+                 "has_spaces_share": round(p["spaced"] / sampled, 3), "has_digit_share": round(p["digit"] / sampled, 3), "integer_share": round(p["integer"] / sampled, 3),
+                 "len_min": int(lens.min()), "len_median": int(np.median(lens)), "len_p95": int(np.percentile(lens, 95)),
+                 "len_max": int(lens.max()), "replacement_chars": p["fffd"], "mojibake_values": p["moji"],
+                 "frequency_table": "kept" if p["top_open"] else f"over {TRACK_LIMIT} distinct", "examples": " | ".join(p["examples"])})
+profile = pd.DataFrame(rows)
+profile.to_csv(OUT / "02_column_profile.csv", index=False)
+info = profile[["column", "non_blank", "unique_values", "inferred_type"]].to_string(index=False)
+log.info(f"   full-file df.info equivalent\n{info}")
+for kind in ("empty", "numeric", "datetime", "boolean", "json"):
+    hit = profile.loc[profile["inferred_type"] == kind, "column"].tolist()
+    if hit:
+        note(f"Columns typed {kind}", hit)
+const = profile.loc[profile["unique_values"] == 1, "column"].tolist()
+if const:
+    note("Constant columns (one value in every non-blank row)", const)
+
+freq = []
+for c in COLS:
+    if P[c]["top_open"] and P[c]["top"]:
+        for val, cnt in P[c]["top"].most_common():
+            freq.append({"column": c, "value": short(val, 200), "rows": cnt, "share_of_non_blank": round(cnt / P[c]["n"], 4)})
+pd.DataFrame(freq).to_csv(OUT / "03_value_frequencies.csv", index=False)
+
+# %% Phase 3 - structure inside JSON columns: which fields exist, how often, with what values
+
+section("PHASE 3  Structure inside JSON columns")
+
+
+def walk(obj, path, out):
+    if isinstance(obj, dict):
+        out.append((path or "(root)", "object", len(obj)))
+        for k, v in obj.items():
+            walk(v, f"{path}.{k}" if path else str(k), out)
+    elif isinstance(obj, list):
+        out.append((path or "(root)", "list", len(obj)))
+        for v in obj:
+            walk(v, f"{path}[]", out)
+    else:
+        out.append((path, type(obj).__name__, obj))
+
+
+json_rows = []
+for c in [c for c in COLS if P[c]["json_ok"]]:
+    docs = [d for d in (parse_json(x) for x in JSON_DOCS[c]) if d is not None]
+    in_docs, kinds, values, sizes = Counter(), defaultdict(Counter), defaultdict(Counter), defaultdict(list)
+    for d in docs:
+        leaves = []
+        walk(d, "", leaves)
+        for path in {pth for pth, _, _ in leaves}:
+            in_docs[path] += 1
+        for path, kind, val in leaves:
+            kinds[path][kind] += 1
+            if kind in ("list", "object"):
+                sizes[path].append(val)
+            else:
+                values[path][short(val, 100)] += 1
+    for path, cnt in in_docs.most_common():
+        json_rows.append({"column": c, "path": path, "value_types": dict(kinds[path]), "docs_sampled": len(docs),
+                          "share_of_docs": round(cnt / len(docs), 4),
+                          "items_median": float(np.median(sizes[path])) if sizes[path] else "",
+                          "distinct_values_in_sample": len(values[path]) if values[path] else "",
+                          "top_values": " | ".join(f"{v} ({n})" for v, n in values[path].most_common(10))})
+    log.info(f"   {c}: {len(docs):,} documents parsed, {len(in_docs)} distinct field paths")
+json_struct = pd.DataFrame(json_rows)
+json_struct.to_csv(OUT / "04_json_structure.csv", index=False)
+
+# %% Phase 4 - identifier columns: grain of the data and how the ids nest inside each other
+
+section("PHASE 4  Identifier columns and how they nest")
+ids = profile[(profile["has_spaces_share"] == 0) & (profile["has_digit_share"] == 1) & (profile["unique_values"] > 1)
+              & ((profile["inferred_type"] == "text, no spaces") | ((profile["inferred_type"] == "numeric") & (profile["integer_share"] == 1)))]["column"].tolist()
+note("Identifier-like columns (no spaces, every value carries a digit, no decimals)", ids)
+counts = {c: pd.Series(dtype="int64") for c in ids}
+pairs = [(a, b) for k, a in enumerate(ids) for b in ids[k + 1:]]
+pair_hashes = {pr: np.empty(0, np.uint64) for pr in pairs}
+for ch in read(ids):
+    ch = ch.apply(lambda s: s.str.strip().where(~blank_mask(s)))
+    hashes = {c: row_hash(ch[c].fillna("")) for c in ids}
+    for c in ids:
+        counts[c] = counts[c].add(ch[c].dropna().value_counts(), fill_value=0)
+    for a, b in pairs:
+        both = ch[a].notna().values & ch[b].notna().values
+        combo = hashes[a][both] * np.uint64(1_000_003) ^ hashes[b][both]
+        pair_hashes[(a, b)] = np.union1d(pair_hashes[(a, b)], np.unique(combo))
+
+grain = []
+for c in ids:
+    rpv = counts[c].astype(int)
+    grain.append({"column": c, "unique_values": len(rpv), "rows_per_value_min": int(rpv.min()), "median": float(rpv.median()),
+                  "mean": round(rpv.mean(), 2), "p95": float(rpv.quantile(0.95)), "max": int(rpv.max()),
+                  "values_seen_once_share": round((rpv == 1).mean(), 4)})
+grain = pd.DataFrame(grain)
+grain.to_csv(OUT / "05_identifier_grain.csv", index=False)
+log.info(f"   rows per identifier value\n{grain.to_string(index=False)}")
+
+nest = []
+for a, b in pairs:
+    joint = len(pair_hashes[(a, b)])
+    ua, ub = len(counts[a]), len(counts[b])
+    a_to_b, b_to_a = joint == ua, joint == ub
+    relation = ("same grain (1:1)" if a_to_b and b_to_a else f"each {a} sits inside one {b}" if a_to_b
+                else f"each {b} sits inside one {a}" if b_to_a else "many-to-many")
+    nest.append({"column_a": a, "column_b": b, "unique_a": ua, "unique_b": ub, "unique_pairs": joint, "relation": relation})
+nest = pd.DataFrame(nest)
+nest.to_csv(OUT / "06_identifier_nesting.csv", index=False)
+for r in nest.itertuples():
+    log.info(f"   {r.column_a} vs {r.column_b}: {r.relation}")
+
+# %% Phase 5 - cleaning: trim, blanks to missing, encoding repair, exact duplicates out, types cast
+
+section("PHASE 5  Cleaning")
+try:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+except ImportError:
+    pa = None
+    CLEAN = SRC.with_name(f"{SRC.stem}_clean.csv")
+    log.info("   pyarrow not installed, so the cleaned file is written as CSV (pip install pyarrow for a faster Parquet copy)")
+
+
+def _repair(m):
+    raw = bytearray()
+    for ch_ in m.group(0):
+        try:
+            raw += ch_.encode("cp1252")
+        except UnicodeEncodeError:
+            if ord(ch_) > 255:
+                return m.group(0)
+            raw.append(ord(ch_))
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return m.group(0)
+
+
+kind = profile.set_index("column")["inferred_type"].to_dict()
+drop_cols = [c for c in COLS if kind[c] == "empty"]
+keep = [c for c in COLS if c not in drop_cols]
+num_cols = [c for c in keep if kind[c] == "numeric" and c not in ids]
+dt_cols = [c for c in keep if kind[c] == "datetime"]
+bool_cols = [c for c in keep if kind[c] == "boolean"]
+text_cols = [c for c in keep if c not in num_cols + dt_cols + bool_cols]
+cast_to = {**{c: "text" for c in text_cols}, **{c: "float" for c in num_cols}, **{c: "datetime (UTC)" for c in dt_cols}, **{c: "boolean" for c in bool_cols}}
+if pa is not None:
+    pa_type = {**{c: pa.string() for c in text_cols}, **{c: pa.float64() for c in num_cols},
+               **{c: pa.timestamp("ns", tz="UTC") for c in dt_cols}, **{c: pa.bool_() for c in bool_cols}}
+    schema = pa.schema([(c, pa_type[c]) for c in keep] + [("source_row", pa.int64())])
+file_time = pd.Timestamp(SRC.stat().st_mtime, unit="s", tz="UTC")
+
+stats = {c: Counter() for c in keep}
+dt_range = {c: [None, None] for c in dt_cols}
+per_day = {c: Counter() for c in dt_cols}
+numeric_values = {c: [] for c in num_cols}
+seen, offset, rows_out = np.empty(0, np.uint64), 0, 0
+writer = pq.ParquetWriter(CLEAN, schema) if pa is not None else None
+if writer is None and CLEAN.exists():
+    CLEAN.unlink()
+for ch in read():
+    ch = ch[keep].copy()
+    ch["source_row"] = np.arange(offset, offset + len(ch))
+    offset += len(ch)
+    for c in keep:
+        s = ch[c].str.strip()
+        bl = s.str.lower().isin(BLANK_TOKENS)
+        stats[c]["blank_to_missing"] += int(bl.sum())
+        s = s.where(~bl)
+        if c in text_cols:
+            hit = s.str.contains(MOJIBAKE, regex=True, na=False)
+            if hit.any():
+                fixed = s[hit].str.replace(MOJIBAKE, _repair, regex=True)
+                stats[c]["encoding_repaired"] += int((fixed != s[hit]).sum())
+                s[hit] = fixed
+        ch[c] = s
+    h = row_hash(ch[keep])
+    fresh = ~np.isin(h, seen) & ~pd.Series(h).duplicated().values
+    seen = np.union1d(seen, h)
+    ch = ch[fresh]
+    for c in num_cols:
+        before = ch[c].notna().sum()
+        ch[c] = pd.to_numeric(ch[c], errors="coerce")
+        stats[c]["failed_cast"] += int(before - ch[c].notna().sum())
+        numeric_values[c].append(ch[c].dropna().values)
+    for c in dt_cols:
+        before = ch[c].notna().sum()
+        ch[c] = pd.to_datetime(ch[c], errors="coerce", utc=True, format="mixed")
+        stats[c]["failed_cast"] += int(before - ch[c].notna().sum())
+        stats[c]["after_file_date"] += int((ch[c] > file_time).sum())
+        if ch[c].notna().any():
+            lo, hi = ch[c].min(), ch[c].max()
+            dt_range[c] = [lo if dt_range[c][0] is None else min(lo, dt_range[c][0]), hi if dt_range[c][1] is None else max(hi, dt_range[c][1])]
+            per_day[c].update(ch[c].dt.floor("D").value_counts().to_dict())
+    for c in bool_cols:
+        ch[c] = ch[c].str.lower().map({"true": True, "false": False})
+    if writer is not None:
+        writer.write_table(pa.Table.from_pandas(ch, schema=schema, preserve_index=False))
+    else:
+        ch.to_csv(CLEAN, mode="a", header=not CLEAN.exists(), index=False)
+    rows_out += len(ch)
+if writer is not None:
+    writer.close()
+
+clean_log = pd.DataFrame([{"column": c, "cast_to": cast_to[c], **stats[c],
+                           "earliest": dt_range[c][0] if c in dt_range else "", "latest": dt_range[c][1] if c in dt_range else ""}
+                          for c in keep]).fillna(0)
+clean_log.to_csv(OUT / "07_cleaning_log.csv", index=False)
+note("Columns dropped (no value in any row)", drop_cols or "none")
+note("Rows after removing exact duplicates", f"{rows_out:,} of {total:,}")
+note("Cleaned file", f"{CLEAN} ({CLEAN.stat().st_size / 1024 ** 3:.2f} GB)")
+for c in dt_cols:
+    note(f"{c} range", f"{dt_range[c][0]} to {dt_range[c][1]}, {stats[c]['failed_cast']:,} unparseable, {stats[c]['after_file_date']:,} later than the file itself")
+
+# %% Phase 6 - descriptive summaries
+
+section("PHASE 6  Descriptive summaries")
+num_summary = pd.DataFrame([{"column": c, **pd.Series(np.concatenate(v) if v else []).describe(percentiles=[.05, .25, .5, .75, .95]).round(3).to_dict()}
+                            for c, v in numeric_values.items()])
+num_summary.to_csv(OUT / "08_numeric_summary.csv", index=False)
+if len(num_summary):
+    log.info(f"\n{num_summary.to_string(index=False)}")
+pd.DataFrame(OVERVIEW, columns=["item", "value"]).to_csv(OUT / "00_overview.csv", index=False)
+
+# %% Phase 7 - charts
+
+section("PHASE 7  Charts")
+INK, INK2, BAR, GRID = "#1f1f1e", "#5f5e58", "#2a78d6", "#e8e7e2"
+plt.rcParams.update({"font.size": 9, "axes.titlesize": 11, "axes.titlelocation": "left", "axes.titlecolor": INK,
+                     "xtick.color": INK2, "ytick.color": INK2})
+
+
+def save(fig, name):
+    fig.savefig(OUT / "charts" / name, dpi=160, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    log.info(f"   chart -> charts/{name}")
+
+
+pr = profile.sort_values("blank_share")
+fig, ax = plt.subplots(figsize=(9, 0.28 * len(pr) + 1.5))
+ax.barh(range(len(pr)), pr["blank_share"], color=BAR, height=0.65)
+for j, v in enumerate(pr["blank_share"]):
+    ax.text(v + 0.01, j, f"{v:.0%}", va="center", fontsize=7.5, color=INK2)
+ax.set_yticks(range(len(pr)), pr["column"], fontsize=8)
+ax.set_xlim(0, 1.1)
+ax.spines[["top", "right"]].set_visible(False)
+ax.set_xlabel("share of rows blank")
+ax.set_title(f"How complete each column is ({total:,} rows)")
+save(fig, "01_blank_share_by_column.png")
+
+if ids:
+    fig, axes = plt.subplots(1, len(ids), figsize=(4.2 * len(ids), 3.4), squeeze=False)
+    for ax, c in zip(axes[0], ids):
+        rpv = counts[c].astype(int)
+        ax.hist(rpv, bins=min(60, max(10, rpv.nunique())), color=BAR)
+        ax.set_yscale("log")
+        ax.set_title(f"rows per {c}\n({len(rpv):,} values, median {rpv.median():.0f})", fontsize=9)
+        ax.spines[["top", "right"]].set_visible(False)
+    save(fig, "02_rows_per_identifier.png")
+
+for c in dt_cols:
+    if per_day[c]:
+        days = pd.Series(per_day[c]).sort_index()
+        fig, ax = plt.subplots(figsize=(10, 3))
+        ax.bar(days.index, days.values, color=BAR, width=0.9)
+        ax.spines[["top", "right"]].set_visible(False)
+        ax.set_ylabel("rows")
+        ax.set_title(f"Rows per day by {c}")
+        save(fig, f"03_rows_per_day_{c}.png")
+
+log.info(f"Finished in {time.time() - t0:.0f}s. Outputs in {OUT}")

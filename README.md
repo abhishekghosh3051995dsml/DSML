@@ -4,3 +4,7 @@ python -m pip install igraph --index-url https://pypi.org/simple --trusted-host 
 
 ######
 python ".\nora_data_analysis_v1.py" --file "C:\Datascience\interactions.csv" --out ".\interactions_data_analysis"
+
+
+##
+python .\nora_task_decomposition_phase1_.py --file "C:\Datascience\interactions_clean.parquet"

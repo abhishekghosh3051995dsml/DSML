@@ -8,3 +8,7 @@ python ".\nora_data_analysis_v1.py" --file "C:\Datascience\interactions.csv" --o
 
 ##
 python .\nora_task_decomposition_phase1_.py --file "C:\Datascience\interactions_clean.parquet"
+
+
+##
+python .\nora_task_decomposition_phase_02.py --file "C:\Datascience\interactions_clean.parquet" --out ".\task_decomposition_v5"

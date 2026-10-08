@@ -12,3 +12,10 @@ python .\nora_task_decomposition_phase1_.py --file "C:\Datascience\interactions_
 
 ##
 python .\nora_task_decomposition_phase_02.py --file "C:\Datascience\interactions_clean.parquet" --out ".\task_decomposition_v5"
+
+
+####
+
+python .\nora_knowledge_graph_v2.py
+start .\task_decomposition_v7\nora_knowledge_graph.html
+

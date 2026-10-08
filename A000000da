@@ -1,0 +1,64 @@
+# NORA row-count check: original file -> clean file -> calls -> cases
+# Read-only. It changes no file. Run:  python .\nora_row_count_check.py
+import argparse
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+p = argparse.ArgumentParser()
+p.add_argument("--raw", default=r"C:\Datascience\interactions.csv")
+p.add_argument("--clean", default=r"C:\Datascience\interactions_clean.parquet")
+p.add_argument("--chunk", type=int, default=200_000)
+args = p.parse_args()
+
+RAW, CLEAN = Path(args.raw), Path(args.clean)
+BLANK = {"", "none", "null", "nan", "n/a", "na", "[]", "{}"}
+
+
+def encoding(path):
+    raw = path.open("rb").read(64 * 1024 * 1024)
+    for enc in ("utf-8-sig", "cp1252"):
+        try:
+            raw.decode(enc)
+            return enc
+        except UnicodeDecodeError as e:
+            if enc == "utf-8-sig" and e.start >= len(raw) - 3:
+                return enc
+    return "latin-1"
+
+
+# 1. original file: count every row, and every row that is a 100% copy of an earlier row
+print(f"Reading {RAW} ...")
+rows, seen, exact_dupes = 0, set(), 0
+with pd.read_csv(RAW, dtype=str, keep_default_na=False, na_filter=False, encoding=encoding(RAW),
+                 encoding_errors="replace", chunksize=args.chunk) as reader:
+    for ch in reader:
+        ch = ch.apply(lambda s: s.str.strip())                      # same trimming as the data-analysis step
+        ch = ch.apply(lambda s: s.where(~s.str.lower().isin(BLANK), ""))
+        h = pd.util.hash_pandas_object(ch, index=False).values
+        for x in h:
+            if x in seen:
+                exact_dupes += 1
+            else:
+                seen.add(x)
+        rows += len(ch)
+        print(f"   {rows:,} rows read")
+print()
+print(f"A. Rows in the original file (interactions.csv)      : {rows:,}")
+print(f"B. Rows that are 100% copies of another row          : {exact_dupes:,}")
+print(f"C. Expected clean rows (A - B)                       : {rows - exact_dupes:,}")
+
+# 2. clean file
+cols = ["interaction_id", "function_name", "source"]
+df = pd.read_parquet(CLEAN, columns=cols) if CLEAN.suffix == ".parquet" else pd.read_csv(CLEAN, usecols=cols, dtype=str)
+named = df["function_name"].astype("string").str.strip().fillna("").ne("")
+print(f"D. Rows in the clean file (interactions_clean)       : {len(df):,}   (should equal C)")
+print(f"E. Rows that are not calls (no tool name)            : {int((~named).sum()):,}")
+print(f"F. Call rows (D - E)                                 : {int(named.sum()):,}")
+print(f"   Call rows per log table                           : " +
+      ", ".join(f"{k} {v:,}" for k, v in df.loc[named, "source"].value_counts().items()))
+print(f"G. Interactions (cases)                              : {df['interaction_id'].nunique():,}")
+print()
+print("Next in the decomposition script: F minus the same call written in two log tables = real calls (124,417),")
+print("grouped by interaction_id = cases.")

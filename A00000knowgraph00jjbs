@@ -1,0 +1,636 @@
+# NORA knowledge graph v1 - built 100% from the v7.2 decomposition outputs
+#
+#   Reads  : nora_task_decomposition_v7_2.xlsx            (Classes, Task_Plan, Interactions, API_Catalog)
+#            nora_task_decomposition_v7_2_validation.xlsx (Handoff_Test, Handoff_Tasks, DAG_Edges, Accuracy_by_Class)
+#   Builds : a NetworkX graph  Class -> Hand-off -> Agent -> Task -> API -> System, plus "then" arrows of the task DAG
+#   Writes : nora_knowledge_graph.html          interactive page (network view, plan explorer, optional 3D view), works offline
+#            nora_knowledge_graph.graphml       for NetworkX / Gephi / JanusGraph (TinkerPop GraphML: labelV / labelE)
+#            nora_kg_nodes.csv, nora_kg_edges.csv
+#            load_into_janusgraph.groovy        Gremlin console script + example queries
+#
+#   Nothing is typed in by hand: every node, link and number comes from the two Excel files.
+#   Run:  python nora_knowledge_graph_v1.py
+#         python nora_knowledge_graph_v1.py --main <path to main xlsx> --validation <path to validation xlsx> --out <folder>
+
+import argparse
+import json
+import math
+import re
+import sys
+from collections import defaultdict
+from pathlib import Path
+
+import pandas as pd
+
+try:
+    import networkx as nx
+except ImportError:
+    sys.exit("networkx is missing: run  pip install networkx  and try again")
+
+p = argparse.ArgumentParser()
+p.add_argument("--main", default="nora_task_decomposition_v7_2.xlsx")
+p.add_argument("--validation", default="nora_task_decomposition_v7_2_validation.xlsx")
+p.add_argument("--out", default=None, help="output folder (default: the folder of the main workbook)")
+p.add_argument("--seed", type=int, default=42)
+args = p.parse_args()
+
+HERE = Path(__file__).resolve().parent
+
+
+def find(name):
+    for c in (Path(name), Path.cwd() / name, HERE / name, Path.cwd() / "outputs" / name, HERE / "outputs" / name):
+        if c.exists():
+            return c
+    sys.exit(f"cannot find {name}; pass it with --main / --validation")
+
+
+MAIN, VAL = find(args.main), find(args.validation)
+OUT = Path(args.out) if args.out else MAIN.parent
+OUT.mkdir(parents=True, exist_ok=True)
+print(f"main workbook       : {MAIN}")
+print(f"validation workbook : {VAL}")
+
+M = pd.read_excel(MAIN, sheet_name=None, dtype=object)
+V = pd.read_excel(VAL, sheet_name=None, dtype=object)
+for need in ("Classes", "Task_Plan", "API_Catalog"):
+    if need not in M:
+        sys.exit(f"sheet {need} not found in {MAIN.name}")
+
+SEP = " · "
+NONE_PREFIX = "No hand-off"
+
+
+def s(v):
+    return "" if v is None or (isinstance(v, float) and pd.isna(v)) else str(v).strip()
+
+
+def num(v):
+    try:
+        f = float(v)
+        return None if pd.isna(f) else f
+    except (TypeError, ValueError):
+        return None
+
+
+def col(df, *names):
+    """First column whose name starts with any of `names` (tolerates renamed / shortened headers)."""
+    for n in names:
+        for c in df.columns:
+            if str(c).strip().lower().startswith(n.lower()):
+                return c
+    return None
+
+
+def split_task(t):
+    agent, _, api = s(t).partition(SEP)
+    return agent.strip(), api.strip()
+
+
+G = nx.MultiDiGraph()
+TYPE_LABEL = {"class": "Class", "plan": "Plan", "handoff": "Hand-off", "agent": "Agent", "task": "Task", "api": "API", "system": "System"}
+
+
+def add_node(nid, ntype, label, **attrs):
+    if nid in G:
+        G.nodes[nid].update({k: v for k, v in attrs.items() if v not in (None, "")})
+    else:
+        G.add_node(nid, type=ntype, labelV=TYPE_LABEL[ntype], label=label, **{k: v for k, v in attrs.items() if v not in (None, "")})
+
+
+def add_edge(a, b, rel, **attrs):
+    G.add_edge(a, b, key=f"{rel}:{len(G)}:{G.number_of_edges()}", rel=rel, labelE=rel,
+               **{k: v for k, v in attrs.items() if v not in (None, "")})
+
+
+# ---------- hand-offs (validation: Handoff_Test) ----------
+HANDOFF = {}
+ht = V.get("Handoff_Test")
+if ht is not None and len(ht):
+    c_t, c_a, c_nd, c_nn, c_v = (col(ht, "Hand-off call"), col(ht, "Specialist agent"), col(ht, "Interactions handed"),
+                                 col(ht, "Interactions not handed"), col(ht, "Verdict"))
+    c_st, c_sw, c_so, c_sp = (col(ht, "Strongest task") , col(ht, "Strongest task: ran when handed"),
+                              col(ht, "Strongest task: ran when not"), col(ht, "Strongest task: p-value"))
+    c_fold = col(ht, "Same verdict")
+    for _, r in ht.iterrows():
+        t = s(r[c_t])
+        if not t:
+            continue
+        HANDOFF[t] = {"agent": s(r[c_a]), "verdict": s(r[c_v]), "handed": num(r[c_nd]), "not_handed": num(r[c_nn]),
+                      "strongest_task": s(r[c_st]) if c_st else "", "ran_when_handed": num(r[c_sw]) if c_sw else None,
+                      "ran_when_not": num(r[c_so]) if c_so else None, "p_value_bh": s(r[c_sp]) if c_sp else "",
+                      "same_verdict_in_folds": s(r[c_fold]) if c_fold else ""}
+
+# hand-off calls also appear as tasks with System = 'hand-off'
+cat = M["API_Catalog"]
+c_ag, c_api, c_sys, c_lay, c_int, c_calls = (col(cat, "Agent"), col(cat, "API"), col(cat, "System"), col(cat, "Layer"),
+                                              col(cat, "Interactions using"), col(cat, "Calls"))
+for _, r in cat.iterrows():
+    if s(r[c_sys]).lower() == "hand-off" and s(r[c_api]) not in HANDOFF:
+        HANDOFF[s(r[c_api])] = {"agent": "", "verdict": s(r[c_lay])}
+
+
+def task_id(task):
+    agent, api = split_task(task)
+    return f"handoff:{api}" if api in HANDOFF else f"task:{agent}{SEP}{api}"
+
+
+for t, h in HANDOFF.items():
+    brings = h.get("verdict", "").lower().startswith("brings")
+    add_node(f"handoff:{t}", "handoff", t, brings_specialist_work="yes" if brings else "no", **{k: v for k, v in h.items() if k != "agent"},
+             specialist_agent=h.get("agent", ""))
+    if h.get("agent"):
+        add_node(f"agent:{h['agent']}", "agent", h["agent"])
+        add_edge(f"handoff:{t}", f"agent:{h['agent']}", "ACTIVATES")
+
+# ---------- agents, tasks, APIs, systems (API_Catalog) ----------
+for _, r in cat.iterrows():
+    agent, api, system, layer = s(r[c_ag]), s(r[c_api]), s(r[c_sys]) or "not recorded", s(r[c_lay])
+    inter, calls = num(r[c_int]), num(r[c_calls])
+    if not api:
+        continue
+    add_node(f"agent:{agent}", "agent", agent)
+    G.nodes[f"agent:{agent}"]["calls"] = G.nodes[f"agent:{agent}"].get("calls", 0) + (calls or 0)
+    if api in HANDOFF:                                   # the boss passing work to an expert
+        hid = f"handoff:{api}"
+        add_node(hid, "handoff", api, interactions=inter, calls=calls, layer=layer)
+        add_edge(f"agent:{agent}", hid, "HANDS_OFF", calls=calls, interactions=inter)
+        continue
+    tid = f"task:{agent}{SEP}{api}"
+    add_node(tid, "task", api, agent=agent, api=api, system=system, layer=layer, interactions=inter, calls=calls)
+    add_node(f"api:{api}", "api", api)
+    G.nodes[f"api:{api}"]["calls"] = G.nodes[f"api:{api}"].get("calls", 0) + (calls or 0)
+    add_node(f"system:{system}", "system", system)
+    G.nodes[f"system:{system}"]["calls"] = G.nodes[f"system:{system}"].get("calls", 0) + (calls or 0)
+    add_edge(f"agent:{agent}", tid, "PERFORMS", calls=calls, interactions=inter)
+    if not G.has_edge(tid, f"api:{api}"):
+        add_edge(tid, f"api:{api}", "CALLS")
+    if not G.has_edge(f"api:{api}", f"system:{system}"):
+        add_edge(f"api:{api}", f"system:{system}", "ON_SYSTEM")
+
+# ---------- plans and stages (Task_Plan) ----------
+tp = M["Task_Plan"]
+c_plan, c_stage, c_task, c_tsys, c_after = (col(tp, "Plan"), col(tp, "Stage"), col(tp, "Task"), col(tp, "System"), col(tp, "Runs after"))
+PLANS = {}                         # plan name -> {"handoff": name or None, "stages": {stage: [node ids]}, "edges": []}
+for _, r in tp.iterrows():
+    pname, task = s(r[c_plan]), s(r[c_task])
+    if not pname or not task:
+        continue
+    stage = int(num(r[c_stage]) or 1)
+    nid = task_id(task)
+    if nid not in G:                                     # a plan task missing from the catalog: add it from the plan row
+        agent, api = split_task(task)
+        add_node(nid, "task", api, agent=agent, api=api, system=s(r[c_tsys]))
+    is_std = pname.lower().startswith("standard")
+    ho = None if is_std else re.sub(r"\s*sub-plan\s*$", "", pname).strip()
+    pl = PLANS.setdefault(pname, {"handoff": ho, "stages": defaultdict(list), "after": {}, "edges": []})
+    pl["stages"][stage].append(nid)
+    pl["after"][nid] = s(r[c_after])
+    if is_std:
+        add_node("plan:standard", "plan", "Standard plan", description="Runs in every interaction")
+        add_edge("plan:standard", nid, "INCLUDES", stage=stage)
+        G.nodes[nid]["standard_stage"] = stage
+    elif ho and nid != f"handoff:{ho}":
+        add_edge(f"handoff:{ho}", nid, "BRINGS", stage=stage)
+        G.nodes[nid]["sub_plan"] = ho
+
+# "then" arrows of the DAG: DAG_Edges (exact names and statistics); fallback = 'Runs after' text
+de = V.get("DAG_Edges")
+if de is not None and len(de):
+    cp, cf, ct = col(de, "Plan"), col(de, "From task"), col(de, "To task")
+    cdep, cq, cboth, cfirst = col(de, "Dependency"), col(de, "p-value"), col(de, "Traces with both"), col(de, "From came first")
+    for _, r in de.iterrows():
+        pname, a, b = s(r[cp]), task_id(r[cf]), task_id(r[ct])
+        if pname in PLANS and a in G and b in G:
+            dep = num(r[cdep])
+            PLANS[pname]["edges"].append([a, b, dep])
+            add_edge(a, b, "THEN", plan=pname, dependency=dep, p_value_bh=s(r[cq]), cases_with_both=num(r[cboth]),
+                     from_came_first=num(r[cfirst]))
+else:
+    for pname, pl in PLANS.items():
+        for b, after in pl["after"].items():
+            if after and after.lower() != "start":
+                for a_txt in after.split(", "):
+                    a = task_id(a_txt)
+                    if a in G:
+                        pl["edges"].append([a, b, None])
+                        add_edge(a, b, "THEN", plan=pname)
+
+# evidence on BRINGS links: Handoff_Tasks
+hts = V.get("Handoff_Tasks")
+if hts is not None and len(hts):
+    ch, ctk, cw, co, cq, cd = (col(hts, "Hand-off call"), col(hts, "Task"), col(hts, "Ran when handed"), col(hts, "Ran when not"),
+                               col(hts, "p-value"), col(hts, "Runs only after"))
+    for _, r in hts.iterrows():
+        hid, tid = f"handoff:{s(r[ch])}", task_id(r[ctk])
+        if hid in G and tid in G and G.has_edge(hid, tid):
+            for k, e in G[hid][tid].items():
+                if e["rel"] == "BRINGS":
+                    e.update(ran_when_handed=num(r[cw]), ran_when_not=num(r[co]), p_value_bh=s(r[cq]))
+
+# ---------- classes (Classes + Interactions + Accuracy_by_Class) ----------
+cl = M["Classes"]
+c_cls, c_spec, c_n, c_tasks, c_dec = (col(cl, "Class"), col(cl, "Specialists"), col(cl, "Interactions"),
+                                      col(cl, "Tasks in executable"), col(cl, "Decomposition"))
+c_med = col(cl, "Tool calls (median)")
+approved = defaultdict(int)
+it = M.get("Interactions")
+if it is not None and len(it):
+    ci, ca = col(it, "Class"), col(it, "Approved")
+    if ci and ca:
+        for k, v in it.groupby(it[ci].map(s))[ca].apply(lambda x: (x.map(s).str.lower() == "yes").sum()).items():
+            approved[k] = int(v)
+acc = {}
+ab = V.get("Accuracy_by_Class")
+if ab is not None and len(ab):
+    for _, r in ab.iterrows():
+        acc[s(r[col(ab, "Class")])] = {"task_f1_unseen": num(r[col(ab, "Task F1")]),
+                                       "specialist_f1_unseen": num(r[col(ab, "Specialist task F1")]),
+                                       "baseline_task_f1_unseen": num(r[col(ab, "Baseline task F1")])}
+CLASSES = []
+for _, r in cl.iterrows():
+    cname, spec = s(r[c_cls]), s(r[c_spec])
+    if not cname:
+        continue
+    dec = s(r[c_dec]) if c_dec else ""
+    hos = [] if spec.startswith(NONE_PREFIX) else [h.strip() for h in spec.split(" + ") if h.strip()]
+    hos = sorted(hos, key=lambda h: (dec.find(h) if h in dec else 10 ** 6, h))   # order seen in the class (Decomposition column)
+    cid = f"class:{cname}"
+    add_node(cid, "class", cname, specialists_handed_work=spec, interactions=num(r[c_n]), tasks_in_plan=num(r[c_tasks]) if c_tasks else None,
+             tool_calls_median=num(r[c_med]) if c_med else None, approved_traces=approved.get(cname, 0), **acc.get(cname, {}))
+    if "plan:standard" in G:
+        add_edge(cid, "plan:standard", "RUNS_PLAN", interactions=num(r[c_n]))
+    for order, h in enumerate(hos, start=1):
+        if f"handoff:{h}" not in G:
+            add_node(f"handoff:{h}", "handoff", h)
+        add_edge(cid, f"handoff:{h}", "HANDS_OFF_TO", order=order, interactions=num(r[c_n]))
+    CLASSES.append({"id": cid, "name": cname, "spec": spec, "handoffs": hos, "n": num(r[c_n]), "tasks": num(r[c_tasks]) if c_tasks else None,
+                    "median_calls": num(r[c_med]) if c_med else None, "approved": approved.get(cname, 0), **acc.get(cname, {})})
+
+# ---------- layout (NetworkX, deterministic) ----------
+U = nx.Graph()
+U.add_nodes_from(G.nodes)
+for a, b, e in G.edges(data=True):
+    if e["rel"] != "THEN":
+        U.add_edge(a, b)
+pos = nx.spring_layout(U, seed=args.seed, iterations=300, k=1.6 / max(1, len(U)) ** 0.5)
+xs = [v[0] for v in pos.values()] or [0]
+ys = [v[1] for v in pos.values()] or [0]
+span = max(max(xs) - min(xs), max(ys) - min(ys)) or 1
+
+
+def size_of(n, d):
+    w = d.get("interactions") or d.get("calls") or 1
+    base = {"class": 4, "plan": 12, "handoff": 6, "agent": 6, "task": 2.5, "api": 2.5, "system": 8}[d["type"]]
+    return round(base + 2.2 * math.log10(1 + float(w or 0)), 1)
+
+
+nodes = []
+for n, d in G.nodes(data=True):
+    attrs = {k: v for k, v in d.items() if k not in ("type", "label", "labelV")}
+    nodes.append({"id": n, "type": d["type"], "label": d["label"], "size": size_of(n, d),
+                  "x": round((pos[n][0] - min(xs)) / span * 2000 - 1000, 1), "y": round((pos[n][1] - min(ys)) / span * 2000 - 1000, 1),
+                  "a": attrs})
+edges = [{"s": a, "t": b, "rel": e["rel"], "a": {k: v for k, v in e.items() if k not in ("rel", "labelE")}} for a, b, e in G.edges(data=True)]
+plans = {name: {"handoff": pl["handoff"], "stages": [pl["stages"][k] for k in sorted(pl["stages"])], "edges": pl["edges"]}
+         for name, pl in PLANS.items()}
+counts = defaultdict(int)
+for _, d in G.nodes(data=True):
+    counts[d["type"]] += 1
+rel_counts = defaultdict(int)
+for _, _, e in G.edges(data=True):
+    rel_counts[e["rel"]] += 1
+DATA = {"nodes": nodes, "edges": edges, "classes": CLASSES, "plans": plans, "counts": counts, "rels": rel_counts,
+        "source": {"main": MAIN.name, "validation": VAL.name}}
+
+# ---------- exports ----------
+GG = nx.MultiDiGraph()
+for n, d in G.nodes(data=True):
+    GG.add_node(n, **{k: (v if isinstance(v, (int, float, str)) else str(v)) for k, v in d.items() if v is not None})
+for a, b, k, e in G.edges(keys=True, data=True):
+    GG.add_edge(a, b, key=k, **{kk: (v if isinstance(v, (int, float, str)) else str(v)) for kk, v in e.items() if v is not None})
+nx.write_graphml(GG, OUT / "nora_knowledge_graph.graphml")
+pd.DataFrame([{"id": n, **d} for n, d in G.nodes(data=True)]).to_csv(OUT / "nora_kg_nodes.csv", index=False)
+pd.DataFrame([{"from": a, "to": b, **e} for a, b, e in G.edges(data=True)]).to_csv(OUT / "nora_kg_edges.csv", index=False)
+(OUT / "load_into_janusgraph.groovy").write_text("""// Load the NORA knowledge graph into JanusGraph (Gremlin console).
+// Put nora_knowledge_graph.graphml next to the console, then:  :load load_into_janusgraph.groovy
+graph = JanusGraphFactory.open('conf/janusgraph-inmemory.properties')   // or your berkeleyje / cassandra properties file
+graph.io(IoCore.graphml()).readGraph('nora_knowledge_graph.graphml')   // vertex label = labelV, edge label = labelE
+graph.tx().commit()
+g = graph.traversal()
+
+// What is in the graph
+g.V().groupCount().by(label)
+g.E().groupCount().by(label)
+
+// The executable plan of one class: its hand-offs, the expert agent and the tasks each hand-off brings
+g.V().has('label', 'Class 02').out('HANDS_OFF_TO').as('handoff').out('BRINGS').as('task').select('handoff', 'task').by('label')
+
+// Who calls an API, and in how many interactions
+g.V().has('label', 'get_device_details').hasLabel('API').in('CALLS').project('task', 'agent', 'interactions').by('label').by('agent').by('interactions')
+
+// The order of the standard plan: every 'then' arrow with its dependency score
+g.E().hasLabel('THEN').has('plan', 'Standard (every interaction)').project('from', 'to', 'dependency').by(outV().values('label')).by(inV().values('label')).by('dependency')
+""", encoding="utf-8")
+
+
+# ---------- the page (one self-contained HTML file, no internet needed except for the optional 3D view) ----------
+TEMPLATE = r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>NORA Knowledge Graph</title>
+<style>
+:root{--bg:#0b1020;--panel:#121a30;--panel2:#18223d;--line:#26314f;--text:#e6ebf5;--muted:#93a0bd;--accent:#4cc9f0;
+--c-class:#ff5d73;--c-plan:#ffd166;--c-handoff:#ffa62b;--c-agent:#4cc9f0;--c-task:#9b8cff;--c-api:#6ee7b7;--c-system:#f1f5f9;}
+*{box-sizing:border-box}html,body{margin:0;height:100%;background:var(--bg);color:var(--text);font:13px/1.45 "Segoe UI",system-ui,Arial,sans-serif}
+header{display:flex;align-items:center;gap:14px;padding:8px 14px;border-bottom:1px solid var(--line);background:#0d142a;flex-wrap:wrap}
+header h1{font-size:15px;margin:0;font-weight:650;letter-spacing:.2px}header .src{color:var(--muted);font-size:11.5px}
+.tabs{display:flex;gap:4px;margin-left:auto;flex-wrap:wrap}.tabs button{background:transparent;color:var(--muted);border:1px solid var(--line);padding:5px 11px;border-radius:7px;cursor:pointer;font:inherit}
+.tabs button.on{background:var(--accent);color:#06121f;border-color:var(--accent);font-weight:600}
+main{display:flex;height:calc(100% - 46px)}
+#side{width:250px;min-width:250px;border-right:1px solid var(--line);background:var(--panel);overflow:auto;padding:10px 12px}
+#stage{flex:1;position:relative;overflow:hidden}
+#info{width:340px;min-width:340px;border-left:1px solid var(--line);background:var(--panel);overflow:auto;padding:12px 14px}
+h3{font-size:11.5px;text-transform:uppercase;letter-spacing:.7px;color:var(--muted);margin:14px 0 6px}
+.row{display:flex;align-items:center;gap:7px;margin:3px 0;cursor:pointer;user-select:none}.row input{margin:0}
+.dot{width:11px;height:11px;border-radius:50%;display:inline-block;flex:none}.cnt{margin-left:auto;color:var(--muted);font-size:11.5px}
+input[type=text],select{width:100%;background:var(--panel2);color:var(--text);border:1px solid var(--line);border-radius:7px;padding:6px 8px;font:inherit}
+.btn{background:var(--panel2);color:var(--text);border:1px solid var(--line);border-radius:7px;padding:5px 9px;cursor:pointer;font:inherit;margin:3px 3px 0 0}
+.btn:hover{border-color:var(--accent)}
+canvas{display:block;width:100%;height:100%;cursor:grab}
+#tip{position:absolute;pointer-events:none;background:#0f1730ee;border:1px solid var(--line);padding:5px 8px;border-radius:7px;font-size:12px;display:none;max-width:360px}
+.chip{display:inline-block;padding:1px 7px;border-radius:10px;font-size:11px;font-weight:600;color:#08111f}
+#info h2{font-size:15px;margin:4px 0 6px;word-break:break-word}
+table.kv{width:100%;border-collapse:collapse;font-size:12px;margin-bottom:6px}table.kv td{padding:3px 4px;border-bottom:1px solid var(--line);vertical-align:top}
+table.kv td:first-child{color:var(--muted);width:44%}
+.lnk{color:var(--accent);cursor:pointer;text-decoration:none}.lnk:hover{text-decoration:underline}
+.relh{margin:10px 0 3px;font-weight:600;font-size:12px}.relh span{color:var(--muted);font-weight:400}
+ul.nb{margin:0;padding-left:16px}ul.nb li{margin:1px 0;font-size:12px;word-break:break-word}
+.muted{color:var(--muted)}.hint{color:var(--muted);font-size:12px}
+#planwrap{position:absolute;inset:0;overflow:auto;padding:14px}
+.kpis{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px}.kpi{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:8px 12px;min-width:110px}
+.kpi b{display:block;font-size:18px}.kpi span{color:var(--muted);font-size:11.5px}
+.lane{background:var(--panel);border:1px solid var(--line);border-radius:12px;margin-bottom:14px;padding:10px 12px;overflow-x:auto}
+.lane h4{margin:0 0 4px;font-size:13.5px}.lane .ev{color:var(--muted);font-size:12px;margin-bottom:6px}
+svg text{font-family:"Segoe UI",system-ui,Arial,sans-serif}
+#guide{position:absolute;inset:0;overflow:auto;padding:18px 26px;max-width:980px}
+#guide table{border-collapse:collapse;width:100%;margin:6px 0 14px}#guide th,#guide td{border-bottom:1px solid var(--line);padding:5px 8px;text-align:left;vertical-align:top}
+#guide th{color:var(--muted);font-weight:600}
+#g3d{position:absolute;inset:0}#msg3d{position:absolute;left:20px;top:20px;max-width:520px}
+@media (max-width:900px){#side{display:none}#info{width:260px;min-width:260px}}
+</style></head><body>
+<header><h1>NORA Knowledge Graph</h1><span class="src" id="src"></span>
+<div class="tabs"><button data-v="net" class="on">Network</button><button data-v="plan">Plan explorer</button><button data-v="3d">3D view</button><button data-v="guide">How to read</button></div></header>
+<main>
+<aside id="side">
+ <h3>Find</h3><input id="q" type="text" list="names" placeholder="Search a class, agent, API…"><datalist id="names"></datalist>
+ <h3>Follow one class</h3><select id="clsSel"></select>
+ <div><button class="btn" id="reset">Reset view</button><button class="btn" id="lbl">Labels: auto</button></div>
+ <h3>Show nodes</h3><div id="typeBox"></div>
+ <h3>Show links</h3><div id="relBox"></div>
+ <h3>Layout</h3><select id="layoutSel"><option value="layered">Layered: class → hand-off → agent → task → API → system</option><option value="force">Force (organic network)</option></select>
+ <h3>Tasks coloured by</h3><select id="colorBy"><option value="type">Node type</option><option value="layer">Layer (Standard / Specialist / …)</option><option value="system">System</option></select>
+ <p class="hint">Scroll to zoom, drag the background to move, drag a node to place it. Click a node to see everything linked to it.</p>
+</aside>
+<section id="stage">
+ <canvas id="cv"></canvas><div id="tip"></div>
+ <div id="planwrap" style="display:none"></div>
+ <div id="g3d" style="display:none"></div><div id="msg3d" class="hint" style="display:none"></div>
+ <div id="guide" style="display:none"></div>
+</section>
+<aside id="info"><p class="hint">Click any node, or pick a class on the left.</p></aside>
+</main>
+<script>
+const DATA = /*__DATA__*/null;
+const TYPES = {class:["Class","--c-class"],plan:["Plan","--c-plan"],handoff:["Hand-off","--c-handoff"],agent:["Agent","--c-agent"],task:["Task (agent · API)","--c-task"],api:["API","--c-api"],system:["System","--c-system"]};
+const RELS = {HANDS_OFF_TO:"class → hand-off",RUNS_PLAN:"class → standard plan",INCLUDES:"standard plan → task",HANDS_OFF:"boss agent → hand-off",ACTIVATES:"hand-off → expert agent",BRINGS:"hand-off → task it brings",PERFORMS:"agent → task",CALLS:"task → API",ON_SYSTEM:"API → system",THEN:"task → next task (DAG order)"};
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const COL = Object.fromEntries(Object.entries(TYPES).map(([k,v])=>[k,css(v[1])]));
+const PALETTE = ["#9b8cff","#ff5d73","#ffa62b","#6ee7b7","#4cc9f0","#f472b6","#facc15","#94a3b8","#a3e635","#fb7185"];
+const byId = new Map(DATA.nodes.map(n=>[n.id,n]));
+const out = new Map(), inn = new Map();
+DATA.edges.forEach(e=>{(out.get(e.s)||out.set(e.s,[]).get(e.s)).push(e);(inn.get(e.t)||inn.set(e.t,[]).get(e.t)).push(e);});
+document.getElementById("src").textContent = `built from ${DATA.source.main} + ${DATA.source.validation} · ${DATA.nodes.length} nodes · ${DATA.edges.length} links`;
+const esc = s => String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const fmt = (k,v) => { if(v===null||v===undefined||v==="") return "";
+  if(typeof v==="number"){ if(/ran_when|f1/.test(k) && v<=1) return (v*100).toFixed(1)+"%"; if(/dependency/.test(k)) return v.toFixed(3);
+    return Number.isInteger(v)? v.toLocaleString(): (Math.abs(v)<10? v.toFixed(2): Math.round(v).toLocaleString()); } return String(v); };
+const nice = k => k.replace(/_/g," ").replace(/\bbh\b/i,"(BH)").replace(/^./,c=>c.toUpperCase());
+
+/* ---------- categorical colours for layer / system ---------- */
+function catColors(attr){ const vals=[...new Set(DATA.nodes.filter(n=>n.type==="task").map(n=>n.a[attr]||"not recorded"))].sort(); return Object.fromEntries(vals.map((v,i)=>[v,PALETTE[i%PALETTE.length]])); }
+const LAYERC = catColors("layer"), SYSC = catColors("system");
+let colorBy = "type";
+const nodeColor = n => n.type!=="task"||colorBy==="type" ? (n.type==="handoff"&&n.a.brings_specialist_work==="no" ? "#8a6a3c" : COL[n.type]) : (colorBy==="layer"? LAYERC[n.a.layer||"not recorded"] : SYSC[n.a.system||"not recorded"]);
+
+/* ---------- sidebar ---------- */
+const showType = Object.fromEntries(Object.keys(TYPES).map(k=>[k,true]));
+const showRel = Object.fromEntries(Object.keys(RELS).map(k=>[k,k!=="THEN"]));
+function buildSide(){
+  const tb=document.getElementById("typeBox"); tb.innerHTML="";
+  Object.entries(TYPES).forEach(([k,[name]])=>{ const c=DATA.counts[k]||0; if(!c) return;
+    const r=document.createElement("label"); r.className="row"; r.innerHTML=`<input type="checkbox" ${showType[k]?"checked":""}><span class="dot" style="background:${COL[k]}"></span>${name}<span class="cnt">${c}</span>`;
+    r.querySelector("input").onchange=e=>{showType[k]=e.target.checked; if(typeof relayout==="function") relayout(); else draw();}; tb.appendChild(r); });
+  const rb=document.getElementById("relBox"); rb.innerHTML="";
+  Object.entries(RELS).forEach(([k,name])=>{ const c=DATA.rels[k]||0; if(!c) return;
+    const r=document.createElement("label"); r.className="row"; r.innerHTML=`<input type="checkbox" ${showRel[k]?"checked":""}>${name}<span class="cnt">${c}</span>`;
+    r.querySelector("input").onchange=e=>{showRel[k]=e.target.checked;draw();}; rb.appendChild(r); });
+  document.getElementById("names").innerHTML = DATA.nodes.map(n=>`<option value="${esc(n.label)} — ${TYPES[n.type][0]}">`).join("");
+  const sel=document.getElementById("clsSel");
+  sel.innerHTML = `<option value="">— choose a class —</option>` + DATA.classes.map(c=>`<option value="${esc(c.id)}">${esc(c.name)} · ${esc(c.spec)} (${fmt("n",c.n)})</option>`).join("");
+}
+buildSide();
+
+/* ---------- network canvas ---------- */
+const cv=document.getElementById("cv"), ctx=cv.getContext("2d"), tip=document.getElementById("tip");
+let W=0,H=0,DPR=1, T={k:1,x:0,y:0}, labels="auto", hover=null, selected=null, focus=null;
+function resize(){ const r=cv.parentElement.getBoundingClientRect(); DPR=window.devicePixelRatio||1; W=r.width; H=r.height; cv.width=W*DPR; cv.height=H*DPR; draw(); }
+function fit(){ const vn=DATA.nodes.filter(visibleNode); if(!vn.length) return; const xs=vn.map(n=>n.x), ys=vn.map(n=>n.y); const w=Math.max(...xs)-Math.min(...xs)+(layout==="layered"?380:120), h=Math.max(...ys)-Math.min(...ys)+60;
+  T.k=Math.min(W/w,H/h,2.2); T.x=W/2-T.k*(Math.min(...xs)+Math.max(...xs)+(layout==="layered"?260:0))/2; T.y=H/2-T.k*(Math.min(...ys)+Math.max(...ys))/2; }
+const sx=x=>x*T.k+T.x, sy=y=>y*T.k+T.y;
+const visibleNode = n => showType[n.type] && (!focus || focus.has(n.id));
+/* layouts: 'force' = NetworkX spring layout from Python, 'layered' = columns by node type, ordered to reduce crossings */
+let layout="layered"; let ROWGAP=20; const COLGAP=430;
+const COLUMN={class:0,plan:1,handoff:1,agent:2,task:3,api:4,system:5};
+DATA.nodes.forEach(n=>{n.fx=n.x;n.fy=n.y;});
+function applyLayout(){
+  const nodes=DATA.nodes.filter(visibleNode);
+  if(layout==="force"){ DATA.nodes.forEach(n=>{n.x=n.fx;n.y=n.fy;}); return; }
+  const cols=[[],[],[],[],[],[]]; nodes.forEach(n=>cols[COLUMN[n.type]].push(n));
+  const ids=new Set(nodes.map(n=>n.id)), nb=new Map(nodes.map(n=>[n.id,[]]));
+  DATA.edges.forEach(e=>{ if(e.rel!=="THEN"&&ids.has(e.s)&&ids.has(e.t)){ nb.get(e.s).push(e.t); nb.get(e.t).push(e.s);} });
+  const maxLen=Math.max(1,...cols.map(c=>c.length)), avail=(COLGAP*5+380)*((H&&W)?H/W:0.6);
+  ROWGAP=Math.min(70,Math.max(20,avail/maxLen));
+  const place=()=>cols.forEach((c,ci)=>{ const g=Math.min(70,Math.max(20,avail/Math.max(1,c.length))); const h=(c.length-1)*g; c.forEach((n,i)=>{ n.gap=g; n.x=ci*COLGAP; n.y=i*g-h/2; }); });
+  cols.forEach(c=>c.sort((a,b)=>(b.a.interactions||b.a.calls||0)-(a.a.interactions||a.a.calls||0)||a.label.localeCompare(b.label))); place();
+  const bary=n=>{ const ys=nb.get(n.id).map(id=>byId.get(id).y); return ys.length? ys.reduce((a,b)=>a+b,0)/ys.length : n.y; };
+  for(let it=0;it<6;it++){ const order = it%2? [4,3,2,1,0] : [1,2,3,4,5]; order.forEach(ci=>{ const m=new Map(cols[ci].map(n=>[n.id,bary(n)])); cols[ci].sort((a,b)=>m.get(a.id)-m.get(b.id)); place(); }); }
+}
+function draw(){
+  if(!W) return; ctx.setTransform(DPR,0,0,DPR,0,0); ctx.clearRect(0,0,W,H);
+  const hl = selected ? neighbourSet(selected) : null;
+  for(const e of DATA.edges){ if(!showRel[e.rel]) continue; const a=byId.get(e.s), b=byId.get(e.t); if(!visibleNode(a)||!visibleNode(b)) continue;
+    const on = !hl || (hl.has(a.id)&&hl.has(b.id)&&(a.id===selected||b.id===selected||focus));
+    ctx.strokeStyle = e.rel==="THEN" ? (on?"rgba(255,209,102,.75)":"rgba(255,209,102,.06)") : (on? "rgba(170,190,235,.32)":"rgba(170,190,235,.035)");
+    ctx.lineWidth = on&&hl ? 1.3 : .7; ctx.beginPath(); ctx.moveTo(sx(a.x),sy(a.y)); ctx.lineTo(sx(b.x),sy(b.y)); ctx.stroke();
+    if(e.rel==="THEN"&&on){ arrow(sx(a.x),sy(a.y),sx(b.x),sy(b.y),b.size*Math.sqrt(T.k)); } }
+  for(const n of DATA.nodes){ if(!visibleNode(n)) continue; const on=!hl||hl.has(n.id); const r=layout==="layered"? Math.max(2,Math.min(n.size*Math.sqrt(T.k),(n.gap||ROWGAP)*T.k*0.42)) : Math.max(2,n.size*Math.sqrt(T.k));
+    ctx.globalAlpha = on?1:.13; ctx.fillStyle=nodeColor(n); ctx.beginPath(); ctx.arc(sx(n.x),sy(n.y),r,0,7); ctx.fill();
+    if(n.id===selected||n===hover){ctx.strokeStyle="#fff";ctx.lineWidth=2;ctx.stroke();}
+    const showL = labels==="on" || (labels==="auto" && (layout==="layered" ? (n.gap||ROWGAP)*T.k>=10 : (n.type!=="task"&&n.type!=="api"&&n.type!=="class") || T.k>1.3)) || (hl&&on&&labels!=="off");
+    if(showL){ ctx.fillStyle = on?"#dfe6f5":"rgba(223,230,245,.2)"; ctx.font=`${n.type==="class"||n.type==="system"||n.type==="plan"?600:400} 11px Segoe UI,Arial`;
+      const maxc = layout==="layered" ? Math.max(8,Math.floor((COLGAP*T.k-r-14)/6.2)) : 34;
+      ctx.fillText(short(n.type==="task"&&layout==="layered"&&maxc>40?(n.a.agent||"").replace(/^NORA_/,"")+" · "+n.label:n.label,maxc), sx(n.x)+r+3, sy(n.y)+4); } }
+  ctx.globalAlpha=1;
+}
+function arrow(x1,y1,x2,y2,r){ const a=Math.atan2(y2-y1,x2-x1), x=x2-Math.cos(a)*(r+2), y=y2-Math.sin(a)*(r+2); ctx.fillStyle="rgba(255,209,102,.9)";
+  ctx.beginPath(); ctx.moveTo(x,y); ctx.lineTo(x-8*Math.cos(a-.4),y-8*Math.sin(a-.4)); ctx.lineTo(x-8*Math.cos(a+.4),y-8*Math.sin(a+.4)); ctx.fill(); }
+const short=(s,n)=>s.length>n?s.slice(0,n-1)+"…":s;
+function neighbourSet(id){ const s=new Set([id]); (out.get(id)||[]).forEach(e=>{if(showRel[e.rel])s.add(e.t)}); (inn.get(id)||[]).forEach(e=>{if(showRel[e.rel])s.add(e.s)}); return s; }
+function nodeAt(px,py){ let best=null,bd=1e9; for(const n of DATA.nodes){ if(!visibleNode(n)) continue; const d=Math.hypot(sx(n.x)-px,sy(n.y)-py), r=Math.max(5,n.size*Math.sqrt(T.k)+3); if(d<r&&d<bd){bd=d;best=n;} } return best; }
+let drag=null, pan=null, moved=false;
+cv.addEventListener("mousedown",e=>{ const n=nodeAt(e.offsetX,e.offsetY); moved=false; if(n) drag=n; else pan={x:e.offsetX,y:e.offsetY,tx:T.x,ty:T.y}; cv.style.cursor="grabbing"; });
+cv.addEventListener("mousemove",e=>{ if(drag){ drag.x=(e.offsetX-T.x)/T.k; drag.y=(e.offsetY-T.y)/T.k; moved=true; draw(); return; }
+  if(pan){ T.x=pan.tx+e.offsetX-pan.x; T.y=pan.ty+e.offsetY-pan.y; moved=true; draw(); return; }
+  const n=nodeAt(e.offsetX,e.offsetY); if(n!==hover){hover=n;draw();}
+  if(n){ tip.style.display="block"; tip.style.left=(e.offsetX+14)+"px"; tip.style.top=(e.offsetY+10)+"px";
+    tip.innerHTML=`<b>${esc(n.label)}</b><br><span class="muted">${TYPES[n.type][0]}${n.a.agent?" · "+esc(n.a.agent):""}${n.a.interactions?" · "+fmt("i",n.a.interactions)+" interactions":""}</span>`; }
+  else tip.style.display="none"; });
+window.addEventListener("mouseup",e=>{ if(drag&&!moved) select(drag.id); else if(pan&&!moved){ selected=null; draw(); } drag=null; pan=null; cv.style.cursor="grab"; });
+cv.addEventListener("wheel",e=>{ e.preventDefault(); const f=Math.exp(-e.deltaY*.0015); const wx=(e.offsetX-T.x)/T.k, wy=(e.offsetY-T.y)/T.k;
+  T.k=Math.min(12,Math.max(.08,T.k*f)); T.x=e.offsetX-wx*T.k; T.y=e.offsetY-wy*T.k; draw(); },{passive:false});
+/* touch (iPad) */
+let tp=null;
+cv.addEventListener("touchstart",e=>{ if(e.touches.length===1){const t=e.touches[0],r=cv.getBoundingClientRect(); const n=nodeAt(t.clientX-r.left,t.clientY-r.top); if(n){select(n.id);} tp={x:t.clientX,y:t.clientY,tx:T.x,ty:T.y};}
+  else if(e.touches.length===2){ const [a,b]=e.touches; tp={d:Math.hypot(a.clientX-b.clientX,a.clientY-b.clientY),k:T.k,tx:T.x,ty:T.y,cx:(a.clientX+b.clientX)/2,cy:(a.clientY+b.clientY)/2}; } },{passive:true});
+cv.addEventListener("touchmove",e=>{ e.preventDefault(); if(!tp) return; const r=cv.getBoundingClientRect();
+  if(e.touches.length===1&&tp.x!==undefined){ const t=e.touches[0]; T.x=tp.tx+t.clientX-tp.x; T.y=tp.ty+t.clientY-tp.y; }
+  else if(e.touches.length===2&&tp.d){ const [a,b]=e.touches; const d=Math.hypot(a.clientX-b.clientX,a.clientY-b.clientY); const k=Math.min(12,Math.max(.08,tp.k*d/tp.d));
+    const cx=tp.cx-r.left, cy=tp.cy-r.top, wx=(cx-tp.tx)/tp.k, wy=(cy-tp.ty)/tp.k; T.k=k; T.x=cx-wx*k; T.y=cy-wy*k; } draw(); },{passive:false});
+cv.addEventListener("touchend",()=>{tp=null;});
+
+/* ---------- selection, info panel ---------- */
+function select(id, center){ selected=id; const n=byId.get(id); if(center){ T.k=Math.max(T.k,1.4); T.x=W/2-n.x*T.k; T.y=H/2-n.y*T.k; } draw(); info(n); }
+function info(n){
+  const el=document.getElementById("info"); let h=`<span class="chip" style="background:${nodeColor(n)}">${TYPES[n.type][0]}</span><h2>${esc(n.label)}</h2>`;
+  const rows=Object.entries(n.a).filter(([k,v])=>v!==""&&v!==null&&k!=="label"); if(rows.length) h+=`<table class="kv">${rows.map(([k,v])=>`<tr><td>${esc(nice(k))}</td><td>${esc(fmt(k,v))}</td></tr>`).join("")}</table>`;
+  if(n.type==="class") h+=`<p><a class="lnk" onclick="openPlan('${esc(n.id)}')">Open this class in the Plan explorer →</a></p>`;
+  const groups={}; (out.get(n.id)||[]).forEach(e=>(groups["→ "+e.rel]=groups["→ "+e.rel]||[]).push([e.t,e])); (inn.get(n.id)||[]).forEach(e=>(groups["← "+e.rel]=groups["← "+e.rel]||[]).push([e.s,e]));
+  for(const [g,list] of Object.entries(groups)){ const rel=g.slice(2); h+=`<div class="relh">${esc(g.startsWith("→")?"→ ":"← ")}${esc(RELS[rel]||rel)} <span>(${list.length})</span></div><ul class="nb">`;
+    list.slice(0,60).forEach(([id,e])=>{ const m=byId.get(id); const ex=edgeText(e); h+=`<li><a class="lnk" onclick="select('${esc(id).replace(/'/g,"\\'")}',true)">${esc(m.type==="task"?(m.a.agent||"")+" · "+m.label:m.label)}</a>${ex?` <span class="muted">${esc(ex)}</span>`:""}</li>`; });
+    if(list.length>60) h+=`<li class="muted">… ${list.length-60} more</li>`; h+=`</ul>`; }
+  el.innerHTML=h; }
+function edgeText(e){ const a=e.a||{}; const p=[];
+  if(a.stage) p.push("stage "+a.stage); if(a.ran_when_handed!==undefined) p.push(`${fmt("ran_when",a.ran_when_handed)} when handed vs ${fmt("ran_when",a.ran_when_not)}`);
+  if(a.dependency!==undefined) p.push("dependency "+fmt("dependency",a.dependency)); if(a.interactions&&e.rel!=="RUNS_PLAN"&&e.rel!=="HANDS_OFF_TO") p.push(fmt("i",a.interactions)+" interactions");
+  if(a.order) p.push("#"+a.order+" hand-off"); return p.join(" · "); }
+window.select=select;
+
+/* ---------- follow one class ---------- */
+function classSet(cid){ const s=new Set([cid]); const add=id=>{ if(!s.has(id)){ s.add(id); } };
+  (out.get(cid)||[]).forEach(e=>{ add(e.t); if(e.rel==="RUNS_PLAN"){ (out.get(e.t)||[]).filter(x=>x.rel==="INCLUDES").forEach(x=>add(x.t)); }
+    if(e.rel==="HANDS_OFF_TO"){ (out.get(e.t)||[]).forEach(x=>{ if(x.rel==="BRINGS"||x.rel==="ACTIVATES") add(x.t); }); (inn.get(e.t)||[]).forEach(x=>{ if(x.rel==="HANDS_OFF") add(x.s); }); } });
+  [...s].forEach(id=>{ const n=byId.get(id); if(n.type==="task"){ (inn.get(id)||[]).forEach(e=>{ if(e.rel==="PERFORMS") add(e.s); }); (out.get(id)||[]).forEach(e=>{ if(e.rel==="CALLS"){ add(e.t); (out.get(e.t)||[]).forEach(x=>x.rel==="ON_SYSTEM"&&add(x.t)); } }); } });
+  return s; }
+document.getElementById("clsSel").onchange=e=>{ const v=e.target.value; focus = v? classSet(v): null; selected=null; if(v){ info(byId.get(v)); } relayout(); if(view==="plan") renderPlan(v); };
+document.getElementById("reset").onclick=()=>{ focus=null; selected=null; document.getElementById("clsSel").value=""; relayout(); };
+document.getElementById("layoutSel").onchange=e=>{ layout=e.target.value; relayout(); };
+function relayout(){ applyLayout(); fit(); draw(); }
+document.getElementById("lbl").onclick=e=>{ labels = labels==="auto"?"on":labels==="on"?"off":"auto"; e.target.textContent="Labels: "+labels; draw(); };
+document.getElementById("colorBy").onchange=e=>{ colorBy=e.target.value; legendColors(); draw(); };
+document.getElementById("q").addEventListener("change",e=>{ const v=e.target.value.split(" — ")[0].trim().toLowerCase(); const n=DATA.nodes.find(n=>n.label.toLowerCase()===v)||DATA.nodes.find(n=>n.label.toLowerCase().includes(v)); if(n){ if(!showType[n.type]){showType[n.type]=true;buildSide();} if(focus&&!focus.has(n.id)){focus=null;document.getElementById("clsSel").value="";} applyLayout(); fit(); select(n.id,true);} });
+function legendColors(){ const box=document.getElementById("typeBox"); let extra=document.getElementById("catLegend"); if(extra) extra.remove(); if(colorBy==="type") return;
+  const m=colorBy==="layer"?LAYERC:SYSC; extra=document.createElement("div"); extra.id="catLegend"; extra.innerHTML=`<h3>Task colours</h3>`+Object.entries(m).map(([k,c])=>`<div class="row"><span class="dot" style="background:${c}"></span>${esc(k)}</div>`).join(""); box.after(extra); }
+
+/* ---------- plan explorer ---------- */
+const STD = Object.keys(DATA.plans).find(k=>k.toLowerCase().startsWith("standard"));
+const planOf = h => Object.entries(DATA.plans).find(([k,p])=>p.handoff===h);
+function openPlan(cid){ document.getElementById("clsSel").value=cid; focus=classSet(cid); applyLayout(); setView("plan"); renderPlan(cid); }
+window.openPlan=openPlan;
+function renderPlan(cid){
+  const wrap=document.getElementById("planwrap"); const c=DATA.classes.find(x=>x.id===cid) || DATA.classes[0]; if(!c){ wrap.innerHTML="<p>No classes found.</p>"; return; }
+  if(document.getElementById("clsSel").value!==c.id){ document.getElementById("clsSel").value=c.id; focus=classSet(c.id); }
+  let h=`<h2 style="margin:0 0 4px">${esc(c.name)} — ${esc(c.spec)}</h2><p class="hint" style="margin:0 0 10px">The executable plan of this class = the standard plan + the sub-plan of every hand-off in it, in the order NORA hands off. Arrows = "this runs after that", learned from the logs (task DAG).</p><div class="kpis">`;
+  [["Interactions",c.n],["Approved traces",c.approved],["Tasks in plan",c.tasks],["Typical tool calls",c.median_calls],["Task F1 on unseen",c.task_f1_unseen],["Specialist F1 on unseen",c.specialist_f1_unseen]].forEach(([k,v])=>{ if(v!==undefined&&v!==null&&v!=="") h+=`<div class="kpi"><b>${esc(fmt(/F1/.test(k)?"f1":"n",v))}</b><span>${k}</span></div>`; });
+  h+=`</div>`;
+  const lanes=[]; if(STD) lanes.push([STD,DATA.plans[STD],"Standard plan","Runs in every interaction"]);
+  c.handoffs.forEach((ho,i)=>{ const p=planOf(ho); const hn=byId.get("handoff:"+ho)||{a:{}}; const a=hn.a;
+    const ev = a.strongest_task ? `Proof: ${a.strongest_task} ran in ${fmt("ran_when",a.ran_when_handed)} of cases handed work vs ${fmt("ran_when",a.ran_when_not)} otherwise (p ${a.p_value_bh||"–"}, same verdict ${a.same_verdict_in_folds||"–"} folds)` : "";
+    lanes.push([p?p[0]:ho, p?p[1]:{stages:[["handoff:"+ho]],edges:[]}, `Hand-off ${i+1}: ${ho}`, ev]); });
+  lanes.forEach(([name,pl,title,ev],li)=>{ h+=`<div class="lane"><h4>${esc(title)}</h4>${ev?`<div class="ev">${esc(ev)}</div>`:""}${laneSvg(pl,li)}</div>`; });
+  wrap.innerHTML=h; info(byId.get(c.id));
+  wrap.querySelectorAll("[data-id]").forEach(g=>g.addEventListener("click",()=>info(byId.get(g.dataset.id))));
+}
+function laneSvg(pl,li){
+  const BW=250,BH=40,GX=70,GY=10,PADT=22; const pos={}; let maxRows=0;
+  pl.stages.forEach((st,i)=>{ maxRows=Math.max(maxRows,st.length); st.forEach((id,j)=>pos[id]={x:i*(BW+GX),y:PADT+j*(BH+GY)}); });
+  const Wd=pl.stages.length*(BW+GX)-GX+10, Hd=PADT+maxRows*(BH+GY)+4; const mk=`ah${li}`;
+  let s=`<svg width="${Wd}" height="${Hd}" style="max-width:none"><defs><marker id="${mk}" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0L10,5L0,10z" fill="#ffd166"/></marker></defs>`;
+  pl.stages.forEach((st,i)=>{ s+=`<text x="${i*(BW+GX)}" y="13" fill="#93a0bd" font-size="11" font-weight="600">STAGE ${i+1} · ${st.length} task${st.length>1?"s":""}${i===0?" (runs after: start)":""}</text>`; });
+  (pl.edges||[]).forEach(([a,b,d])=>{ const A=pos[a],B=pos[b]; if(!A||!B) return; const x1=A.x+BW,y1=A.y+BH/2,x2=B.x,y2=B.y+BH/2,mx=(x1+x2)/2;
+    s+=`<path d="M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2-2},${y2}" fill="none" stroke="#ffd166" stroke-opacity=".55" stroke-width="1.3" marker-end="url(#${mk})"><title>dependency ${d==null?"":d.toFixed(3)}</title></path>`; });
+  pl.stages.forEach(st=>st.forEach(id=>{ const n=byId.get(id); if(!n) return; const P=pos[id]; const col=nodeColor(n);
+    const top = n.type==="handoff" ? "hand-off · "+(n.a.specialist_agent||"") : (n.a.agent||"")+(n.a.system?" · "+n.a.system:"");
+    s+=`<g data-id="${esc(id)}" style="cursor:pointer"><rect x="${P.x}" y="${P.y}" width="${BW}" height="${BH}" rx="8" fill="#18223d" stroke="${col}" stroke-width="1.4"/><rect x="${P.x}" y="${P.y}" width="5" height="${BH}" rx="2" fill="${col}"/>
+      <text x="${P.x+12}" y="${P.y+15}" fill="#93a0bd" font-size="10.5">${esc(short(top,40))}</text><text x="${P.x+12}" y="${P.y+31}" fill="#e6ebf5" font-size="12" font-weight="600">${esc(short(n.label,34))}</text><title>${esc((n.a.agent?n.a.agent+" · ":"")+n.label)}</title></g>`; }));
+  return s+`</svg>`;
+}
+
+/* ---------- 3D (needs internet once to load the 3D library) ---------- */
+let g3d=null;
+function load3d(){
+  const box=document.getElementById("g3d"), msg=document.getElementById("msg3d");
+  const go=()=>{ msg.style.display="none"; if(g3d){ g3d.width(box.clientWidth).height(box.clientHeight); return; }
+    const vis=new Set(DATA.nodes.filter(n=>showType[n.type]).map(n=>n.id));
+    const gd={nodes:DATA.nodes.filter(n=>vis.has(n.id)).map(n=>({id:n.id,label:n.label,type:n.type,val:n.size*n.size/9,color:nodeColor(n)})),
+      links:DATA.edges.filter(e=>showRel[e.rel]&&vis.has(e.s)&&vis.has(e.t)).map(e=>({source:e.s,target:e.t,rel:e.rel}))};
+    g3d=ForceGraph3D()(box).backgroundColor("#0b1020").graphData(gd).nodeLabel(n=>`${n.label} (${TYPES[n.type][0]})`).nodeColor("color").nodeVal("val").nodeOpacity(.95)
+      .linkColor(l=>l.rel==="THEN"?"#ffd166":"#8ea3d8").linkOpacity(.25).linkDirectionalArrowLength(l=>l.rel==="THEN"?3.5:0).linkDirectionalParticles(l=>l.rel==="HANDS_OFF_TO"||l.rel==="BRINGS"?1:0)
+      .onNodeClick(n=>info(byId.get(n.id))).width(box.clientWidth).height(box.clientHeight); };
+  if(window.ForceGraph3D) return go();
+  msg.style.display="block"; msg.textContent="Loading the 3D library… (needs internet once)";
+  const sc=document.createElement("script"); sc.src="https://cdn.jsdelivr.net/npm/3d-force-graph@1.72.2/dist/3d-force-graph.min.js"; sc.onload=go;
+  sc.onerror=()=>{ msg.innerHTML="The 3D library could not be loaded (no internet, or the site is blocked on this network). The Network and Plan explorer views work fully offline."; };
+  document.head.appendChild(sc);
+}
+
+/* ---------- guide ---------- */
+function renderGuide(){
+  const c=DATA.counts, r=DATA.rels;
+  document.getElementById("guide").innerHTML=`<h2>How to read this graph</h2>
+  <p>This graph shows <b>how NORA solves a case</b>: which class the case belongs to, which experts the boss agent hands work to, which tasks (agent · API) run, on which system, and in what order. Every node, link and number comes from the two v7.2 Excel files; nothing is typed in.</p>
+  <table><tr><th>Node</th><th>Count</th><th>Plain meaning</th><th>Comes from</th></tr>
+  <tr><td><span class="dot" style="background:${COL.class}"></span> Class</td><td>${c.class||0}</td><td>A group of cases with the same proven hand-offs</td><td>Classes sheet</td></tr>
+  <tr><td><span class="dot" style="background:${COL.plan}"></span> Plan</td><td>${c.plan||0}</td><td>The standard plan every case runs</td><td>Task_Plan (Plan = Standard)</td></tr>
+  <tr><td><span class="dot" style="background:${COL.handoff}"></span> Hand-off</td><td>${c.handoff||0}</td><td>The boss agent calling an expert in (dark = does not bring specialist work, e.g. Sim, Audit)</td><td>Handoff_Test, API_Catalog</td></tr>
+  <tr><td><span class="dot" style="background:${COL.agent}"></span> Agent</td><td>${c.agent||0}</td><td>A NORA agent (boss, helpers, experts)</td><td>API_Catalog: Agent</td></tr>
+  <tr><td><span class="dot" style="background:${COL.task}"></span> Task</td><td>${c.task||0}</td><td>One agent calling one API</td><td>API_Catalog, Task_Plan</td></tr>
+  <tr><td><span class="dot" style="background:${COL.api}"></span> API</td><td>${c.api||0}</td><td>The API itself (several agents may call the same API)</td><td>API_Catalog: API</td></tr>
+  <tr><td><span class="dot" style="background:${COL.system}"></span> System</td><td>${c.system||0}</td><td>Where the API lives (snowflake, nsm, misc, search …)</td><td>API_Catalog: System</td></tr></table>
+  <table><tr><th>Link</th><th>Count</th><th>Meaning</th><th>Evidence on the link</th></tr>
+  ${Object.entries(RELS).filter(([k])=>r[k]).map(([k,v])=>`<tr><td>${k}</td><td>${r[k]}</td><td>${v}</td><td>${{HANDS_OFF_TO:"order of the hand-off in the class",BRINGS:"% ran when handed vs not, p-value (Fisher + BH)",THEN:"dependency score, cases with both, p-value (Heuristics Miner + binomial test)",INCLUDES:"stage",PERFORMS:"calls, interactions",HANDS_OFF:"calls, interactions"}[k]||""}</td></tr>`).join("")}</table>
+  <h3>Three views</h3><ul><li><b>Network</b>: the whole picture. Pick a class on the left to light up only its path: class → hand-offs → expert agents → tasks → APIs → systems.</li>
+  <li><b>Plan explorer</b>: one class as an executable plan, stage by stage, with the "runs after" arrows and the statistical proof of each hand-off.</li>
+  <li><b>3D view</b>: the same graph in 3D (needs internet once to load the 3D library).</li></ul>
+  <h3>Same graph in other tools</h3><p><code>nora_knowledge_graph.graphml</code> opens in NetworkX (<code>nx.read_graphml</code>) and Gephi, and loads into JanusGraph with <code>load_into_janusgraph.groovy</code>. <code>nora_kg_nodes.csv</code> / <code>nora_kg_edges.csv</code> hold the same nodes and links as tables.</p>`;
+}
+
+/* ---------- views ---------- */
+let view="net";
+function setView(v){ view=v; document.querySelectorAll(".tabs button").forEach(b=>b.classList.toggle("on",b.dataset.v===v));
+  cv.style.display=v==="net"?"block":"none"; document.getElementById("planwrap").style.display=v==="plan"?"block":"none";
+  document.getElementById("g3d").style.display=v==="3d"?"block":"none"; document.getElementById("msg3d").style.display="none"; document.getElementById("guide").style.display=v==="guide"?"block":"none"; tip.style.display="none";
+  if(v==="net"){ applyLayout(); resize(); fit(); draw(); } if(v==="plan") renderPlan(document.getElementById("clsSel").value || (DATA.classes[0]||{}).id); if(v==="3d") load3d(); if(v==="guide") renderGuide(); }
+document.querySelectorAll(".tabs button").forEach(b=>b.onclick=()=>setView(b.dataset.v));
+window.addEventListener("resize",()=>{ if(view==="net") resize(); if(view==="3d"&&g3d) g3d.width(document.getElementById("g3d").clientWidth).height(document.getElementById("g3d").clientHeight); });
+applyLayout(); resize(); fit(); draw();
+</script></body></html>
+"""
+
+payload = json.dumps(DATA, ensure_ascii=False, default=str).replace("</", "<\\/")
+(OUT / "nora_knowledge_graph.html").write_text(TEMPLATE.replace("/*__DATA__*/null", payload), encoding="utf-8")
+
+print()
+print(f"nodes {G.number_of_nodes():,}: " + ", ".join(f"{TYPE_LABEL[k]} {v}" for k, v in sorted(counts.items())))
+print(f"links {G.number_of_edges():,}: " + ", ".join(f"{k} {v}" for k, v in sorted(rel_counts.items())))
+print(f"classes {len(CLASSES)} · plans {len(PLANS)} · hand-offs {len(HANDOFF)}")
+for f in ("nora_knowledge_graph.html", "nora_knowledge_graph.graphml", "nora_kg_nodes.csv", "nora_kg_edges.csv", "load_into_janusgraph.groovy"):
+    print(f"  -> {OUT / f}")

@@ -19,3 +19,8 @@ python .\nora_task_decomposition_phase_02.py --file "C:\Datascience\interactions
 python .\nora_knowledge_graph_v2.py
 start .\task_decomposition_v7\nora_knowledge_graph.html
 
+
+######
+python -c "import pandas as pd; d=pd.read_parquet(r'C:\Datascience\interactions_clean.parquet'); c=d[d['source']=='chat_history']; print(c.columns.tolist()); print(c.head(2).T.to_string()[:3000])"
+
+

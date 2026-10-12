@@ -1,4 +1,4 @@
-# %% NORA task decomposition version 1.7 - one sequential pipeline, decomposition only
+# %% NORA task decomposition version 1.7.2 - one sequential pipeline, decomposition only
 #
 #   PHASE 1  Read the data          only the columns the decomposition needs (intent is never loaded)
 #   PHASE 2  Prepare the calls      time order, each call counted once, system name, agent of each call
@@ -10,6 +10,12 @@
 #   PHASE 8  Approved traces        follow their plan and are not anomalous (isolation forest)
 #   PHASE 9  Outputs                decomposition workbook, validation workbook, report.md
 #
+# version 1.7.2: clean sheets - Interactions holds the complete input message, the steps in order (repeats shown ×n), branches,
+#      counts, every repeated call and why it differs from its variant; Classes explain how each class and its variants are
+#      identified; Class_Variants keeps only what defines a variant. Internal measures stay in the validation workbook.
+# version 1.7.1: stricter triggers - present in MORE than half of the interactions with the new call and in LESS than half without
+#      it (same rule as the hand-off test), echoed request parameters ignored, and the API whose result holds the trigger named;
+#      loops shown per interaction and per class; variant typical = median of the variant's tool calls; misfit patterns per class.
 # version 1.7: classes are split into VARIANTS by the conditional branches each interaction took (calls outside the plan with a
 #      trigger proven in the logs); every interaction's call count is explained API by API against its variant's typical profile;
 #      conditional steps are added to Task_Plan; the Interactions sheet comes first and holds the input. Approved traces and the
@@ -49,9 +55,9 @@ from sklearn.pipeline import make_pipeline
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
 
-parser = argparse.ArgumentParser(description="NORA task decomposition version 1.7")
+parser = argparse.ArgumentParser(description="NORA task decomposition version 1.7.2")
 parser.add_argument("--file", default=r"C:\Datascience\interactions_clean.parquet", help="cleaned file from the data-analysis step")
-parser.add_argument("--out", default=None, help="output folder; default <script folder>/task_decomposition_version_1_7")
+parser.add_argument("--out", default=None, help="output folder; default <script folder>/task_decomposition_version_1_7_2")
 parser.add_argument("--case", default="interaction_id", help="column: interaction id")
 parser.add_argument("--agent", default="agent", help="column: agent name")
 parser.add_argument("--tool", default="function_name", help="column: tool / API name")
@@ -77,10 +83,10 @@ if not SRC.exists() and SRC.with_suffix(".csv").exists():
 if not SRC.exists():
     raise FileNotFoundError(f"{SRC} not found; pass --file <cleaned parquet or csv>")
 HERE = Path(__file__).resolve().parent if "__file__" in globals() else Path.cwd()
-OUT = Path(args.out) if args.out else HERE / "task_decomposition_version_1_7"
+OUT = Path(args.out) if args.out else HERE / "task_decomposition_version_1_7_2"
 OUT.mkdir(parents=True, exist_ok=True)
 
-log = logging.getLogger("nora_version_1_7")
+log = logging.getLogger("nora_version_1_7_2")
 log.setLevel(logging.INFO)
 log.handlers.clear()
 log.propagate = False
@@ -255,6 +261,29 @@ def text_of(v, limit=500):
 
 
 # the input of each interaction, exactly as logged: the first row that is not a call and has an input (e.g. the user's message)
+def user_texts(v):
+    """All messages written by the user inside a logged conversation (JSON list/dict with role + content), in order."""
+    d = parse_json(v) if isinstance(v, str) else None
+    out = []
+
+    def walk(o, depth=0):
+        if depth > 6:
+            return
+        if isinstance(o, dict):
+            role = str(o.get("role", o.get("type", o.get("sender", "")))).lower()
+            body = next((o[k] for k in ("content", "text", "message", "msg", "query", "question") if k in o and has_value(o[k])), None)
+            if role in ("user", "human", "customer") and body is not None:
+                out.append(body if isinstance(body, str) else json.dumps(body, default=str))
+                return
+            for v_ in o.values():
+                walk(v_, depth + 1)
+        elif isinstance(o, list):
+            for v_ in o:
+                walk(v_, depth + 1)
+    walk(d)
+    return out
+
+
 def user_text(v):
     """The first message written by the user inside a logged conversation (JSON list/dict with role + content); otherwise the readable text."""
     d = parse_json(v) if isinstance(v, str) else None
@@ -280,7 +309,7 @@ def user_text(v):
 
 # the input of each interaction, as logged: the first row that is not a call and carries text, looking in the
 # conversation messages first, then input, then output (the first of these columns that has a value)
-FIRST_MSG, FIRST_TXT = {}, {}
+FIRST_MSG, FIRST_TXT, FULL_MSG = {}, {}, {}
 MSG_COLS = [COL[k] for k in ("messages", "input", "output") if COL.get(k)]
 if MSG_COLS:
     other = df[~df.index.isin(calls.index)].sort_values([CASE, "source_row"], kind="stable")
@@ -292,6 +321,14 @@ if MSG_COLS:
                 if t_:
                     FIRST_TXT[cid] = t_
                     FIRST_MSG[cid] = f"[{g.loc[vals.index[0], SOURCE]} · {col_}] {t_}"
+                    seen, parts = set(), []                                  # complete input: every user message of the interaction, in order
+                    for v_ in vals:
+                        for m_ in (user_texts(v_) or [v_]):
+                            m_ = text_of(m_, limit=32000)
+                            if m_ and m_ not in seen:
+                                seen.add(m_)
+                                parts.append(m_)
+                    FULL_MSG[cid] = " ‖ ".join(parts)
                     break
 fact("first_msg", len(FIRST_MSG), "Interactions with a logged first message (row that is not a call: messages, else input, else output)")
 del df
@@ -890,8 +927,6 @@ def standout_words(mem, k=6):
 
 classes = pd.DataFrame([{
     "Class": CLASS[l], "Specialists handed work": l, "Interactions": len(FINAL["members"][l]),
-    "Input examples (most frequent first messages)": input_examples(FINAL["members"][l]),
-    "Words that stand out in its inputs (class vs all)": standout_words(FINAL["members"][l]),
     "Tool calls (median)": float(per.loc[FINAL["members"][l], "tool_calls"].median()),
     "Hand-off calls (median)": float(per.loc[FINAL["members"][l], "handoff_calls"].median()),
     "API calls (median)": float(per.loc[FINAL["members"][l], "api_calls"].median()),
@@ -1085,13 +1120,15 @@ def out_tokens(v, limit=80):
 
 EXTRA_OF = {c: TASKS[c] - PLAN_T[c] for c in IDS}
 CAND = sorted({t for c in IDS for t in EXTRA_OF[c]})
-FIRST_TOK = {}                                                          # case -> {token: first call position}
+FIRST_TOK, TOK_SRC = {}, defaultdict(Counter)                           # case -> {token: first call position}; token -> APIs whose result held it
 if COL["output"]:
-    for c, g in calls[[CASE, "call_no", "_out"]].groupby(CASE, sort=False):
+    for c, g in calls[[CASE, "call_no", "_out", "_in", "task"]].groupby(CASE, sort=False):
         ft = {}
-        for pos, v in zip(g["call_no"].values, g["_out"].values):
-            for tk in out_tokens(v):
-                ft.setdefault(tk, pos)
+        for pos, v, vin, tk_task in zip(g["call_no"].values, g["_out"].values, g["_in"].values, g["task"].values):
+            for tk in out_tokens(v) - out_tokens(vin):                          # a value that only repeats the call's own request is not a result
+                if tk not in ft:
+                    ft[tk] = pos
+                    TOK_SRC[tk][TASK_API.get(tk_task, tk_task)] += 1
         FIRST_TOK[c] = ft
 PREV_TASK = calls.groupby(CASE)["task"].shift()
 FIRST_ROW = calls.assign(_prev=PREV_TASK).drop_duplicates([CASE, "task"])   # first call of each task in each case
@@ -1110,7 +1147,7 @@ for t in CAND:
         cw = Counter(tk for c in with_t for tk, fp in FIRST_TOK.get(c, {}).items() if fp < pos_t[c][t])
         co = Counter(tk for c in without for tk in FIRST_TOK.get(c, {}))
         for tk, k_ in cw.items():
-            if k_ / len(with_t) > MAJORITY and k_ / len(with_t) > co[tk] / len(without):
+            if k_ / len(with_t) > MAJORITY and co[tk] / len(without) < MAJORITY:
                 _, pv = fisher_greater(k_, len(with_t) - k_, co[tk], len(without) - co[tk])
                 trig_tests.append((t, "out", tk, k_ / len(with_t), co[tk] / len(without), pv))
     have_w, have_o = [c for c in with_t if c in MSG_W], [c for c in without if c in MSG_W]
@@ -1118,7 +1155,7 @@ for t in CAND:
         cw = Counter(w for c in have_w for w in MSG_W[c])
         co = Counter(w for c in have_o for w in MSG_W[c])
         for w_, k_ in cw.items():
-            if k_ / len(have_w) > MAJORITY and k_ / len(have_w) > co[w_] / len(have_o):
+            if k_ / len(have_w) > MAJORITY and co[w_] / len(have_o) < MAJORITY:
                 _, pv = fisher_greater(k_, len(have_w) - k_, co[w_], len(have_o) - co[w_])
                 trig_tests.append((t, "in", w_, k_ / len(have_w), co[w_] / len(have_o), pv))
     TRIG[t] = info_t
@@ -1127,13 +1164,18 @@ for (t, kind, tk, a_, b_, pv), q in zip(trig_tests, bh([x[5] for x in trig_tests
         TRIG[t][kind].append((a_ - b_, tk, a_, b_, q))
 
 
+def src_of(tk):
+    s_ = TOK_SRC.get(tk)
+    return f" from {s_.most_common(1)[0][0]}" if s_ else ""
+
+
 def trigger_text(t):
     i_ = TRIG.get(t)
     if not i_:
         return "Too few interactions to test", ""
     out_ = sorted(i_["out"], reverse=True)[:3]
     in_ = sorted(i_["in"], reverse=True)[:3]
-    ev = "; ".join([f"earlier result {tk} ({a_:.0%} vs {b_:.0%}, q {p_text(q)})" for _, tk, a_, b_, q in out_] +
+    ev = "; ".join([f"earlier result{src_of(tk)}: {tk} ({a_:.0%} vs {b_:.0%}, q {p_text(q)})" for _, tk, a_, b_, q in out_] +
                    [f"input word '{tk}' ({a_:.0%} vs {b_:.0%}, q {p_text(q)})" for _, tk, a_, b_, q in in_])
     if out_ and in_:
         verdict = "Triggered by an earlier result and linked to the input"
@@ -1222,7 +1264,7 @@ def trigger_label(t):
         return f"too rare to test (< {args.folds} interactions)"
     if i_["out"]:
         _, tk, a_, b_, q = max(i_["out"])
-        return f"when an earlier result has {tk} ({a_:.0%} vs {b_:.0%})"
+        return f"when the result{src_of(tk)} has {tk} ({a_:.0%} vs {b_:.0%})"
     if i_["in"]:
         _, tk, a_, b_, q = max(i_["in"])
         return f"when the input mentions '{tk}' ({a_:.0%} vs {b_:.0%})"
@@ -1294,7 +1336,7 @@ def explain_v17(c):
     d_ = d_[d_ != 0]
     total, ref_t = int(row.sum()), int(ref.sum())
     if d_.empty:
-        return total, ref_t, f"{total} = typical {ref_t}: the same calls as the typical interaction of its variant"
+        return total, ref_t, f"{total} = typical step profile {ref_t}: the same calls as the typical interaction of its variant"
     parts = []
     for t in sorted(d_.index, key=lambda t: (-abs(d_[t]), DISP_T[t])):
         dv = int(d_[t])
@@ -1307,11 +1349,21 @@ def explain_v17(c):
             kind = ("repeated" if dv > 0 else "repeated less") + (f", incl. {r_} retries" if r_ else "")
         parts.append(f"{DISP_T[t]} {dv:+d} ({kind})")
     shown, rest = parts[:8], int(d_.sum() - sum(int(d_[t]) for t in sorted(d_.index, key=lambda t: (-abs(d_[t]), DISP_T[t]))[:8]))
-    txt = f"{total} = typical {ref_t} " + " · ".join(shown) + (f" · other calls {rest:+d}" if len(parts) > 8 else "")
+    txt = f"{total} = typical step profile {ref_t} · " + " · ".join(shown) + (f" · other calls {rest:+d}" if len(parts) > 8 else "")
     return total, ref_t, txt
 
 
 EXP17 = {c: explain_v17(c) for c in IDS}
+
+
+def loops_of(c, k=4):
+    row = CNT.loc[c]
+    row = row[row > 1].sort_values(ascending=False)
+    return ", ".join(f"{DISP_T[t]} ×{int(v)}" for t, v in row.head(k).items()) + (f" (+{len(row) - k} more)" if len(row) > k else "")
+
+
+LOOP_TXT = {c: loops_of(c) for c in IDS}
+VMED = {v: float(np.median([CALLS_N[c] for c in m])) for v, m in VAR_MEM.items()}
 assert all(EXP17[c][0] == CALLS_N[c] for c in IDS)
 
 
@@ -1349,10 +1401,7 @@ for l in ORDER:
                          "Conditional branches that define it": "; ".join(f"{DISP_T[t]} ({trigger_label(t)})" for t in sorted(VAR_KEY[v], key=lambda t: DISP_T[t]))
                          or "none: the class's base plan",
                          "Interactions": len(m), "Share of class": len(m) / len(FINAL["members"][l]),
-                         "Tool calls min / median / max": f"{tc.min():.0f} / {tc.median():.0f} / {tc.max():.0f}",
-                         "Typical calls (profile)": int(REF[v].sum()), "Call spread (IQR)": iqr(tc),
-                         "Similarity to the variant (median)": float(np.median([SIM_V[c] for c in m])),
-                         "Explained calls": sum(SPLIT[c][0] + SPLIT[c][1] for c in m) / max(sum(CALLS_N[c] for c in m), 1),
+                         "Tool calls min / mean / median / max": f"{tc.min():.0f} / {tc.mean():.1f} / {tc.median():.0f} / {tc.max():.0f}",
                          "Most common loops (share of interactions)": "; ".join(f"{DISP_T[t]} {k_ / len(m):.0%}" for t, k_ in lp.most_common(4))})
 class_variants = pd.DataFrame(var_rows)
 
@@ -1361,12 +1410,56 @@ for l in ORDER:
     mem = FINAL["members"][l]
     vs = VAR_OF_CLASS[l]
     w_iqr = sum(iqr([CALLS_N[c] for c in VAR_MEM[v]]) * len(VAR_MEM[v]) for v in vs) / len(mem)
-    extra_cols.append({"Variants": len(vs), "Similarity within class (median)": float(np.median([SIM_C[c] for c in mem])),
+    lp_ = Counter(t for c in mem for t in CNT.columns[CNT.loc[c].values > 1])
+    extra_cols.append({"Loop calls (median)": float(np.median([LOOPS[c] for c in mem])),
+                       "Most common loops (share of interactions)": "; ".join(f"{DISP_T[t]} {k_ / len(mem):.0%}" for t, k_ in lp_.most_common(3)),
+                       "Variants": len(vs), "Similarity within class (median)": float(np.median([SIM_C[c] for c in mem])),
                        "Similarity within its variants (median)": float(np.median([SIM_V[c] for c in mem])),
                        "Explained calls": sum(SPLIT[c][0] + SPLIT[c][1] for c in mem) / max(sum(CALLS_N[c] for c in mem), 1),
                        "Call spread in class (IQR)": iqr([CALLS_N[c] for c in mem]), "Call spread within variants (IQR)": round(w_iqr, 1),
                        "Interactions that do not fit": sum(1 for c in mem if c in MISFIT)})
-classes = pd.concat([classes.drop(columns=["Decomposition (standard plan → hand-offs in order → APIs they bring)"]), pd.DataFrame(extra_cols),
+ROWS_BY_HO = {r["t"]: r for r in FINAL["rows"]}
+
+
+def how_class(l):
+    if l == NONE_LABEL:
+        nd = [f"{r['t']} (its agent works in {pct(r['without'])} of interactions without it)" for r in FINAL["rows"] if r["t"] not in FINAL["driving"]]
+        return ("Interactions in which NORA_Orchestrate_Agent handed work to no expert that brings specialist work"
+                + (f"; hand-offs that change nothing are ignored: {', '.join(nd)}" if nd else ""))
+    parts = []
+    for h in l.split(" + "):
+        r = ROWS_BY_HO.get(h)
+        b = r["best"] if r else None
+        parts.append(f"{h}" + (f" (proof: {b['task'].split(' · ')[-1]} ran in {pct(b['with'])} of interactions handed work vs {pct(b['without'])} without, "
+                               f"p {p_text(b['q'])})" if b else ""))
+    return "Interactions in which the orchestrator handed work to exactly these experts: " + "; ".join(parts)
+
+
+def how_variants(l):
+    vs = VAR_OF_CLASS[l]
+    if len(vs) == 1:
+        return "One variant: no conditional branch with a proven trigger is taken by some (at least 5) but not all interactions of this class"
+    return " | ".join(f"{v} ({len(VAR_MEM[v])}): " + ("; ".join(f"+ {DISP_T[t]} {trigger_label(t)}" for t in sorted(VAR_KEY[v], key=lambda t: DISP_T[t])) or "base plan")
+                      for v in vs)
+
+
+def why_calls_differ(l):
+    mem = FINAL["members"][l]
+    tot = sum(CALLS_N[c] for c in mem)
+    loop_calls = Counter()
+    for c in mem:
+        row = CNT.loc[c]
+        for t, v_ in row[row > 1].items():
+            loop_calls[t] += int(v_) - 1
+    br = sum(SPLIT[c][1] for c in mem)
+    lp = "; ".join(f"{DISP_T[t]} {v_ / tot:.0%} of calls" for t, v_ in loop_calls.most_common(3))
+    return (f"Same experts, same plan; the count moves with loops ({sum(LOOPS[c] for c in mem) / tot:.0%} of the class's calls: {lp})"
+            f" and conditional branches ({br / tot:.0%} of calls)")
+
+
+ident = pd.DataFrame([{"How this class is identified": how_class(l), "How its variants are identified": how_variants(l),
+                       "Why call counts differ inside the class": why_calls_differ(l)} for l in ORDER])
+classes = pd.concat([classes.drop(columns=["Decomposition (standard plan → hand-offs in order → APIs they bring)"]), pd.DataFrame(extra_cols), ident,
                      classes[["Decomposition (standard plan → hand-offs in order → APIs they bring)"]]], axis=1)
 
 task_plan["Runs when"] = ["always" if p.startswith("Standard") else f"after {p.replace(' sub-plan', '')} (classes with it)" for p in task_plan["Plan"]]
@@ -1388,6 +1481,21 @@ misfits = pd.DataFrame([{"Interaction ID": c, "Class": CLASS[LABEL[c]], "Variant
                          "Class median similarity": MISFIT[c][1], "Cut-off (Q1 - 1.5 IQR)": MISFIT[c][0],
                          "Tasks it ran that its class usually does not": short_list({DISP_T[t] for t in TASKS[c] - TYP_C[LABEL[c]]}, 8),
                          "Usual tasks of its class it did not run": short_list({DISP_T[t] for t in TYP_C[LABEL[c]] - TASKS[c]}, 8)} for c in MISFIT])
+mp_rows = []
+for l in ORDER:
+    mf = [c for c in FINAL["members"][l] if c in MISFIT]
+    if not mf:
+        continue
+    extra_ = Counter(t for c in mf for t in TASKS[c] - TYP_C[l])
+    miss_ = Counter(t for c in mf for t in TYP_C[l] - TASKS[c])
+    hos_ = Counter(t for c in mf for t in DISP.get(c, ()))
+    mp_rows.append({"Class": CLASS[l], "Specialists handed work": l, "Interactions": len(FINAL["members"][l]), "Do not fit": len(mf),
+                    "Share of class": len(mf) / len(FINAL["members"][l]),
+                    "Tasks they ran that the class usually does not (share of misfits)": "; ".join(f"{DISP_T[t]} {v_ / len(mf):.0%}" for t, v_ in extra_.most_common(6)),
+                    "Usual tasks they did not run (share of misfits)": "; ".join(f"{DISP_T[t]} {v_ / len(mf):.0%}" for t, v_ in miss_.most_common(6)),
+                    "Hand-offs in the misfits (share)": "; ".join(f"{t} {v_ / len(mf):.0%}" for t, v_ in hos_.most_common(5)) or "none",
+                    "Tool calls of misfits (median) vs class": f"{np.median([CALLS_N[c] for c in mf]):.0f} vs {STAT[l]['med']:.0f}"})
+misfit_patterns = pd.DataFrame(mp_rows)
 approved_traces = pd.DataFrame({"Interaction ID": IDS, "Class": [CLASS[LABEL[c]] for c in IDS], "Variant": [VAR[c] for c in IDS],
                                 "Approved trace": np.where(per["approved"], "yes", "no"), "Follows plan order fully": np.where(per["follows"], "yes", "no"),
                                 "Anomalous (isolation forest)": np.where(per["anomalous"], "yes", "no"), "Anomaly score": per["anomaly_score"].round(4).values})
@@ -1397,7 +1505,19 @@ matrix.insert(0, "Variant", [VAR[c] for c in IDS])
 matrix.insert(0, "Class", [CLASS[LABEL[c]] for c in IDS])
 matrix = matrix.reset_index().rename(columns={CASE: "Interaction ID", "case": "Interaction ID"}).sort_values(["Class", "Variant", "Interaction ID"])
 
-interactions = pd.DataFrame({
+_st = calls[new_step][[CASE, "step_no", "task", "system"]]
+_sz = calls.groupby([CASE, "step_no"]).size()
+_st = _st.assign(_n=_sz.reindex(pd.MultiIndex.from_arrays([_st[CASE], _st["step_no"]])).values)
+STEP_FULL = (_st["task"] + " [" + _st["system"].astype(str) + "]" + np.where(_st["_n"] > 1, " ×" + _st["_n"].astype(str), "")).groupby(_st[CASE], sort=False).agg(list).to_dict()
+
+
+def all_repeats(c):
+    row = CNT.loc[c]
+    row = row[row > 1].sort_values(ascending=False)
+    return ", ".join(f"{DISP_T[t]} ×{int(v)}" for t, v in row.items())
+
+
+interactions_old = pd.DataFrame({
     "Interaction ID": IDS,
     "Input: first message": [FIRST_MSG.get(c) for c in IDS],
     "Input: first tool call": [text_of(FIRST_IN.get(c)) for c in IDS],
@@ -1406,14 +1526,32 @@ interactions = pd.DataFrame({
     "Steps": [STEPS_N[c] for c in IDS], "Total tool calls": [CALLS_N[c] for c in IDS],
     "Hand-off calls": per["handoff_calls"].astype(int).values, "API calls": per["api_calls"].astype(int).values,
     "Loop / repeat calls": [LOOPS[c] for c in IDS],
+    "Loops (API ×calls)": [LOOP_TXT[c] for c in IDS],
     "Class typical calls (median)": [STAT[LABEL[c]]["med"] for c in IDS],
-    "Variant typical calls": [EXP17[c][1] for c in IDS],
-    "Difference from variant typical": [EXP17[c][0] - EXP17[c][1] for c in IDS],
+    "Variant typical calls (median)": [VMED[VAR[c]] for c in IDS],
+    "Difference from variant median": [CALLS_N[c] - VMED[VAR[c]] for c in IDS],
     "Why it differs (per API)": [EXP17[c][2] for c in IDS],
     "Explained calls": [EXPL_SHARE[c] for c in IDS],
     "Similarity to its variant": [SIM_V[c] for c in IDS],
     "Fits its class?": ["no: " + f"only {SIM_C[c]:.0%} of its tasks match its class (class median {MISFIT[c][1]:.0%})" if c in MISFIT else "yes" for c in IDS],
     "Steps in order (agent · API [system])": [ARROW.join(f"{i + 1}. {x}" for i, x in enumerate(STEP_TXT[c])) for c in IDS]}).sort_values(["Class", "Variant", "Interaction ID"])
+interaction_checks = interactions_old[["Interaction ID", "Class", "Variant", "Total tool calls", "Class typical calls (median)", "Variant typical calls (median)",
+                                       "Difference from variant median", "Explained calls", "Similarity to its variant", "Fits its class?"]]
+del interactions_old
+interactions = pd.DataFrame({
+    "Interaction ID": IDS,
+    "Input message": [FULL_MSG.get(c) for c in IDS],
+    "Input: first tool call": [text_of(FIRST_IN.get(c)) for c in IDS],
+    "Class": [CLASS[LABEL[c]] for c in IDS], "Specialists handed work": [LABEL[c] for c in IDS],
+    "Variant": [VAR[c] for c in IDS],
+    "Steps in order (agent · tool or API [system])": [ARROW.join(f"{i + 1}. {x}" for i, x in enumerate(STEP_FULL[c])) for c in IDS],
+    "Conditional branches taken": [BRANCHES[c] for c in IDS],
+    "Steps": [STEPS_N[c] for c in IDS], "Total tool calls": [CALLS_N[c] for c in IDS],
+    "Hand-off calls": per["handoff_calls"].astype(int).values, "API calls": per["api_calls"].astype(int).values,
+    "Loop / repeat calls": [LOOPS[c] for c in IDS],
+    "Repeated calls (API ×calls)": [all_repeats(c) for c in IDS],
+    "Variant typical calls (median)": [VMED[VAR[c]] for c in IDS],
+    "Why it differs from its variant (per API)": [EXP17[c][2] for c in IDS]}).sort_values(["Class", "Variant", "Interaction ID"])
 
 # ---- workbook 2: validation ----
 METRICS = [("Specialist task precision", "sprecision", "Hand-off and specialist tasks: of those the plan predicts, share the interaction really ran"),
@@ -1465,6 +1603,8 @@ GUIDE = {
                 "Interactions": ("Interactions in the class", C), "Tool calls (median)": ("Typical number of tool calls (hand-off + API). Describes the class; it does not decide it", C),
                 "Hand-off calls (median)": ("Typical number of hand-off calls", C), "API calls (median)": ("Typical number of API calls", C),
                 "Tasks in executable plan": ("Distinct tasks in the fixed plan: standard plan + the sub-plan of every hand-off in the class (see Task_Plan). Tasks, not calls: a task can run several times", HM),
+                "Loop calls (median)": ("Typical number of calls that repeat a task already called in the interaction (loops over items, retries)", C),
+                "Most common loops (share of interactions)": ("APIs most often called more than once in this class, with the share of its interactions where that happens", C),
                 "Variants": ("How many variants the class splits into by the conditional branches taken (see Class_Variants)", F),
                 "Similarity within class (median)": ("Overlap of an interaction's task set with the class's typical task set (Jaccard, 100% = identical), median over the class", C),
                 "Similarity within its variants (median)": ("Same, measured against each interaction's own variant: higher than the class value = the variants group like with like", C),
@@ -1472,6 +1612,9 @@ GUIDE = {
                 "Call spread in class (IQR)": ("Middle-50% range of tool calls across the whole class", C),
                 "Call spread within variants (IQR)": ("Same, inside the variants (weighted average): smaller = the variants explain the differences", C),
                 "Interactions that do not fit": ("Interactions whose task set is far less similar to the class than the rest (below Q1 - 1.5 IQR); listed in the validation workbook (Misfits)", C),
+                "How this class is identified": ("The rule that puts an interaction in this class and the statistical proof of each expert (Fisher's exact test + BH)", F),
+                "How its variants are identified": ("Each variant with its size and the conditional branches that define it, each with the trigger proven in the logs", F),
+                "Why call counts differ inside the class": ("Share of the class's calls that are loops (with the APIs that loop most) and conditional branches", C),
                 "Decomposition (standard plan → hand-offs in order → APIs they bring)": (
                     "How NORA decomposes a case of this class: the standard plan, then each hand-off in the order seen in the class, with the "
                     "agent and APIs that run only after it. Conditional steps: Task_Plan", F + "; " + HM)},
@@ -1480,6 +1623,7 @@ GUIDE = {
                        "Conditional branches that define it": ("Calls outside the class plan, with their proven trigger, that this variant takes; 'none' = the class's base plan", F),
                        "Interactions": ("Interactions in the variant", C), "Share of class": ("Share of the class in this variant", C),
                        "Tool calls min / median / max": ("Smallest, typical and largest number of tool calls", C),
+                       "Tool calls min / mean / median / max": ("Smallest, average, typical and largest number of tool calls in the variant", C),
                        "Typical calls (profile)": ("Sum of the typical (median) number of calls of every task in the variant: the reference used in 'Why it differs'", C),
                        "Call spread (IQR)": ("Middle-50% range of tool calls in the variant", C),
                        "Similarity to the variant (median)": ("Overlap of task sets with the variant's typical task set (Jaccard)", C),
@@ -1491,7 +1635,11 @@ GUIDE = {
                   "System": ("System NORA writes in front of the API name, or 'hand-off'", L),
                   "Runs after": ("Tasks this one directly depends on, learned from the order in the traces; for a conditional step, the call that usually comes right before it", HM),
                   "Runs when": ("always / after its hand-off / the trigger proven in the logs (Fisher's exact test + BH)", F)},
-    "Interactions": {"Interaction ID": ("One NORA case", L),
+    "Interactions": {"Input message": ("The complete input of the interaction: every message the user wrote, in order (‖ separates messages), as logged in the first rows that are not tool calls", L),
+                     "Steps in order (agent · tool or API [system])": ("Every step in order: the agent and the tool or API it called, with its system ([hand-off] = a tool that passes work to another agent); ×n = the same call repeated n times in a row", L),
+                     "Repeated calls (API ×calls)": ("Every API this interaction called more than once, with its number of calls", C),
+                     "Why it differs from its variant (per API)": ("Exact, API by API: total = the variant's typical step profile (sum of the typical number of calls of each step) + each difference. 'new call' = not usual in the variant (with its trigger); 'repeated' = loop; 'not run here' = usual call it did not make", C),
+                     "Interaction ID": ("One NORA case", L),
                      "Input: first message": ("The first logged row of this interaction that is not a tool call and has an input (e.g. the user's message); [table] = the log table it came from", L),
                      "Input: first tool call": ("What was sent to the first tool call of the interaction", L),
                      "Class": ("Its class: the exact set of experts the orchestrator handed work to", F),
@@ -1503,9 +1651,10 @@ GUIDE = {
                      "API calls": ("Tool calls that fetch from a system", C),
                      "Loop / repeat calls": ("Calls beyond the first call of each task (loops over items and retries)", C),
                      "Class typical calls (median)": ("Median tool calls of its class", C),
-                     "Variant typical calls": ("Typical calls of its variant: sum of the typical number of calls of every task in the variant", C),
-                     "Difference from variant typical": ("Total tool calls minus Variant typical calls", C),
-                     "Why it differs (per API)": ("Exact, API by API: total = variant typical + each difference. 'new call' = not in the variant's typical calls (with its trigger); 'repeated' = loop; 'not run here' = typical call it did not make", C),
+                     "Loops (API ×calls)": ("APIs this interaction called more than once, with how many calls: the main reason call counts differ within a class", C),
+                     "Variant typical calls (median)": ("Median tool calls of its variant", C),
+                     "Difference from variant median": ("Total tool calls minus the variant median (+ = more calls)", C),
+                     "Why it differs (per API)": ("Exact, API by API: total = the variant's typical step profile (sum of the typical number of calls of each step) + each difference. 'new call' = not in the variant's typical calls (with its trigger); 'repeated' = loop; 'not run here' = typical call it did not make", C),
                      "Explained calls": ("Share of its calls that are plan steps or conditional steps with a proven trigger", F),
                      "Similarity to its variant": ("Overlap of its task set with its variant's typical task set (Jaccard)", C),
                      "Fits its class?": ("'no' when its task set is far less similar to the class than the rest (below Q1 - 1.5 IQR of the class)", C),
@@ -1551,14 +1700,14 @@ for sname, f in MAIN.items():
 VALID = {"Model_Accuracy": accuracy, "Accuracy_by_Class": by_class, "CV_Folds": fold_df, "Handoff_Test": handoff_tab, "Handoff_Tasks": handoff_tasks,
          "Hand-off_Detection": pd.DataFrame(detect), "DAG_Edges": edges, "Duplicate_Logging": DUPLICATES,
          "API_Two_Names": pd.DataFrame(two_names), "Anomalous": unusual, "Input_to_Class": input_class, "Input_to_Handoff": input_ho,
-         "Approved_Traces": approved_traces, "Branch_Triggers": new_calls, "Unexplained_Calls": unexplained, "Misfits": misfits,
+         "Approved_Traces": approved_traces, "Branch_Triggers": new_calls, "Unexplained_Calls": unexplained, "Misfits": misfits, "Misfit_Patterns": misfit_patterns, "Interaction_Checks": interaction_checks,
          "Class_Check": class_check, "API_Count_Matrix": matrix,
          "Column_Guide": pd.DataFrame([{"Sheet": s_, "Column": c, "What it shows": GUIDE[s_][c][0], "Method": GUIDE[s_][c][1]} for s_, f in MAIN.items() for c in f.columns])}
-PERCENT = {"Explained calls", "Similarity within class (median)", "Similarity within its variants (median)", "Similarity to the variant (median)", "Similarity to its variant", "Similarity to its class", "Class median similarity", "Cut-off (Q1 - 1.5 IQR)", "Share of class", "Above typical range", "Below typical range", "Input → class: found on unseen (recall)", "Input → class: correct when predicted (precision)", "Input → class: by chance", "Found on unseen (recall)", "Correct when predicted (precision)", "By chance (class share)", "Follow plan order fully", "Strongest task: ran when handed work", "Strongest task: ran when not handed work", "Agent made any call when handed work",
+PERCENT = {"Share of class", "Explained calls", "Similarity within class (median)", "Similarity within its variants (median)", "Similarity to the variant (median)", "Similarity to its variant", "Similarity to its class", "Class median similarity", "Cut-off (Q1 - 1.5 IQR)", "Share of class", "Above typical range", "Below typical range", "Input → class: found on unseen (recall)", "Input → class: correct when predicted (precision)", "Input → class: by chance", "Found on unseen (recall)", "Correct when predicted (precision)", "By chance (class share)", "Follow plan order fully", "Strongest task: ran when handed work", "Strongest task: ran when not handed work", "Agent made any call when handed work",
            "Agent made any call when not handed work", "Specialist task precision", "Specialist task recall", "Specialist task F1", "Baseline specialist task F1", "Task precision", "Task recall",
            "Task F1", "Baseline task F1", "Order accuracy", "Follow plan fully", "Ran when handed work", "Ran when not handed work",
            "Identical input in matched pairs"}
-WIDE = {"Why it differs (per API)": 100, "Conditional branches taken": 60, "Conditional branches that define it": 70, "Runs when": 50, "Most common loops (share of interactions)": 55, "Tasks it ran that its class usually does not": 60, "Usual tasks of its class it did not run": 60, "Reason": 45, "New calls and why (trigger)": 70, "Evidence (with it vs without it, all interactions)": 90, "New call (not in the class plan)": 50, "Usually right after": 50, "Why the calls differ": 90, "Main drivers outside the range (share)": 55, "Most repeated APIs (share of interactions)": 50, "Flags": 45, "Words in the input that point to this expert": 60, "Input examples (most frequent first messages)": 70, "Words that stand out in its inputs (class vs all)": 55, "Input: first message": 60, "Input: first tool call": 45, "Plan tasks not run": 50, "Extra tasks": 50, "Most common extra tasks (share of cases)": 70, "Plan tasks most often not run (share of cases)": 70, "Decomposition (standard plan → hand-offs in order → APIs they bring)": 110, "Steps in order (agent · API [system])": 100, "Runs after": 60, "Task (agent · API)": 55, "What it measures": 70, "What it shows": 70,
+WIDE = {"Input message": 70, "Steps in order (agent · tool or API [system])": 100, "Repeated calls (API ×calls)": 50, "Why it differs from its variant (per API)": 90, "How this class is identified": 80, "How its variants are identified": 90, "Why call counts differ inside the class": 70, "Loops (API ×calls)": 45, "Tasks they ran that the class usually does not (share of misfits)": 70, "Usual tasks they did not run (share of misfits)": 70, "Hand-offs in the misfits (share)": 45, "Why it differs (per API)": 100, "Conditional branches taken": 60, "Conditional branches that define it": 70, "Runs when": 50, "Most common loops (share of interactions)": 55, "Tasks it ran that its class usually does not": 60, "Usual tasks of its class it did not run": 60, "Reason": 45, "New calls and why (trigger)": 70, "Evidence (with it vs without it, all interactions)": 90, "New call (not in the class plan)": 50, "Usually right after": 50, "Why the calls differ": 90, "Main drivers outside the range (share)": 55, "Most repeated APIs (share of interactions)": 50, "Flags": 45, "Words in the input that point to this expert": 60, "Input examples (most frequent first messages)": 70, "Words that stand out in its inputs (class vs all)": 55, "Input: first message": 60, "Input: first tool call": 45, "Plan tasks not run": 50, "Extra tasks": 50, "Most common extra tasks (share of cases)": 70, "Plan tasks most often not run (share of cases)": 70, "Decomposition (standard plan → hand-offs in order → APIs they bring)": 110, "Steps in order (agent · API [system])": 100, "Runs after": 60, "Task (agent · API)": 55, "What it measures": 70, "What it shows": 70,
         "Strongest task": 50, "Specialists handed work": 45, "From task": 50, "To task": 50}
 HEAD, BAND, LINE = PatternFill("solid", fgColor="1C5CAB"), PatternFill("solid", fgColor="F2F5FA"), Border(bottom=Side(style="thin", color="D9DEE7"))
 
@@ -1579,7 +1728,7 @@ def write_book(path, sheets, notes):
             cell.font, cell.fill = Font(bold=True, color="FFFFFF"), HEAD
             cell.alignment = Alignment(vertical="center", wrap_text=True)
             if notes and name in GUIDE.get(ws.title, {}):
-                cm = Comment(f"{GUIDE[ws.title][name][0]}\n\nMethod: {GUIDE[ws.title][name][1]}", "NORA version 1.7")
+                cm = Comment(f"{GUIDE[ws.title][name][0]}\n\nMethod: {GUIDE[ws.title][name][1]}", "NORA version 1.7.2")
                 cm.width, cm.height = 320, 140
                 cell.comment = cm
             w = max(len(str(ws.cell(i, j).value or "")) for i in range(1, min(ws.max_row, 60) + 1))
@@ -1598,8 +1747,8 @@ def write_book(path, sheets, notes):
     wb.save(path)
 
 
-BOOK = OUT / "nora_task_decomposition_version_1_7.xlsx"
-VBOOK = OUT / "nora_task_decomposition_version_1_7_validation.xlsx"
+BOOK = OUT / "nora_task_decomposition_version_1_7_2.xlsx"
+VBOOK = OUT / "nora_task_decomposition_version_1_7_2_validation.xlsx"
 write_book(BOOK, MAIN, notes=True)
 write_book(VBOOK, VALID, notes=False)
 log.info(f"   decomposition workbook -> {BOOK}")
@@ -1607,7 +1756,7 @@ log.info(f"   validation workbook    -> {VBOOK}")
 
 # ---- report.md: the separate summary (every figure filled from this run) ----
 TOTAL = round(time.time() - T_START, 1)
-md = [f"# NORA task decomposition - run report (version 1.7)", "",
+md = [f"# NORA task decomposition - run report (version 1.7.2)", "",
       f"Data: `{SRC.name}` · {n:,} interactions · {FACTS['calls']:,} tool calls · run time {TOTAL:.0f} s · seed {args.seed}", "",
       "## 1. Goal", "",
       "Learn from NORA's own logs how a case is decomposed: which specialists the coordinator hands work to (the class), which tasks "
@@ -1662,7 +1811,9 @@ md += ["", "## 7. Classes, variants and why call counts differ", "",
        f"- Task-set similarity (median): {np.median(list(SIM_C.values())):.0%} to the class, {np.median(list(SIM_V.values())):.0%} to the variant.",
        f"- Call spread (IQR, weighted): {np.average(classes['Call spread in class (IQR)'], weights=classes['Interactions']):.1f} in classes vs "
        f"{np.average(classes['Call spread within variants (IQR)'], weights=classes['Interactions']):.1f} within variants.",
-       f"- Interactions that do not fit their class: {len(MISFIT)} (validation workbook, Misfits).",
+       f"- Interactions that do not fit their class: {len(MISFIT)} (validation workbook, Misfits and Misfit_Patterns).",
+       "- Trigger rule: present in more than half of the interactions with the new call and in less than half without it (same rule as the hand-off test), "
+       "Fisher's exact test + BH; values that only repeat the call's own request are ignored.",
        f"- Calls outside the plan: {found} of {len(TRIG)} tested have a proven trigger (Branch_Triggers); the rest are listed in Unexplained_Calls."]
 md += ["", "## 8. Honest check: does the input predict the class?", ""]
 if IN_SUM:

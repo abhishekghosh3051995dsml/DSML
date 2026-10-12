@@ -57,6 +57,7 @@ parser.add_argument("--agent", default="agent", help="column: agent name")
 parser.add_argument("--tool", default="function_name", help="column: tool / API name")
 parser.add_argument("--source", default="source", help="column: log table")
 parser.add_argument("--payload", default="data", help="column: JSON payload (timestamp is discovered inside it)")
+parser.add_argument("--messages", default="messages", help="column: conversation messages (where the user's first message is found)")
 parser.add_argument("--output", default="output", help="column: call output (used to find what triggered a new call)")
 parser.add_argument("--input", default="input", help="column: call input (used to match the same call in two log tables)")
 parser.add_argument("--folds", type=int, default=5, help="cross-validation folds")
@@ -186,7 +187,7 @@ def p_text(q):
 # %% PHASE 1 - Read the data
 
 section("PHASE 1  Read the data")
-ROLE = {"case": args.case, "agent": args.agent, "tool": args.tool, "source": args.source, "payload": args.payload, "input": args.input, "output": args.output}
+ROLE = {"case": args.case, "agent": args.agent, "tool": args.tool, "source": args.source, "payload": args.payload, "input": args.input, "output": args.output, "messages": args.messages}
 if SRC.suffix == ".parquet":
     import pyarrow.parquet as pq
     available = pq.read_schema(SRC).names
@@ -254,14 +255,45 @@ def text_of(v, limit=500):
 
 
 # the input of each interaction, exactly as logged: the first row that is not a call and has an input (e.g. the user's message)
+def user_text(v):
+    """The first message written by the user inside a logged conversation (JSON list/dict with role + content); otherwise the readable text."""
+    d = parse_json(v) if isinstance(v, str) else None
+    found = []
+
+    def walk(o, depth=0):
+        if found or depth > 6:
+            return
+        if isinstance(o, dict):
+            role = str(o.get("role", o.get("type", o.get("sender", "")))).lower()
+            body = next((o[k] for k in ("content", "text", "message", "msg", "query", "question") if k in o and has_value(o[k])), None)
+            if role in ("user", "human", "customer") and body is not None:
+                found.append(body if isinstance(body, str) else json.dumps(body, default=str))
+                return
+            for v_ in o.values():
+                walk(v_, depth + 1)
+        elif isinstance(o, list):
+            for v_ in o:
+                walk(v_, depth + 1)
+    walk(d)
+    return text_of(found[0]) if found else text_of(v)
+
+
+# the input of each interaction, as logged: the first row that is not a call and carries text, looking in the
+# conversation messages first, then input, then output (the first of these columns that has a value)
 FIRST_MSG, FIRST_TXT = {}, {}
-if COL["input"]:
-    other = df[~df.index.isin(calls.index)]
-    other = other[other[COL["input"]].map(has_value)].sort_values([CASE, "source_row"], kind="stable")
-    for cid, r in other.groupby(CASE, sort=False).head(1).set_index(CASE).iterrows():
-        FIRST_TXT[cid] = text_of(r[COL["input"]])
-        FIRST_MSG[cid] = f"[{r[SOURCE]}] {FIRST_TXT[cid]}"
-fact("first_msg", len(FIRST_MSG), "Interactions with a logged first message (row that is not a call, with an input)")
+MSG_COLS = [COL[k] for k in ("messages", "input", "output") if COL.get(k)]
+if MSG_COLS:
+    other = df[~df.index.isin(calls.index)].sort_values([CASE, "source_row"], kind="stable")
+    for cid, g in other.groupby(CASE, sort=False):
+        for col_ in MSG_COLS:
+            vals = g[col_][g[col_].map(has_value)]
+            if len(vals):
+                t_ = user_text(vals.iloc[0])
+                if t_:
+                    FIRST_TXT[cid] = t_
+                    FIRST_MSG[cid] = f"[{g.loc[vals.index[0], SOURCE]} · {col_}] {t_}"
+                    break
+fact("first_msg", len(FIRST_MSG), "Interactions with a logged first message (row that is not a call: messages, else input, else output)")
 del df
 
 # %% PHASE 2 - Prepare the calls

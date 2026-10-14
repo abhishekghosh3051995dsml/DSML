@@ -24,3 +24,7 @@ start .\task_decomposition_v7\nora_knowledge_graph.html
 python -c "import pandas as pd; d=pd.read_parquet(r'C:\Datascience\interactions_clean.parquet'); c=d[d['source']=='chat_history']; print(c.columns.tolist()); print(c.head(2).T.to_string()[:3000])"
 
 
+#######
+
+python .\nora_check_repeats.py --file "C:\Datascience\interactions_clean.parquet" --id 00a62ae2 --api qtm_provisioning_status_daily_query
+

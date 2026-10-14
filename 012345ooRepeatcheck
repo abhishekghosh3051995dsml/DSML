@@ -1,0 +1,30 @@
+# Read-only check: is a "×2" repeat a real second call, or the same call logged twice?
+# Prints every logged row of one API in one interaction: which log table (source), row number, input, and the payload (time is inside it).
+#
+#   python .\nora_check_repeats.py --file "C:\Datascience\interactions_clean.parquet" --id 00a62ae2 --api qtm_provisioning_status_daily_query
+
+import argparse
+from pathlib import Path
+
+import pandas as pd
+
+p = argparse.ArgumentParser()
+p.add_argument("--file", default=r"C:\Datascience\interactions_clean.parquet")
+p.add_argument("--id", required=True, help="interaction ID, or its first characters")
+p.add_argument("--api", required=True, help="API name, or part of it")
+a = p.parse_args()
+
+src = Path(a.file)
+df = pd.read_parquet(src) if src.suffix == ".parquet" else pd.read_csv(src, dtype=str, low_memory=False)
+m = df["interaction_id"].astype(str).str.startswith(a.id) & df["function_name"].astype(str).str.contains(a.api, regex=False)
+rows = df.loc[m, [c for c in ("interaction_id", "source", "source_row", "agent", "function_name", "input", "data") if c in df.columns]]
+pd.set_option("display.width", 250)
+pd.set_option("display.max_colwidth", 160)
+print(f"\n{len(rows)} logged rows for API '{a.api}' in interaction '{a.id}':\n")
+for _, r in rows.iterrows():
+    print("-" * 100)
+    for k, v in r.items():
+        print(f"{k:>14}: {str(v)[:400]}")
+print("-" * 100)
+print("\nSame call logged twice -> DIFFERENT 'source' and the same time in 'data'.")
+print("Real repeat            -> same 'source' (or both tables twice) and different times.\n")

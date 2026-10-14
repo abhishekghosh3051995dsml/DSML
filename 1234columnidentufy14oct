@@ -1,0 +1,161 @@
+# %% NORA - find the field that classifies an interaction (clarification required / rca / modify / ticket ...)
+#
+#   Read-only check on the cleaned data file. Nothing is changed, nothing is decided for you.
+#   1. Every column of the file: how many rows / interactions have a value, and one example.
+#   2. Every field name (column, or key inside JSON, nested JSON text included) that looks like a classifier
+#      (name matches --names), with its values and how many interactions have each value.
+#   3. Every field whose VALUE matches one of the words you are looking for (--words), wherever it sits,
+#      with the field path, the value and how many interactions have it.
+#   Output: printed on screen + nora_classification_check.xlsx next to this script.
+#
+#   python .\nora_find_classification_field.py --file "C:\Datascience\interactions_clean.parquet"
+
+import argparse
+import ast
+import json
+import re
+from collections import Counter, defaultdict
+from pathlib import Path
+
+import pandas as pd
+
+p = argparse.ArgumentParser()
+p.add_argument("--file", default=r"C:\Datascience\interactions_clean.parquet")
+p.add_argument("--case", default="interaction_id", help="column: interaction id")
+p.add_argument("--names", default=r"classif|intent|category|type|route|action|label|decision",
+               help="regex: field names that may hold a classification")
+p.add_argument("--words", default=r"clarif|\brca\b|root.?cause|modif|ticket",
+               help="regex: values you are looking for")
+p.add_argument("--top", type=int, default=15, help="values listed per field")
+args = p.parse_args()
+
+SRC = Path(args.file)
+NAME_RE, WORD_RE = re.compile(args.names, re.I), re.compile(args.words, re.I)
+OUT = Path(__file__).resolve().parent / "nora_classification_check.xlsx"
+
+
+def parse_json(v):
+    if isinstance(v, (dict, list)):
+        return v
+    if not isinstance(v, str) or v.strip()[:1] not in ("{", "["):
+        return None
+    for loader in (json.loads, ast.literal_eval):
+        try:
+            return loader(v)
+        except Exception:
+            continue
+    return None
+
+
+def has_value(v):
+    return v is not None and str(v).strip().lower() not in ("", "none", "null", "nan", "[]", "{}")
+
+
+def leaves(o, path=(), depth=0):
+    """(path, value) for every value inside JSON; JSON written as text inside JSON is opened too."""
+    if depth > 12:
+        return
+    if isinstance(o, dict):
+        for k, x in o.items():
+            yield from leaves(x, path + (str(k),), depth + 1)
+    elif isinstance(o, list):
+        for x in o:
+            yield from leaves(x, path, depth + 1)
+    else:
+        inner = parse_json(o) if isinstance(o, str) else None
+        if inner is not None:
+            yield from leaves(inner, path, depth + 1)
+        elif has_value(o):
+            yield path, o
+
+
+def short(v, n=80):
+    t = re.sub(r"\s+", " ", str(v)).strip()
+    return t if len(t) <= n else t[:n - 1] + "…"
+
+
+# ---- read ----
+if SRC.suffix == ".parquet":
+    df = pd.read_parquet(SRC)
+else:
+    df = pd.read_csv(SRC, dtype=str, low_memory=False)
+df[args.case] = df[args.case].astype(str)
+print(f"\nFile: {SRC}\nRows: {len(df):,}   Interactions: {df[args.case].nunique():,}   Columns: {len(df.columns)}\n")
+
+# ---- 1. every column ----
+col_rows = []
+for c in df.columns:
+    s = df[c]
+    ok = s.map(lambda v: isinstance(v, (dict, list)) or has_value(v))
+    ex = s[ok].iloc[0] if ok.any() else None
+    col_rows.append({"Column": c, "Rows with a value": int(ok.sum()), "Interactions with a value": int(df.loc[ok, args.case].nunique()),
+                     "Holds JSON": bool(ok.any() and parse_json(ex) is not None), "Example": short(ex, 120) if ex is not None else ""})
+cols = pd.DataFrame(col_rows)
+print("1. COLUMNS IN THE FILE")
+print(cols.to_string(index=False, max_colwidth=70))
+
+# ---- 2 + 3. walk every value once ----
+by_name = defaultdict(lambda: {"values": defaultdict(set), "cases": set()})      # (column, path) -> value -> interactions
+by_word = defaultdict(set)                                                        # (column, path, value) -> interactions
+free_text = defaultdict(lambda: {"cases": set(), "example": None})               # column -> word hits in plain text
+for c in [c for c in df.columns if c != args.case]:
+    name_hit = bool(NAME_RE.search(c))
+    s = df[c]
+    if not name_hit:                                       # only rows that can matter are opened
+        txt = s.astype(str)
+        s = s[txt.str.contains(args.names, case=False, regex=True, na=False) | txt.str.contains(args.words, case=False, regex=True, na=False)]
+    for idx, v in s.items():
+        case = df.at[idx, args.case]
+        d = parse_json(v)
+        if d is None:
+            if not has_value(v):
+                continue
+            if name_hit:
+                by_name[(c, c)]["values"][short(v)].add(case)
+                by_name[(c, c)]["cases"].add(case)
+            if WORD_RE.search(str(v)):
+                if len(str(v)) <= 60:
+                    by_word[(c, c, short(v))].add(case)
+                else:                                      # long free text (a chat message, a note): counted, not listed per value
+                    free_text[c]["cases"].add(case)
+                    free_text[c]["example"] = free_text[c]["example"] or short(v, 160)
+            continue
+        for path, x in leaves(d, (c,) if name_hit else ()):
+            full = ".".join(path)
+            if any(NAME_RE.search(k) for k in path) and len(str(x)) <= 120:
+                by_name[(c, full)]["values"][short(x)].add(case)
+                by_name[(c, full)]["cases"].add(case)
+            if isinstance(x, str) and WORD_RE.search(x):
+                if len(x) <= 60:
+                    by_word[(c, full, short(x))].add(case)
+                else:
+                    free_text[f"{c} · {full}"]["cases"].add(case)
+                    free_text[f"{c} · {full}"]["example"] = free_text[f"{c} · {full}"]["example"] or short(x, 160)
+
+names = pd.DataFrame([{"Column": c, "Field": f, "Interactions with it": len(v["cases"]), "Different values": len(v["values"]),
+                       "Values (interactions)": "; ".join(f"{k} ({len(s_)})" for k, s_ in sorted(v["values"].items(), key=lambda kv: -len(kv[1]))[:args.top])}
+                      for (c, f), v in by_name.items()])
+if len(names):
+    names = names.sort_values("Interactions with it", ascending=False)
+words = pd.DataFrame([{"Column": c, "Field": f, "Value": v, "Interactions": len(s_)} for (c, f, v), s_ in by_word.items()])
+if len(words):
+    words = words.sort_values(["Field", "Interactions"], ascending=[True, False])
+texts = pd.DataFrame([{"Where (column · field)": k, "Interactions where the text mentions a word": len(v["cases"]), "Example": v["example"]}
+                      for k, v in free_text.items()])
+if len(texts):
+    texts = texts.sort_values("Interactions where the text mentions a word", ascending=False)
+
+pd.set_option("display.width", 250)
+print(f"\n2. FIELDS WHOSE NAME LOOKS LIKE A CLASSIFIER  (names matching: {args.names})")
+print(names.to_string(index=False, max_colwidth=110) if len(names) else "   none")
+print(f"\n3. SHORT VALUES THAT MATCH YOUR WORDS  (words: {args.words})")
+print(words.to_string(index=False, max_colwidth=80) if len(words) else "   none")
+print("\n   ...and long free texts (chat messages, notes) that mention one of the words:")
+print(texts.to_string(index=False, max_colwidth=110) if len(texts) else "   none")
+
+with pd.ExcelWriter(OUT) as xw:
+    cols.to_excel(xw, sheet_name="1_Columns", index=False)
+    (names if len(names) else pd.DataFrame({"Note": ["none"]})).to_excel(xw, sheet_name="2_Classifier_fields", index=False)
+    (words if len(words) else pd.DataFrame({"Note": ["none"]})).to_excel(xw, sheet_name="3_Matching_values", index=False)
+    (texts if len(texts) else pd.DataFrame({"Note": ["none"]})).to_excel(xw, sheet_name="3b_Free_text_mentions", index=False)
+print(f"\nSaved: {OUT}\n")

@@ -1,0 +1,2040 @@
+# %% NORA task decomposition version 1.7.5 - one sequential pipeline, decomposition only
+#
+#   PHASE 1  Read the data          only the columns the decomposition needs (intent is never loaded)
+#   PHASE 2  Prepare the calls      time order, each call counted once, system name, agent of each call
+#   PHASE 3  Event log              every interaction as ordered steps (agent · API)
+#   PHASE 4  Hand-off detection     calls with which the coordinator passes work to another agent
+#   PHASE 5  The model              (a) which hand-offs bring work  (b) classes  (c) task DAGs
+#   PHASE 6  Validation             k-fold cross-validation: learn on k-1 folds, test on the unseen fold
+#   PHASE 7  Final model            refitted on all interactions
+#   PHASE 8  Approved traces        follow their plan and are not anomalous (isolation forest)
+#   PHASE 9  Outputs                decomposition workbook, validation workbook, report.md
+#
+# version 1.7.5: a step most interactions of a class run is part of that class's plan (same >50% rule as the standard plan);
+#   input words that are English stop words (published scikit-learn list) are never triggers; an API name used by more than one
+#   agent is shown with its agent; repeated-call values missing from a call show '(missing)'; Class_Variants shows the variant
+#   typical calls; cells no longer wrap (Excel Online hid the second line).
+# version 1.7.4: every cell of the main sheets holds only what the data says - API names, counts, the earlier result value or
+#      input word found before an extra call, the input values that change between repeats, the earlier list a loop follows.
+#      No sentences of ours in the cells; the meaning of each column is in the Guide sheet (last sheet).
+# version 1.7.3: triggers must be STRONG (with the call at least twice as often as without it, and at least 30 points more),
+#      values that are constant in one API's results are ignored (they only show that the API ran), a branch splits a class
+#      only when at least 10% of the class takes it; every repeated call gets its driver from the logs (one call per item of
+#      a list returned earlier, or per different value of an input field, or retries). Main sheets are plain words only;
+#      every percentage, p-value and quality measure lives in the validation workbook.
+# version 1.7.2: clean sheets - Interactions holds the complete input message, the steps in order (repeats shown ×n), branches,
+#      counts, every repeated call and why it differs from its variant; Classes explain how each class and its variants are
+#      identified; Class_Variants keeps only what defines a variant. Internal measures stay in the validation workbook.
+# version 1.7.1: stricter triggers - present in MORE than half of the interactions with the new call and in LESS than half without
+#      it (same rule as the hand-off test), echoed request parameters ignored, and the API whose result holds the trigger named;
+#      loops shown per interaction and per class; variant typical = median of the variant's tool calls; misfit patterns per class.
+# version 1.7: classes are split into VARIANTS by the conditional branches each interaction took (calls outside the plan with a
+#      trigger proven in the logs); every interaction's call count is explained API by API against its variant's typical profile;
+#      conditional steps are added to Task_Plan; the Interactions sheet comes first and holds the input. Approved traces and the
+#      proofs (triggers, API count matrix, unexplained calls, misfits) are in the validation workbook.
+# v7.8 answered "why is a NEW call added for the same class?": for every call that is not in the class plan, the trigger
+#      found in the logs - an earlier call's result, or the input - tested with Fisher's exact test + BH (New_Calls_Why sheet).
+# v7.7 explained, case by case, why interactions of the same class differ (named APIs as proof), and checks the classes honestly:
+#      can the input predict the class / the experts? (Class_Check, Input_to_Class, Input_to_Handoff)
+# v7.6 added the link input -> class: per class, its most frequent inputs and the words that stand out in them.
+# v7.5 added, on request: the input of every interaction (first message + first tool-call input) and
+# "why cases of the same class differ" - counted per interaction and summarised per class (Class_Variation sheet).
+#
+# Every agent, API, system, class and dependency comes from the data. Nothing is typed in by hand.
+# The only fixed numbers are statistical conventions: "more than half", a 5% significance level, the Heuristics Miner default 0.9.
+
+import argparse
+import ast
+import json
+import logging
+import re
+import sys
+import time
+import warnings
+from collections import Counter, defaultdict
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+from scipy.stats import binom, fisher_exact
+from sklearn.ensemble import IsolationForest
+from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS, TfidfVectorizer
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import classification_report, roc_auc_score
+from sklearn.model_selection import StratifiedKFold, cross_val_predict
+from sklearn.pipeline import make_pipeline
+
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
+
+parser = argparse.ArgumentParser(description="NORA task decomposition version 1.7.5")
+parser.add_argument("--file", default=r"C:\Datascience\interactions_clean.parquet", help="cleaned file from the data-analysis step")
+parser.add_argument("--out", default=None, help="output folder; default <script folder>/task_decomposition_version_1_7_5")
+parser.add_argument("--case", default="interaction_id", help="column: interaction id")
+parser.add_argument("--agent", default="agent", help="column: agent name")
+parser.add_argument("--tool", default="function_name", help="column: tool / API name")
+parser.add_argument("--source", default="source", help="column: log table")
+parser.add_argument("--payload", default="data", help="column: JSON payload (timestamp is discovered inside it)")
+parser.add_argument("--messages", default="messages", help="column: conversation messages (where the user's first message is found)")
+parser.add_argument("--output", default="output", help="column: call output (used to find what triggered a new call)")
+parser.add_argument("--input", default="input", help="column: call input (used to match the same call in two log tables)")
+parser.add_argument("--folds", type=int, default=5, help="cross-validation folds")
+parser.add_argument("--bootstrap", type=int, default=1000, help="bootstrap resamples for the 95%% confidence intervals")
+parser.add_argument("--dependency", type=float, default=0.9, help="Heuristics Miner dependency threshold (published default 0.9)")
+parser.add_argument("--time-field", default=None, help="payload field to order calls by; default: discovered from the data")
+parser.add_argument("--sample", type=int, default=5_000, help="JSON documents sampled to discover payload fields")
+parser.add_argument("--seed", type=int, default=42)
+args, _ = parser.parse_known_args()
+
+MAJORITY = 0.5   # "more than half"
+ALPHA = 0.05     # significance level, after Benjamini-Hochberg correction
+
+SRC = Path(args.file)
+if not SRC.exists() and SRC.with_suffix(".csv").exists():
+    SRC = SRC.with_suffix(".csv")
+if not SRC.exists():
+    raise FileNotFoundError(f"{SRC} not found; pass --file <cleaned parquet or csv>")
+HERE = Path(__file__).resolve().parent if "__file__" in globals() else Path.cwd()
+OUT = Path(args.out) if args.out else HERE / "task_decomposition_version_1_7_5"
+OUT.mkdir(parents=True, exist_ok=True)
+
+log = logging.getLogger("nora_version_1_7_5")
+log.setLevel(logging.INFO)
+log.handlers.clear()
+log.propagate = False
+for h in (logging.StreamHandler(sys.stdout), logging.FileHandler(OUT / "run.log", mode="w", encoding="utf-8")):
+    h.setFormatter(logging.Formatter("%(asctime)s | %(message)s", "%H:%M:%S"))
+    log.addHandler(h)
+
+T_START = time.time()
+TIMES, FACTS = {}, {}
+_phase = {"name": None, "t": None}
+
+
+def section(title):
+    now = time.time()
+    if _phase["name"]:
+        TIMES[_phase["name"]] = round(now - _phase["t"], 1)
+    _phase.update(name=title, t=now)
+    log.info("-" * 90)
+    log.info(title)
+
+
+def fact(key, value, text=None):
+    FACTS[key] = value
+    log.info(f"   {text or key}: {value}")
+
+
+def pct(x, d=0):
+    return f"{x:.{d}%}" if pd.notna(x) else "n/a"
+
+
+def parse_json(v):
+    if not isinstance(v, str) or v.strip()[:1] not in ("[", "{"):
+        return None
+    for loader in (json.loads, ast.literal_eval):
+        try:
+            return loader(v)
+        except (ValueError, SyntaxError, TypeError, MemoryError, RecursionError):
+            continue
+    return None
+
+
+def leaves(obj, prefix="", depth=0, out=None):
+    out = {} if out is None else out
+    if isinstance(obj, dict) and depth < 4:
+        for k, v in obj.items():
+            leaves(v, f"{prefix}.{k}" if prefix else str(k), depth + 1, out)
+    elif not isinstance(obj, (dict, list)) and prefix:
+        out[prefix] = obj
+    return out
+
+
+def get_path(doc, path):
+    for part in path.split("."):
+        if not isinstance(doc, dict) or part not in doc:
+            return None
+        doc = doc[part]
+    return doc
+
+
+def has_value(v):
+    return v is not None and str(v).strip().lower() not in ("", "none", "null", "nan")
+
+
+def to_time(values, ceiling):
+    s = values.astype(object) if isinstance(values, pd.Series) else pd.Series(list(values), dtype=object)
+    idx = s.index
+    s = s[s.map(lambda v: v is not None and not isinstance(v, bool) and str(v).strip() != "")]
+    out_all = pd.Series(pd.NaT, index=idx, dtype="datetime64[ns, UTC]")
+    if s.empty:
+        return out_all
+    num = pd.to_numeric(s, errors="coerce")
+    out = pd.Series(pd.NaT, index=s.index, dtype="datetime64[ns, UTC]")
+    sec, ms = num.between(1e9, 1e10), num.between(1e12, 1e13)
+    out[sec] = pd.to_datetime(num[sec], unit="s", utc=True)
+    out[ms] = pd.to_datetime(num[ms], unit="ms", utc=True)
+    txt = num.isna() & s.map(lambda v: isinstance(v, str) and len(v) <= 40 and any(ch.isdigit() for ch in v))
+    if txt.any():
+        out[txt] = pd.to_datetime(s[txt], errors="coerce", utc=True, format="mixed")
+    out = out.where((out >= pd.Timestamp("2000-01-01", tz="UTC")) & (out <= ceiling))
+    return out.reindex(idx)
+
+
+def bh(p):
+    """Benjamini-Hochberg adjusted p-values (NaN kept)."""
+    p = np.asarray(p, float)
+    out = np.full(len(p), np.nan)
+    ok = ~np.isnan(p)
+    if ok.any():
+        q = p[ok]
+        o = np.argsort(q)
+        adj = q[o] * len(q) / np.arange(1, len(q) + 1)
+        adj = np.minimum.accumulate(adj[::-1])[::-1]
+        res = np.empty_like(adj)
+        res[o] = np.clip(adj, 0, 1)
+        out[ok] = res
+    return out
+
+
+def p_text(q):
+    """p-value as text, so Excel shows very small values exactly as computed instead of rounding them to 0."""
+    return None if pd.isna(q) else ("below 1e-300" if q < 1e-300 else f"{q:.3g}")
+
+
+# %% PHASE 1 - Read the data
+
+section("PHASE 1  Read the data")
+ROLE = {"case": args.case, "agent": args.agent, "tool": args.tool, "source": args.source, "payload": args.payload, "input": args.input, "output": args.output, "messages": args.messages}
+if SRC.suffix == ".parquet":
+    import pyarrow.parquet as pq
+    available = pq.read_schema(SRC).names
+    df = pd.read_parquet(SRC, columns=[c for c in dict.fromkeys(list(ROLE.values()) + ["source_row"]) if c in available])
+else:
+    df = pd.read_csv(SRC, usecols=lambda c: c in set(ROLE.values()) | {"source_row"}, dtype=str, low_memory=False)
+for role in ("case", "tool"):
+    if ROLE[role] not in df.columns:
+        raise KeyError(f"column '{ROLE[role]}' ({role}) not found; pass --{role}. Columns: {list(df.columns)}")
+COL = {r: c if c in df.columns else None for r, c in ROLE.items()}
+for c in [c for c in COL.values() if c]:
+    df[c] = df[c].astype(object).where(df[c].notna(), None)
+if "source_row" not in df.columns:
+    df["source_row"] = np.arange(len(df))
+df["source_row"] = pd.to_numeric(df["source_row"], errors="coerce").fillna(-1).astype(np.int64)
+CASE, TOOL = COL["case"], COL["tool"]
+SOURCE = COL["source"] or "_source"
+AGENT = COL["agent"] or "_agent"
+if COL["source"] is None:
+    df[SOURCE] = "all"
+if COL["agent"] is None:
+    df[AGENT] = None
+df[CASE] = df[CASE].astype(str)
+CEILING = pd.Timestamp(SRC.stat().st_mtime, unit="s", tz="UTC") + pd.Timedelta(days=1)
+
+import unicodedata
+
+
+def clean_name(v):
+    """Remove invisible characters (line breaks, zero-width marks) and outer spaces from a logged name; names keep their spelling."""
+    if not has_value(v):
+        return None
+    t = "".join(ch for ch in str(v) if unicodedata.category(ch) not in ("Cc", "Cf"))
+    t = re.sub(r"\s+", " ", t).strip()
+    return t or None
+
+
+NAMED = re.compile(r"[0-9A-Za-z]")
+raw_names = df[TOOL][df[TOOL].map(has_value)].astype(str)
+fact("names_cleaned", int((raw_names != raw_names.map(lambda v: clean_name(v) or "")).sum()),
+     "Tool-name rows with invisible characters or outer spaces removed")
+df[TOOL] = df[TOOL].map(clean_name).astype(object)
+df[AGENT] = df[AGENT].map(clean_name).astype(object)
+df[TOOL] = df[TOOL].where(df[TOOL].notna(), None)
+df[AGENT] = df[AGENT].where(df[AGENT].notna(), None)
+calls = df[df[TOOL].map(lambda v: isinstance(v, str) and bool(NAMED.search(v)))].copy()   # a call needs a tool name with a letter or digit
+fact("rows", len(df), "Rows in the file")
+fact("interactions_all", df[CASE].nunique(), "Interactions in the file")
+fact("call_rows", len(calls), "Rows that are tool calls (a non-blank tool name is present)")
+fact("other_rows", len(df) - len(calls), "Rows that are not calls (chat, feedback, ...), set aside")
+
+
+def text_of(v, limit=500):
+    """Readable text of a logged value: JSON is flattened to its text parts; whitespace collapsed; cut to `limit` characters."""
+    if not has_value(v):
+        return None
+    d = parse_json(v)
+    if isinstance(d, (dict, list)):
+        parts = [f"{k}: {x}" for k, x in leaves(d if isinstance(d, dict) else {"value": d}).items() if has_value(x)]
+        t = " | ".join(parts) if parts else str(v)
+    else:
+        t = str(v)
+    t = re.sub(r"\s+", " ", t).strip()
+    return (t[:limit - 1] + "…") if len(t) > limit else t
+
+
+# the input of each interaction, exactly as logged: the first row that is not a call and has an input (e.g. the user's message)
+def user_texts(v):
+    """All messages written by the user inside a logged conversation (JSON list/dict with role + content), in order."""
+    d = parse_json(v) if isinstance(v, str) else None
+    out = []
+
+    def walk(o, depth=0):
+        if depth > 6:
+            return
+        if isinstance(o, dict):
+            role = str(o.get("role", o.get("type", o.get("sender", "")))).lower()
+            body = next((o[k] for k in ("content", "text", "message", "msg", "query", "question") if k in o and has_value(o[k])), None)
+            if role in ("user", "human", "customer") and body is not None:
+                out.append(body if isinstance(body, str) else json.dumps(body, default=str))
+                return
+            for v_ in o.values():
+                walk(v_, depth + 1)
+        elif isinstance(o, list):
+            for v_ in o:
+                walk(v_, depth + 1)
+    walk(d)
+    return out
+
+
+def user_text(v):
+    """The first message written by the user inside a logged conversation (JSON list/dict with role + content); otherwise the readable text."""
+    d = parse_json(v) if isinstance(v, str) else None
+    found = []
+
+    def walk(o, depth=0):
+        if found or depth > 6:
+            return
+        if isinstance(o, dict):
+            role = str(o.get("role", o.get("type", o.get("sender", "")))).lower()
+            body = next((o[k] for k in ("content", "text", "message", "msg", "query", "question") if k in o and has_value(o[k])), None)
+            if role in ("user", "human", "customer") and body is not None:
+                found.append(body if isinstance(body, str) else json.dumps(body, default=str))
+                return
+            for v_ in o.values():
+                walk(v_, depth + 1)
+        elif isinstance(o, list):
+            for v_ in o:
+                walk(v_, depth + 1)
+    walk(d)
+    return text_of(found[0]) if found else text_of(v)
+
+
+# the input of each interaction, as logged: the first row that is not a call and carries text, looking in the
+# conversation messages first, then input, then output (the first of these columns that has a value)
+FIRST_MSG, FIRST_TXT, FULL_MSG = {}, {}, {}
+MSG_COLS = [COL[k] for k in ("messages", "input", "output") if COL.get(k)]
+if MSG_COLS:
+    other = df[~df.index.isin(calls.index)].sort_values([CASE, "source_row"], kind="stable")
+    for cid, g in other.groupby(CASE, sort=False):
+        for col_ in MSG_COLS:
+            vals = g[col_][g[col_].map(has_value)]
+            if len(vals):
+                t_ = user_text(vals.iloc[0])
+                if t_:
+                    FIRST_TXT[cid] = t_
+                    FIRST_MSG[cid] = f"[{g.loc[vals.index[0], SOURCE]} · {col_}] {t_}"
+                    seen, parts = set(), []                                  # complete input: every user message of the interaction, in order
+                    for v_ in vals:
+                        for m_ in (user_texts(v_) or [v_]):
+                            m_ = text_of(m_, limit=32000)
+                            if m_ and m_ not in seen:
+                                seen.add(m_)
+                                parts.append(m_)
+                    FULL_MSG[cid] = " ‖ ".join(parts)
+                    break
+fact("first_msg", len(FIRST_MSG), "Interactions with a logged first message (row that is not a call: messages, else input, else output)")
+del df
+
+# %% PHASE 2 - Prepare the calls
+
+section("PHASE 2  Prepare the calls")
+# 2a. discover the timestamp field and an agent field inside the JSON payload (from the data, not typed)
+time_path = agent_path = None
+if COL["payload"]:
+    def flatten(rows):
+        docs = rows[COL["payload"]].dropna()
+        docs = docs.sample(min(args.sample, len(docs)), random_state=args.seed).map(parse_json)
+        return [leaves(d) for d in docs if isinstance(d, dict)]
+
+    flat = flatten(calls)
+    cand = []
+    for p, k in Counter(p for f in flat for p in f).items():
+        vals = [f[p] for f in flat if p in f]
+        if to_time(vals, CEILING).notna().all():
+            cand.append((k, len(set(map(str, vals))), p))
+    time_path = args.time_field or (max(cand)[2] if cand else None)
+    known_agents = set(calls[AGENT].dropna().astype(str))
+    missing = calls[calls[AGENT].isna()]
+    if known_agents and len(missing):
+        flat_na = flatten(missing)
+        cand = []
+        for p, k in Counter(p for f in flat_na for p in f if has_value(f[p])).items():
+            if all(str(f[p]) in known_agents for f in flat_na if p in f and has_value(f[p])):
+                cand.append((k, p))
+        agent_path = max(cand)[1] if cand else None
+if time_path or agent_path:
+    picked = calls[COL["payload"]].map(lambda v: (lambda d: (get_path(d, time_path) if time_path else None,
+                                                             get_path(d, agent_path) if agent_path else None))(parse_json(v)))
+    calls["_t"] = to_time(picked.map(lambda x: x[0]), CEILING) if time_path else pd.NaT
+    calls["_agent_payload"] = picked.map(lambda x: str(x[1]) if has_value(x[1]) else None) if agent_path else None
+    del picked
+else:
+    calls["_t"] = pd.NaT
+calls["_t"] = pd.to_datetime(calls["_t"], utc=True)
+FACTS["time_field"] = time_path
+log.info("   Order of calls: as logged" + (f" (payload field '{time_path}', then row order)" if time_path else " (row order)"))
+
+# 2b. API names: one log table writes '<system><sep><api>'; the system list is learned from names logged both ways
+SEP = re.compile(r"[^0-9A-Za-z_]")
+names = calls.groupby(SOURCE)[TOOL].agg(lambda x: set(x.astype(str)))
+canon, two_names = {}, []
+for src, own in names.items():
+    others = set().union(*[v for k, v in names.items() if k != src]) if len(names) > 1 else set()
+    for name in own:
+        target, prefix = name, ""
+        if name not in others:
+            for hit in SEP.finditer(name):
+                if name[hit.end():] in others:
+                    target, prefix = name[hit.end():], name[:hit.start()]
+                    break
+        canon[(src, name)] = target
+        if target != name:
+            two_names.append({"Log table": src, "Logged as": name, "Same API as": target, "System prefix": prefix, "Plain name seen elsewhere": "yes"})
+SYSTEMS = {r["System prefix"] for r in two_names if r["System prefix"]}
+
+
+def prefix_of(name):
+    hit = SEP.search(name)
+    return name[:hit.start()] if hit and name[:hit.start()] in SYSTEMS else None
+
+
+for (src, name), target in list(canon.items()):
+    p = prefix_of(name)
+    if target == name and p:
+        canon[(src, name)] = name[len(p) + 1:]
+        two_names.append({"Log table": src, "Logged as": name, "Same API as": name[len(p) + 1:], "System prefix": p, "Plain name seen elsewhere": "no"})
+calls["_logged"] = calls[TOOL].astype(str)
+calls[TOOL] = [canon[(a, b)] for a, b in zip(calls[SOURCE], calls["_logged"])]
+calls = calls[calls[TOOL].map(lambda v: bool(NAMED.search(str(v))))]   # a name that is only a system prefix names no API
+API_SYSTEM = calls.groupby(TOOL)["_logged"].agg(lambda x: " / ".join(sorted({prefix_of(v) for v in set(x)} - {None})) or None).dropna()
+fact("systems", ", ".join(sorted(SYSTEMS)) or "none", "Systems NORA writes in front of API names")
+
+def norm_input(v):
+    d = parse_json(v)
+    return json.dumps(d, sort_keys=True, default=str) if d is not None else (None if v is None else str(v).strip())
+
+
+calls["_in"] = calls[COL["input"]].map(norm_input) if COL["input"] else None
+calls["_out"] = calls[COL["output"]] if COL["output"] else None
+
+
+def order_calls(frame):
+    full = frame["_t"].notna().groupby(frame[CASE]).transform("all")
+    secs = (frame["_t"] - pd.Timestamp("1970-01-01", tz="UTC")).dt.total_seconds()
+    frame = frame.assign(_order=np.where(full, secs, frame["source_row"]))
+    return frame.sort_values([CASE, "_order", "source_row"], kind="stable"), full
+
+
+# 2d. the same call written to two log tables is counted once (match: interaction + API + occurrence; checked by identical input)
+calls, _ = order_calls(calls)
+src_count = calls[SOURCE].value_counts()
+primary = src_count.index[0]
+calls["_k"] = calls.groupby([CASE, SOURCE, TOOL]).cumcount()
+drop, dup_rows = [], []
+for s in src_count.index[1:]:
+    a = calls[calls[SOURCE] == primary][[CASE, TOOL, "_k"]].reset_index().rename(columns={"index": "_ia"})
+    b = calls[calls[SOURCE] == s][[CASE, TOOL, "_k"]].reset_index().rename(columns={"index": "_ib"})
+    m = a.merge(b, on=[CASE, TOOL, "_k"])
+    ia, ib = calls.loc[m["_ia"], "_in"].values, calls.loc[m["_ib"], "_in"].values
+    both = pd.notna(ia) & pd.notna(ib)
+    dup_rows.append({"Log table": s, "Call rows": int((calls[SOURCE] == s).sum()), "Same call already in": primary, "Matched": len(m),
+                     "Identical input in matched pairs": round(float(np.mean(ia[both] == ib[both])), 4) if both.any() else None})
+    A, B = m["_ia"].values, m["_ib"].values
+    for c in ("_in", "_out", "_agent_payload") if "_agent_payload" in calls else ("_in", "_out"):
+        va, vb = calls.loc[A, c].values, calls.loc[B, c].values
+        fill = pd.isna(va) & pd.notna(vb)
+        calls.loc[A[fill], c] = vb[fill]
+    need = calls.loc[A, AGENT].isna().values & calls.loc[B, AGENT].notna().values
+    calls.loc[A[need], AGENT] = calls.loc[B[need], AGENT].values
+    ta = calls.loc[A, "_t"]
+    calls.loc[A, "_t"] = ta.where(ta.notna(), pd.Series(calls.loc[B, "_t"].array, index=ta.index))
+    drop.extend(B.tolist())
+calls = calls.drop(index=drop)
+calls, full = order_calls(calls)
+DUPLICATES = pd.DataFrame(dup_rows)
+fact("calls", len(calls), "Tool calls after counting each call once")
+
+# 2e. agent of each call: from the log, from a payload field, or from the only agent ever seen running that API; never guessed
+calls["agent_basis"] = np.where(calls[AGENT].notna(), "recorded", None)
+if agent_path:
+    fill = calls[AGENT].isna() & calls["_agent_payload"].notna()
+    calls.loc[fill, AGENT] = calls.loc[fill, "_agent_payload"]
+    calls.loc[fill, "agent_basis"] = "payload field"
+owners = calls.dropna(subset=[AGENT]).groupby(TOOL)[AGENT].agg(lambda s: sorted(set(s)))
+single = {t: a[0] for t, a in owners.items() if len(a) == 1}
+fill = calls[AGENT].isna() & calls[TOOL].isin(single)
+calls.loc[fill, AGENT] = calls.loc[fill, TOOL].map(single)
+calls.loc[fill, "agent_basis"] = "only agent of this API"
+UNKNOWN = "(agent not recorded)"
+calls["agent_basis"] = calls["agent_basis"].fillna("not recorded")
+calls[AGENT] = calls[AGENT].fillna(UNKNOWN).astype(str)
+fact("agent_known", pct(1 - (calls["agent_basis"] == "not recorded").mean()), "Calls whose agent is known")
+
+# %% PHASE 3 - Event log: every interaction as ordered steps
+
+section("PHASE 3  Event log")
+calls = calls.reset_index(drop=True)
+calls["call_no"] = calls.groupby(CASE).cumcount()
+calls["task"] = calls[AGENT] + " · " + calls[TOOL].astype(str)
+new_step = calls["task"] != calls.groupby(CASE)["task"].shift()
+calls["step_no"] = new_step.astype(int).groupby(calls[CASE]).cumsum()
+same_step = ~new_step
+same_in = calls["_in"].fillna("\x00").eq(calls.groupby(CASE)["_in"].shift().fillna("\x00"))
+calls["retry"] = same_step & same_in
+
+IDS = calls[CASE].drop_duplicates().tolist()
+n = len(IDS)
+first = calls.groupby([CASE, "task"], sort=False)["call_no"].min()
+POS = {c: g.droplevel(0).to_dict() for c, g in first.groupby(level=0, sort=False)}          # first position of each task
+TASKS = {c: set(p) for c, p in POS.items()}
+STEPS = calls[new_step].groupby(CASE, sort=False)["task"].agg(list).to_dict()                # ordered steps
+TASK_AGENT = calls.groupby("task")[AGENT].first().to_dict()
+TASK_API = calls.groupby("task")[TOOL].first().to_dict()
+SYS_OF = {t: API_SYSTEM.get(a) for t, a in TASK_API.items()}
+fact("interactions", n, "Interactions with at least one call")
+fact("agents", calls.loc[calls[AGENT] != UNKNOWN, AGENT].nunique(), "Agents")
+fact("apis", calls[TOOL].nunique(), "Distinct APIs")
+fact("tasks", len(TASK_AGENT), "Distinct tasks (agent · API)")
+fact("variants", len(Counter(tuple(STEPS[c]) for c in IDS)), "Different exact step sequences")
+
+# %% PHASE 4 - Hand-off detection: a call whose name is another agent's name (words shared by several agent names ignored)
+
+section("PHASE 4  Hand-off detection")
+
+
+def words(x):
+    return {w for w in re.split(r"[^0-9a-z]+", str(x).lower()) if w}
+
+
+AGENTS = sorted(a for a in calls[AGENT].unique() if a != UNKNOWN)
+shared = Counter(w for a in AGENTS for w in words(a))
+GENERIC = {w for w, k in shared.items() if k > 1}
+OWN = {a: words(a) - GENERIC for a in AGENTS}
+HANDOFF, detect = {}, []
+for t in sorted(calls[TOOL].astype(str).unique()):
+    tw = words(t)
+    hits = [a for a in AGENTS if OWN[a] and OWN[a] <= tw and tw - OWN[a] <= GENERIC]
+    if len(hits) != 1:
+        continue
+    callers = calls.loc[calls[TOOL] == t, AGENT]
+    if (callers != hits[0]).mean() <= MAJORITY:
+        continue
+    HANDOFF[t] = hits[0]
+    detect.append({"Hand-off call": t, "Agent it names": hits[0], "Words only this agent's name has": ", ".join(sorted(OWN[hits[0]])),
+                   "Made by": " · ".join(f"{a} ({k:,})" for a, k in callers.value_counts().items())})
+calls["is_handoff"] = calls[TOOL].isin(list(HANDOFF))
+HO = calls[calls["is_handoff"]]
+DISP = HO.groupby(CASE)[TOOL].agg(set).to_dict()                                             # hand-offs per interaction
+HO_FIRST = HO.groupby([CASE, TOOL])["call_no"].min().to_dict()
+WORK = calls[~calls["is_handoff"]]
+RAN = WORK.groupby(CASE)[AGENT].agg(set).to_dict()                                           # agents that did work
+AG_FIRST = WORK.groupby([CASE, AGENT])["call_no"].min().to_dict()
+AGENT_TASKS = WORK.groupby(AGENT)["task"].agg(lambda s: sorted(set(s))).to_dict()
+calls["system"] = np.where(calls["is_handoff"], "hand-off", calls[TOOL].map(API_SYSTEM).fillna("not recorded"))
+fact("handoffs", ", ".join(HANDOFF) or "none", "Hand-off calls found")
+fact("coordinator", " · ".join(f"{a} ({k:,})" for a, k in HO[AGENT].value_counts().items()) or "none", "Agent(s) making the hand-offs")
+fact("handoff_calls", int(calls["is_handoff"].sum()), "Hand-off calls")
+fact("api_calls", int((~calls["is_handoff"]).sum()), "API calls (tool calls that fetch from a system)")
+
+# %% PHASE 5 - The model (learned only from the interactions it is given)
+#   (a) hand-off test   which hand-offs bring work that does not happen otherwise (Fisher's exact test + Benjamini-Hochberg)
+#   (b) classes         interaction class = exact set of hand-offs that bring work
+#   (c) task DAGs       standard plan + one sub-plan per hand-off: Heuristics Miner dependency + binomial test + BH, cycles broken, transitive reduction, stages
+
+section("PHASE 5  The model")
+
+
+def fisher_greater(a, b, c, d):
+    return fisher_exact([[a, b], [c, d]], alternative="greater")
+
+
+def handoff_test(ids):
+    ids_set, m = set(ids), len(ids)
+    rows, task_rows = [], []
+    for t, ag in HANDOFF.items():
+        handed = {c for c in ids if t in DISP.get(c, ())}
+        nd, nn = len(handed), m - len(handed)
+        ran = {c for c in ids if ag in RAN.get(c, ())}
+        both, without = len(handed & ran), len(ran - handed)
+        odds, p = fisher_greater(both, nd - both, without, nn - without) if nd and nn else (np.nan, np.nan)
+        rows.append({"t": t, "a": ag, "nd": nd, "nn": nn, "with": both / nd if nd else np.nan, "without": without / nn if nn else np.nan,
+                     "odds": odds, "p": p})
+        for task in AGENT_TASKS.get(ag, []):
+            tw = sum(1 for c in handed if task in TASKS[c])
+            to = sum(1 for c in ids_set - handed if task in TASKS[c])
+            _, tp = fisher_greater(tw, nd - tw, to, nn - to) if nd and nn else (np.nan, np.nan)
+            task_rows.append({"t": t, "task": task, "with": tw / nd if nd else np.nan, "without": to / nn if nn else np.nan, "p": tp,
+                              "home": tw / (tw + to) if tw + to else np.nan})
+    for r, q in zip(rows, bh([r["p"] for r in rows])):
+        r["q"] = q
+    for r, q in zip(task_rows, bh([r["p"] for r in task_rows])):
+        r["q"] = q
+        r["dependent"] = bool(r["with"] > MAJORITY and r["without"] < MAJORITY and q < ALPHA)
+    dep = defaultdict(list)
+    for r in task_rows:
+        if r["dependent"]:
+            dep[r["t"]].append(r["task"])
+    for r in rows:
+        r["dependent_tasks"] = sorted(dep.get(r["t"], []))
+        own = [x for x in task_rows if x["t"] == r["t"] and x["dependent"]]
+        r["best"] = max(own, key=lambda x: (x["with"] - x["without"], -x["q"])) if own else None
+        if r["dependent_tasks"]:                                              # at least one task that only runs after this hand-off
+            r["verdict"] = "Brings specialist work"
+        elif pd.notna(r["without"]) and r["without"] >= MAJORITY:
+            r["verdict"] = "Agent works regardless of the hand-off"
+        else:
+            r["verdict"] = "No clear link"
+    return rows, task_rows
+
+
+def binom_greater(k, n_):
+    return binom.sf(np.asarray(k) - 1, np.asarray(n_), 0.5)
+
+
+def build_plan(members, tasks):
+    """Dependency DAG over `tasks` learned from the first positions of the tasks in `members`."""
+    k = len(tasks)
+    empty = {"tasks": list(tasks), "stages": [list(tasks)] if k else [], "edges": [], "stats": [], "pred": {t: [] for t in tasks}}
+    if k < 2 or not members:
+        return empty
+    P = np.full((len(members), k), np.inf)
+    for i, c in enumerate(members):
+        pos = POS[c]
+        for j, t in enumerate(tasks):
+            if t in pos:
+                P[i, j] = pos[t]
+    fin = np.isfinite(P)
+    before = np.zeros((k, k))
+    for a in range(k):
+        before[a] = ((P[:, [a]] < P) & fin[:, [a]] & fin).sum(0)
+    A, B = np.where(before > before.T)
+    kept = {}
+    if len(A):
+        ab, ba = before[A, B], before[B, A]
+        dep = (ab - ba) / (ab + ba + 1)
+        q = bh(binom_greater(ab, ab + ba))
+        keep = (dep >= args.dependency) & (q < ALPHA)
+        kept = {(int(a), int(b)): (int(x), int(y), float(d), float(qq)) for a, b, x, y, d, qq, kp in zip(A, B, ab, ba, dep, q, keep) if kp}
+    if not kept:
+        return empty
+    while True:                                                    # topological order; break a cycle at its weakest edge
+        indeg = Counter(b for _, b in kept)
+        succ = defaultdict(list)
+        for a, b in kept:
+            succ[a].append(b)
+        ready = sorted(j for j in range(k) if indeg[j] == 0)
+        order = []
+        while ready:
+            j = ready.pop(0)
+            order.append(j)
+            for b in succ[j]:
+                indeg[b] -= 1
+                if indeg[b] == 0:
+                    ready.append(b)
+        if len(order) == k:
+            break
+        done = set(order)
+        kept.pop(min((e for e in kept if e[0] not in done and e[1] not in done), key=lambda e: kept[e][2]))
+    reach = {j: set() for j in range(k)}
+    for j in reversed(order):
+        for b in succ[j]:
+            reach[j] |= {b} | reach[b]
+    reduced = sorted((a, b) for a, b in kept if not any(b in reach[x] for x in succ[a] if x != b))   # transitive reduction
+    level = {}
+    for j in order:
+        level[j] = 1 + max((level[a] for a, b in reduced if b == j), default=0)
+    stages = [sorted(tasks[j] for j in range(k) if level[j] == s) for s in range(1, max(level.values()) + 1)]
+    return {"tasks": list(tasks), "stages": stages, "edges": [(tasks[a], tasks[b]) for a, b in reduced],
+            "stats": [{"From task": tasks[a], "To task": tasks[b], "Traces with both": kept[(a, b)][0] + kept[(a, b)][1],
+                       "From came first": kept[(a, b)][0], "To came first": kept[(a, b)][1],
+                       "Dependency (0-1)": round(kept[(a, b)][2], 3), "p-value (BH)": p_text(kept[(a, b)][3])} for a, b in reduced],
+            "pred": {t: sorted(tasks[a] for a, b in reduced if tasks[b] == t) for t in tasks}}
+
+
+def core(ids, keep_task):
+    m = len(ids)
+    cnt = Counter(t for c in ids for t in TASKS[c] if keep_task(t))
+    return sorted(t for t, k in cnt.items() if k / m > MAJORITY)
+
+
+NONE_LABEL = "No hand-off that brings specialist work"
+
+
+def learn(ids):
+    """Fit the decomposition model on `ids` only."""
+    rows, task_rows = handoff_test(ids)
+    driving = {r["t"] for r in rows if r["verdict"] == "Brings specialist work"}
+    specialist_tasks = {r["task"] for r in task_rows if r["t"] in driving and (r["dependent"] or r["home"] > MAJORITY)}
+    share = Counter(t for c in ids for t in TASKS[c])
+
+    def layer(task):
+        api = TASK_API[task]
+        if api in driving:
+            return "Hand-off"
+        if api in HANDOFF:
+            return "Hand-off (no specialist work)"
+        if task in specialist_tasks:
+            return "Specialist"
+        if TASK_AGENT[task] == UNKNOWN:
+            return "Agent not recorded"
+        return "Standard" if share[task] / len(ids) > MAJORITY else "Occasional"
+
+    lay = {t: layer(t) for t in TASK_AGENT}
+
+    def label(c):
+        combo = sorted(t for t in DISP.get(c, ()) if t in driving)
+        return " + ".join(combo) if combo else NONE_LABEL
+
+    labels = {c: label(c) for c in ids}
+    members = defaultdict(list)
+    for c in ids:
+        members[labels[c]].append(c)
+    std = build_plan(ids, core(ids, lambda t: lay[t] in ("Standard", "Agent not recorded") or (lay[t] == "Hand-off (no specialist work)" and share[t] / len(ids) > MAJORITY)))
+    dep_of = {r["t"]: set(r["dependent_tasks"]) for r in rows}
+    subs = {}                                                                # one sub-plan per hand-off that brings work
+    for t in sorted(driving):
+        mem = [c for c in ids if t in DISP.get(c, ())]
+        ho = [x for x in TASK_API if TASK_API[x] == t]
+        subs[t] = build_plan(mem, sorted(set(ho) | dep_of[t]))      # hand-off + the tasks it brings; their order is learned from the traces
+    cls = {}                                                                 # class steps: run by most interactions of the class, not already planned
+    for l_, mem_ in members.items():
+        if len(mem_) < args.folds:
+            continue
+        have = set(std["tasks"]) | {x for t in driving if l_ != NONE_LABEL and t in l_.split(" + ") for x in subs[t]["tasks"]}
+        cls[l_] = [t for t in core(mem_, lambda t: True) if t not in have]
+    one = build_plan(ids, core(ids, lambda t: True))                         # baseline: one plan for everyone, no decomposition
+    calls_n = {c: CALLS_N[c] for c in ids}
+    med = {l: float(np.median([calls_n[c] for c in mem])) for l, mem in members.items()}
+    return {"rows": rows, "task_rows": task_rows, "driving": driving, "layer": lay, "label": label, "labels": labels, "members": members,
+            "std": std, "subs": subs, "cls": cls, "one": one, "median_calls": med, "median_all": float(np.median(list(calls_n.values())))}
+
+
+CALLS_N = calls.groupby(CASE).size().to_dict()
+log.info("   model defined: hand-off test -> classes -> standard plan + one sub-plan per hand-off (learned only from the interactions it is fitted on)")
+
+# %% PHASE 6 - Validation: k-fold cross-validation on unseen interactions
+#   With decomposition    = standard plan + the sub-plan of every hand-off in the interaction
+#   Without decomposition = one plan learned from all training interactions (the baseline the decomposition must beat)
+
+section(f"PHASE 6  Validation ({args.folds}-fold cross-validation)")
+
+
+def compose(model, c):
+    """Executable plan of an interaction = standard plan + the sub-plan of every hand-off that brings work in it."""
+    tasks, edges = set(model["std"]["tasks"]), list(model["std"]["edges"])
+    for t in sorted(DISP.get(c, ())):
+        if t in model["subs"]:
+            tasks |= set(model["subs"][t]["tasks"])
+            edges += model["subs"][t]["edges"]
+    tasks |= set(model["cls"].get(model["label"](c), ()))
+    return tasks, edges
+
+
+def order_check(edges, pos):
+    ok = tot = 0
+    for a, b in edges:
+        if a in pos and b in pos:
+            tot += 1
+            ok += pos[a] < pos[b]
+    return ok, tot
+
+
+def evaluate(model, ids):
+    res = []
+    for c in ids:
+        lab = model["label"](c)
+        pred, edges = compose(model, c)
+        base = set(model["one"]["tasks"])
+        act, pos = TASKS[c], POS[c]
+        spec = lambda S: {t for t in S if model["layer"].get(t) in ("Hand-off", "Specialist")}
+        sp, sa, sb = spec(pred), spec(act), spec(base)
+        ok, tot = order_check(edges, pos)
+        bok, btot = order_check(model["one"]["edges"], pos)
+        res.append({"case": c, "label": lab, "tp": len(pred & act), "fp": len(pred - act), "fn": len(act - pred),
+                    "btp": len(base & act), "bfp": len(base - act), "bfn": len(act - base),
+                    "stp": len(sp & sa), "sfp": len(sp - sa), "sfn": len(sa - sp), "sbtp": len(sb & sa), "sbfp": len(sb - sa), "sbfn": len(sa - sb),
+                    "ok": ok, "tot": tot, "bok": bok, "btot": btot, "follows": ok == tot, "bfollows": bok == btot,
+                    "ae": abs(CALLS_N[c] - model["median_calls"].get(lab, model["median_all"])), "bae": abs(CALLS_N[c] - model["median_all"])})
+    return pd.DataFrame(res)
+
+
+def prf(tp, fp, fn):
+    p, r = tp / np.maximum(tp + fp, 1), tp / np.maximum(tp + fn, 1)
+    return p, r, 2 * p * r / np.maximum(p + r, 1e-12)
+
+
+def scores(r):
+    out = {}
+    for pre, (tp, fp, fn) in (("s", ("stp", "sfp", "sfn")), ("b_s", ("sbtp", "sbfp", "sbfn")), ("", ("tp", "fp", "fn")), ("b_", ("btp", "bfp", "bfn"))):
+        out[pre + "precision"], out[pre + "recall"], out[pre + "f1"] = prf(r[tp].sum(), r[fp].sum(), r[fn].sum())
+    out.update(order=r["ok"].sum() / max(r["tot"].sum(), 1), b_order=r["bok"].sum() / max(r["btot"].sum(), 1),
+               follows=r["follows"].mean(), b_follows=r["bfollows"].mean(), mae=r["ae"].median(), b_mae=r["bae"].median())
+    return {k: float(v) for k, v in out.items()}
+
+
+strat_raw = [" + ".join(sorted(DISP.get(c, ()))) for c in IDS]
+cnt = Counter(strat_raw)
+strat = [s if cnt[s] >= args.folds else "rare" for s in strat_raw]
+folds = min(args.folds, max(2, min(Counter(strat).values()))) if n >= 2 * args.folds else 2
+skf = StratifiedKFold(n_splits=folds, shuffle=True, random_state=args.seed)
+OOF, FOLD_ROWS, VERDICTS = [], [], defaultdict(list)
+for k, (tr, te) in enumerate(skf.split(np.zeros(n), strat), start=1):
+    t1 = time.time()
+    train, test = [IDS[i] for i in tr], [IDS[i] for i in te]
+    model = learn(train)
+    r = evaluate(model, test)
+    OOF.append(r)
+    s = scores(r)
+    for row in model["rows"]:
+        VERDICTS[row["t"]].append(row["verdict"])
+    FOLD_ROWS.append({"Fold": k, "Train interactions": len(train), "Test interactions": len(test), "Classes in training": len(model["members"]),
+                      "Specialist task precision": s["sprecision"], "Specialist task recall": s["srecall"], "Specialist task F1": s["sf1"],
+                      "Task precision": s["precision"], "Task recall": s["recall"], "Task F1": s["f1"], "Order accuracy": s["order"],
+                      "Tool-call error (median)": round(s["mae"], 2),
+                      "Baseline task F1": s["b_f1"], "Seconds": round(time.time() - t1, 1)})
+    log.info(f"   fold {k}/{folds}: train {len(train):,} · test {len(test):,} · specialist F1 {s['sf1']:.3f} · "
+             f"task F1 {s['f1']:.3f} (baseline {s['b_f1']:.3f}) · order {s['order']:.3f} · tool-call error {s['mae']:.1f} (baseline {s['b_mae']:.1f})")
+OOF = pd.concat(OOF, ignore_index=True)
+POOLED = scores(OOF)
+
+# bootstrap 95% confidence intervals: resample the unseen interactions with replacement
+rng = np.random.default_rng(args.seed)
+SUMS = ["tp", "fp", "fn", "btp", "bfp", "bfn", "stp", "sfp", "sfn", "sbtp", "sbfp", "sbfn", "ok", "tot", "bok", "btot"]
+M = OOF[SUMS].to_numpy(float)
+MEANS = OOF[["follows", "bfollows"]].to_numpy(float)
+AE = OOF[["ae", "bae"]].to_numpy(float)
+boot = defaultdict(list)
+step = max(1, args.bootstrap // 10)
+for b0 in range(0, args.bootstrap, step):
+    nb = min(step, args.bootstrap - b0)
+    W = rng.multinomial(len(OOF), np.full(len(OOF), 1 / len(OOF)), size=nb).astype(float)
+    col = dict(zip(SUMS, (W @ M).T))
+    for pre, (tp, fp, fn) in (("s", ("stp", "sfp", "sfn")), ("b_s", ("sbtp", "sbfp", "sbfn")), ("", ("tp", "fp", "fn")), ("b_", ("btp", "bfp", "bfn"))):
+        for name, v in zip(("precision", "recall", "f1"), prf(col[tp], col[fp], col[fn])):
+            boot[pre + name] += list(v)
+    boot["order"] += list(col["ok"] / np.maximum(col["tot"], 1))
+    boot["b_order"] += list(col["bok"] / np.maximum(col["btot"], 1))
+    for name, v in zip(("follows", "b_follows"), (W @ MEANS / len(OOF)).T):
+        boot[name] += list(v)
+    idx = rng.integers(0, len(OOF), size=(nb, len(OOF)))
+    boot["mae"] += list(np.median(AE[idx, 0], axis=1))
+    boot["b_mae"] += list(np.median(AE[idx, 1], axis=1))
+    log.info(f"   bootstrap {b0 + nb:,}/{args.bootstrap:,}")
+CI = {k: (float(np.percentile(v, 2.5)), float(np.percentile(v, 97.5))) for k, v in boot.items()}
+fold_df = pd.DataFrame(FOLD_ROWS)
+for key, name in (("sf1", "Specialist task F1"), ("f1", "Task F1"), ("order", "Order accuracy"), ("mae", "Tool-call error (median)")):
+    fact(f"cv_{key}", f"{POOLED[key]:.3f} (95% CI {CI[key][0]:.3f}-{CI[key][1]:.3f}" + ("" if key == "sf1" else f"; baseline {POOLED['b_' + key]:.3f}") + ")",
+         f"{name} on unseen interactions")
+
+# %% PHASE 7 - Final model on all interactions
+
+section("PHASE 7  Final model (all interactions)")
+FINAL = learn(IDS)
+ORDER = sorted(FINAL["members"], key=lambda l: (-len(FINAL["members"][l]), l))
+width = max(2, len(str(len(ORDER))))
+CLASS = {l: f"Class {i + 1:0{width}d}" for i, l in enumerate(ORDER)}
+LABEL = FINAL["labels"]
+calls["layer"] = calls["task"].map(FINAL["layer"])
+for r in FINAL["rows"]:
+    r["stable"] = f"{Counter(VERDICTS[r['t']])[r['verdict']]} of {len(VERDICTS[r['t']])}"
+    log.info(f"   {r['t']:<26} -> {r['a']:<24} handed {r['nd']:>5} · ran when handed {pct(r['with']):>4} · when not {pct(r['without']):>4} · "
+             f"{r['verdict']} (same in {r['stable']} folds)")
+sizes = np.array([len(FINAL["members"][l]) for l in ORDER])
+cover = np.cumsum(sizes) / n
+fact("driving", f"{len(FINAL['driving'])} of {len(HANDOFF)}", "Hand-offs that bring specialist work")
+fact("classes", len(ORDER), "Decomposition classes")
+fact("cover", f"{int(np.searchsorted(cover, .5) + 1)} / {int(np.searchsorted(cover, .8) + 1)}", "Classes covering half / 80% of interactions")
+fact("std_plan", f"{len(FINAL['std']['tasks'])} tasks in {len(FINAL['std']['stages'])} stages", "Standard plan (every interaction)")
+for t, sp in sorted(FINAL["subs"].items()):
+    log.info(f"   sub-plan {t:<22} {len(sp['tasks'])} tasks in {len(sp['stages'])} stage(s)")
+
+# %% PHASE 8 - Approved traces: follow their plan and are not anomalous
+
+section("PHASE 8  Approved traces")
+per = pd.DataFrame(index=pd.Index(IDS, name="case"))
+per["tool_calls"] = pd.Series(CALLS_N)
+per["handoff_calls"] = calls[calls["is_handoff"]].groupby(CASE).size()
+per = per.fillna(0)
+per["api_calls"] = per["tool_calls"] - per["handoff_calls"]
+per["agents"] = calls[calls[AGENT] != UNKNOWN].groupby(CASE)[AGENT].nunique()
+per["distinct_apis"] = calls.groupby(CASE)[TOOL].nunique()
+per["steps"] = pd.Series({c: len(STEPS[c]) for c in IDS})
+per["repeats"] = calls.groupby(CASE)["retry"].sum()
+per = per.fillna(0)
+X = np.log1p(per[["agents", "tool_calls", "distinct_apis", "steps", "repeats"]].astype(float).values)
+iso = IsolationForest(n_estimators=300, random_state=args.seed).fit(X)
+per["anomaly_score"] = -iso.score_samples(X)
+q1, q3 = np.percentile(per["anomaly_score"], [25, 75])
+per["anomalous"] = per["anomaly_score"] > q3 + 1.5 * (q3 - q1)
+per["follows"] = pd.Series({c: order_check(compose(FINAL, c)[1], POS[c])[0] == order_check(compose(FINAL, c)[1], POS[c])[1] for c in IDS})
+per["approved"] = per["follows"] & ~per["anomalous"]
+per["class"] = [CLASS[LABEL[c]] for c in IDS]
+per["label"] = [LABEL[c] for c in IDS]
+fact("anomalous", int(per["anomalous"].sum()), "Anomalous interactions (isolation forest, Q3 + 1.5 IQR)")
+fact("follows", int(per["follows"].sum()), "Interactions that follow their plan fully")
+fact("approved", int(per["approved"].sum()), "Approved traces (follow the plan, not anomalous)")
+
+# %% PHASE 9 - Outputs
+
+section("PHASE 9  Outputs")
+from openpyxl import load_workbook
+from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
+from openpyxl.comments import Comment
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+
+ARROW = "  →  "
+step_rows = calls[new_step]
+STEP_TXT = (step_rows["task"] + " [" + step_rows["system"].astype(str) + "]").groupby(step_rows[CASE], sort=False).agg(list).to_dict()
+by_sys = calls[~calls["is_handoff"]].groupby([CASE, "system"]).size().unstack(fill_value=0)
+sys_order = list(by_sys.sum().sort_values(ascending=False).index)
+SYS_TXT = {c: " · ".join(f"{s} {int(r[s])}" for s in sys_order if r[s]) for c, r in by_sys.iterrows()}
+
+# ---- workbook 1: the decomposition ----
+HANDED = Counter(t for c in IDS for t in DISP.get(c, ()))
+
+
+def decomposition(label):
+    """Readable executable plan of a class: standard plan, then each hand-off (in the order seen in the class) and the APIs it brings."""
+    mem = FINAL["members"][label]
+    hos = [t for t in FINAL["driving"] if label != NONE_LABEL and t in label.split(" + ")]
+    hos = sorted(hos, key=lambda t: (np.median([HO_FIRST[(c, t)] for c in mem if (c, t) in HO_FIRST] or [np.inf]), t))
+    parts = [f"Standard plan ({len(FINAL['std']['tasks'])} tasks)"]
+    n_tasks = len(FINAL["std"]["tasks"])
+    for t in hos:
+        sub = [x for x in FINAL["subs"][t]["tasks"] if TASK_API[x] != t]
+        n_tasks += len(FINAL["subs"][t]["tasks"])
+        by_agent = defaultdict(list)
+        for x in sub:
+            by_agent[TASK_AGENT[x]].append(TASK_API[x])
+        parts.append(f"{t} → " + "; ".join(f"{a}: {', '.join(v)}" for a, v in sorted(by_agent.items())) if by_agent else t)
+    own = FINAL["cls"].get(label, [])
+    if own:
+        n_tasks += len(own)
+        by_agent = defaultdict(list)
+        for x in own:
+            by_agent[TASK_AGENT[x]].append(TASK_API[x])
+        parts.append("class steps → " + "; ".join(f"{a}: {', '.join(sorted(v))}" for a, v in sorted(by_agent.items())))
+    return ARROW.join(parts), n_tasks
+
+
+# ---- input -> class: what the inputs of each class look like (counted, no word list typed in) ----
+def msg_words(t):
+    return {w for w in re.split(r"[^0-9a-z]+", str(t).lower()) if len(w) >= 3 and any(ch.isalpha() for ch in w) and w not in ENGLISH_STOP_WORDS}
+
+
+MSG_W = {c: msg_words(FIRST_TXT[c]) for c in IDS if FIRST_TXT.get(c)}
+ALL_W = Counter(w for ws in MSG_W.values() for w in ws)
+
+
+def input_examples(mem, k=3):
+    cnt = Counter(FIRST_TXT[c] for c in mem if FIRST_TXT.get(c))
+    return " ‖ ".join(f"{short} ({v})" for short, v in ((t if len(t) <= 120 else t[:119] + "…", v) for t, v in cnt.most_common(k))) or None
+
+
+def standout_words(mem, k=6):
+    """Words found in a larger share of this class's inputs than of all inputs (lift > 1), with at least 3 and 10% of the class's inputs."""
+    have = [c for c in mem if c in MSG_W]
+    if not have or not MSG_W:
+        return None
+    cw, n_c, n_a = Counter(w for c in have for w in MSG_W[c]), len(have), len(MSG_W)
+    rows = [(cw[w] / n_c / (ALL_W[w] / n_a), cw[w], w) for w in cw if cw[w] >= max(3, 0.1 * n_c) and cw[w] / n_c > ALL_W[w] / n_a]
+    return "; ".join(f"{w} ({k_ / n_c:.0%} vs {ALL_W[w] / n_a:.0%})" for _, k_, w in sorted(rows, reverse=True)[:k]) or None
+
+
+classes = pd.DataFrame([{
+    "Class": CLASS[l], "Specialists handed work": l, "Interactions": len(FINAL["members"][l]),
+    "Tool calls (median)": float(per.loc[FINAL["members"][l], "tool_calls"].median()),
+    "Hand-off calls (median)": float(per.loc[FINAL["members"][l], "handoff_calls"].median()),
+    "API calls (median)": float(per.loc[FINAL["members"][l], "api_calls"].median()),
+    "Tasks in executable plan": decomposition(l)[1],
+    "Decomposition (standard plan → hand-offs in order → APIs they bring)": decomposition(l)[0]} for l in ORDER])
+PLANS = [("Standard (every interaction)", FINAL["std"])] + [(f"{t} sub-plan", FINAL["subs"][t]) for t in sorted(FINAL["subs"], key=lambda t: (-HANDED[t], t))]
+plan_rows = []
+for name, pl in PLANS:
+    for si, st in enumerate(pl["stages"], start=1):
+        for t in st:
+            plan_rows.append({"Plan": name, "Stage": si, "Task (agent · API)": t,
+                              "System": "hand-off" if TASK_API[t] in HANDOFF else SYS_OF.get(t) or "not recorded",
+                              "Runs after": ", ".join(pl["pred"].get(t, [])) or "start"})
+task_plan = pd.DataFrame(plan_rows)
+cat = calls.groupby("task").agg(agent=(AGENT, "first"), api=(TOOL, "first"), system=("system", "first"), layer=("layer", "first"),
+                                inter=(CASE, "nunique"), n_calls=(TOOL, "size")).reset_index()
+LAYER_RANK = {"Hand-off": 0, "Specialist": 1, "Hand-off (no specialist work)": 2, "Standard": 3, "Occasional": 4, "Agent not recorded": 5}
+cat = cat.assign(_r=cat["layer"].map(LAYER_RANK)).sort_values(["_r", "agent", "n_calls"], ascending=[True, True, False])
+catalog = pd.DataFrame({"Agent": cat["agent"], "API": cat["api"], "System": cat["system"], "Layer": cat["layer"],
+                        "Interactions using it": cat["inter"], "Calls": cat["n_calls"]})
+
+# ---- why cases of the same class differ (every number counted from the logs) ----
+#   Total tool calls = plan tasks that ran + extra tasks (not in the plan) + repeat calls (same input) + repeat calls (different input)
+RETRY_N = calls.groupby(CASE)["retry"].sum().to_dict()
+FIRST_IN = calls.groupby(CASE, sort=False).head(1).set_index(CASE)[COL["input"]].to_dict() if COL["input"] else {}
+SEQ_N = Counter(tuple(STEPS[c]) for c in IDS)
+PLAN_T = {c: compose(FINAL, c)[0] for c in IDS}
+
+
+def short_list(items, k=6):
+    items = sorted(items)
+    return ", ".join(items[:k]) + (f" … (+{len(items) - k} more)" if len(items) > k else "")
+
+
+why = pd.DataFrame(index=pd.Index(IDS, name="case"))
+why["expected"] = [len(PLAN_T[c]) for c in IDS]
+why["plan_ran"] = [len(PLAN_T[c] & TASKS[c]) for c in IDS]
+why["extra"] = [len(TASKS[c] - PLAN_T[c]) for c in IDS]
+why["rep_same"] = [int(RETRY_N.get(c, 0)) for c in IDS]
+why["rep_other"] = [int(CALLS_N[c] - len(TASKS[c]) - RETRY_N.get(c, 0)) for c in IDS]
+why["vs_typical"] = [int(round(CALLS_N[c] - FINAL["median_calls"][LABEL[c]])) for c in IDS]
+why["missing"] = [short_list(PLAN_T[c] - TASKS[c]) for c in IDS]
+why["extra_list"] = [short_list(TASKS[c] - PLAN_T[c]) for c in IDS]
+why["same_steps"] = [SEQ_N[tuple(STEPS[c])] for c in IDS]
+assert (why["plan_ran"] + why["extra"] + why["rep_same"] + why["rep_other"] == pd.Series(CALLS_N).reindex(IDS).values).all()
+
+
+def top_share(series_of_sets, members, k=5):
+    cnt = Counter(t for c in members for t in series_of_sets[c])
+    return "; ".join(f"{t} ({v / len(members):.0%})" for t, v in cnt.most_common(k))
+
+
+# ---- typical values of each class and, per interaction, why it differs (named APIs as proof) ----
+STEPS_N = {c: len(STEPS[c]) for c in IDS}
+TASK_CALLS = calls.groupby([CASE, "task"]).size()
+TASK_RETRY = calls.groupby([CASE, "task"])["retry"].sum().astype(int)
+TASK_REP = (TASK_CALLS - 1 - TASK_RETRY).astype(int)                       # repeats of a task with different input (or not right after)
+REP_OF = {c: g.droplevel(0) for c, g in TASK_REP[TASK_REP > 0].groupby(level=0)}
+RET_OF = {c: g.droplevel(0) for c, g in TASK_RETRY[TASK_RETRY > 0].groupby(level=0)}
+why["total"] = [CALLS_N[c] for c in IDS]
+why["label"] = [LABEL[c] for c in IDS]
+STAT = {}
+for l in ORDER:
+    w = why.loc[FINAL["members"][l]]
+    STAT[l] = {"med": float(w["total"].median()), "q1": float(w["total"].quantile(.25)), "q3": float(w["total"].quantile(.75)),
+               **{k: float(w[k].median()) for k in ("plan_ran", "extra", "rep_same", "rep_other")}}
+ALL_SPREAD = (why["total"].quantile(.75) - why["total"].quantile(.25)) / max(why["total"].median(), 1)
+DRIVER = {"rep_other": "Repeated calls with different input", "rep_same": "Retries (same input)", "extra": "Extra tasks not in plan",
+          "plan_ran": "Plan tasks not run"}
+
+
+def named(c, ser, k=3):
+    if ser is None or not len(ser):
+        return ""
+    top = ser.sort_values(ascending=False).head(k)
+    return ", ".join(f"{TASK_API.get(t, t)} ×{int(TASK_CALLS[(c, t)])}" for t in top.index)
+
+
+def explain(c):
+    r, st = why.loc[c], STAT[LABEL[c]]
+    total, d = int(r["total"]), r["total"] - st["med"]
+    band = f"typical {st['med']:.0f}, range {st['q1']:.0f}–{st['q3']:.0f}"
+    if st["q1"] <= total <= st["q3"]:
+        versus, head = "Within typical", f"Within the class's typical range ({band})"
+    else:
+        versus, head = (f"Above typical ({d:+.0f})" if d > 0 else f"Below typical ({d:+.0f})"), f"{d:+.0f} calls vs class ({band})"
+    delta = {k: r[k] - st[k] for k in DRIVER}
+    parts = []
+    for k in sorted(delta, key=lambda k: -abs(delta[k])):
+        if abs(delta[k]) < 1:
+            continue
+        if k == "rep_other":
+            parts.append(f"repeated calls with different input {int(r[k])} ({delta[k]:+.0f}){': ' + named(c, REP_OF.get(c)) if r[k] else ''}")
+        elif k == "rep_same":
+            parts.append(f"retries {int(r[k])} ({delta[k]:+.0f}){': ' + named(c, RET_OF.get(c)) if r[k] else ''}")
+        elif k == "extra":
+            ex = sorted(TASK_API.get(t, t) for t in TASKS[c] - PLAN_T[c])
+            parts.append(f"extra tasks not in plan {int(r[k])} ({delta[k]:+.0f}){': ' + ', '.join(ex[:3]) + (' …' if len(ex) > 3 else '') if ex else ''}")
+        else:
+            miss = sorted(TASK_API.get(t, t) for t in PLAN_T[c] - TASKS[c])
+            parts.append(f"plan tasks that ran {int(r[k])} of {int(r['expected'])} ({delta[k]:+.0f})"
+                         f"{'; not run: ' + ', '.join(miss[:3]) + (' …' if len(miss) > 3 else '') if miss else ''}")
+    if versus == "Within typical":
+        driver = "Within typical range"
+    else:
+        same_dir = {k: v for k, v in delta.items() if (v > 0) == (d > 0) and abs(v) >= 1}
+        k = max(same_dir, key=lambda k: abs(same_dir[k])) if same_dir else None
+        driver = "Mixed (no single part)" if k is None else ("More plan tasks ran than typical" if k == "plan_ran" and delta[k] > 0 else DRIVER[k])
+    rep_all = TASK_CALLS.loc[c][TASK_CALLS.loc[c] > 1].sort_values(ascending=False)
+    top = f"{TASK_API.get(rep_all.index[0], rep_all.index[0])} ×{int(rep_all.iloc[0])}" if len(rep_all) else ""
+    return versus, head + (": " + "; ".join(parts) if parts else ""), driver, top
+
+
+EXPL = {c: explain(c) for c in IDS}
+why["versus"] = [EXPL[c][0] for c in IDS]
+why["driver"] = [EXPL[c][2] for c in IDS]
+
+# ---- honest check: can the input predict the class, and the experts NORA brings in? (learned on 4/5, tested on the unseen 1/5) ----
+TEXTED = [c for c in IDS if FIRST_TXT.get(c)]
+IN_CLASS, IN_HO, IN_SUM = {}, [], {}
+if len(TEXTED) >= 10 * args.folds:
+    def text_model():
+        return make_pipeline(TfidfVectorizer(ngram_range=(1, 2), min_df=2, sublinear_tf=True), LogisticRegression(max_iter=3000))
+
+    y_all = [CLASS[LABEL[c]] for c in TEXTED]
+    big = {k for k, v in Counter(y_all).items() if v >= args.folds}            # a class needs >= k interactions to be tested k-fold
+    keep = [i for i, y in enumerate(y_all) if y in big]
+    X_t, y_t = [FIRST_TXT[TEXTED[i]] for i in keep], [y_all[i] for i in keep]
+    try:
+        if len(set(y_t)) >= 2:
+            cv = StratifiedKFold(n_splits=args.folds, shuffle=True, random_state=args.seed)
+            pred = cross_val_predict(text_model(), X_t, y_t, cv=cv)
+            rep_ = classification_report(y_t, pred, output_dict=True, zero_division=0)
+            share = Counter(y_t)
+            IN_SUM = {"tested": len(y_t), "classes": len(share), "acc": float(np.mean(np.array(pred) == np.array(y_t))),
+                      "base": max(share.values()) / len(y_t), "macro_f1": rep_["macro avg"]["f1-score"]}
+            for k_ in share:
+                IN_CLASS[k_] = {"recall": rep_[k_]["recall"], "precision": rep_[k_]["precision"], "chance": share[k_] / len(y_t)}
+            fact("input_class", f"accuracy {IN_SUM['acc']:.1%} vs {IN_SUM['base']:.1%} by always guessing the biggest class "
+                                f"({IN_SUM['tested']:,} interactions, {IN_SUM['classes']} classes with >= {args.folds} interactions)",
+                 "Input (first message) -> class, on unseen interactions")
+        X_all = [FIRST_TXT[c] for c in TEXTED]
+        for t in sorted(FINAL["driving"]):
+            yb = np.array([t in DISP.get(c, ()) for c in TEXTED], int)
+            if yb.sum() < args.folds or (len(yb) - yb.sum()) < args.folds:
+                continue
+            m = make_pipeline(TfidfVectorizer(ngram_range=(1, 2), min_df=2, sublinear_tf=True), LogisticRegression(max_iter=3000, class_weight="balanced"))
+            pr = cross_val_predict(m, X_all, yb, cv=StratifiedKFold(n_splits=args.folds, shuffle=True, random_state=args.seed), method="predict_proba")[:, 1]
+            auc = roc_auc_score(yb, pr)
+            m.fit(X_all, yb)
+            voc, coef = m[0].get_feature_names_out(), m[1].coef_[0]
+            IN_HO.append({"Hand-off call": t, "Interactions with an input": len(yb), "Interactions handed work": int(yb.sum()),
+                          "AUC on unseen (0.5 = chance, 1 = perfect)": round(float(auc), 3),
+                          "Reading": "strong" if auc >= .8 else "acceptable" if auc >= .7 else "weak",
+                          "Words in the input that point to this expert": ", ".join(voc[np.argsort(coef)[::-1][:8]]) if auc >= .7 else "(none reliable: the input does not point to this expert)"})
+            log.info(f"   input -> {t:<24} AUC {auc:.3f}")
+    except ValueError as e:                                                    # e.g. inputs with no repeated words
+        log.info(f"   input check skipped: {e}")
+else:
+    log.info(f"   input check skipped: only {len(TEXTED)} interactions have a logged first message")
+
+# ---- why a NEW call is added for the same class: the trigger found in the logs ----
+#   For a call outside the class plan (task T): compare interactions that ran T with interactions that did not.
+#   (1) earlier result: a field=value seen in an output BEFORE T's first call, vs anywhere in interactions without T
+#   (2) input: a word of the first message
+#   A trigger must be present in more than half of the interactions with T, more often than without (Fisher's exact test, BH q < 0.05).
+#   Evidence is taken from all interactions (more data than one class); the share inside the class is shown next to it.
+NUMLIKE = re.compile(r"\d{6,}")
+
+
+def out_tokens(v, limit=80):
+    d = parse_json(v) if isinstance(v, str) else None
+    toks = []
+
+    def walk(o, key, depth):
+        if len(toks) >= limit or depth > 4:
+            return
+        if isinstance(o, dict):
+            for k_, v_ in o.items():
+                walk(v_, str(k_), depth + 1)
+        elif isinstance(o, list):
+            for v_ in o[:20]:
+                walk(v_, key, depth + 1)
+        elif key and o is not None and not isinstance(o, float):
+            t_ = str(o).strip()
+            if 0 < len(t_) <= 30 and not NUMLIKE.search(t_):
+                toks.append(f"{key}={t_}".lower())
+    walk(d, "", 0)
+    return set(toks)
+
+
+EXTRA_OF = {c: TASKS[c] - PLAN_T[c] for c in IDS}
+CAND = sorted({t for c in IDS for t in EXTRA_OF[c]})
+STRONG_RATIO, STRONG_GAP, CONSTANT, BRANCH_SHARE = 2.0, 0.30, 0.95, 0.10   # trigger strength, constant value, branch size
+
+
+def list_lengths(v, limit=40):
+    """Lengths of the lists inside a logged result (path -> number of items), for lists with 2 or more items."""
+    d = parse_json(v) if isinstance(v, str) else None
+    out = {}
+
+    def walk(o, path, depth):
+        if len(out) >= limit or depth > 4:
+            return
+        if isinstance(o, dict):
+            for k_, v_ in o.items():
+                walk(v_, f"{path}.{k_}" if path else str(k_), depth + 1)
+        elif isinstance(o, list):
+            if len(o) >= 2:
+                out[path or "(list)"] = max(out.get(path or "(list)", 0), len(o))
+            for v_ in o[:3]:
+                walk(v_, path, depth + 1)
+    walk(d, "", 0)
+    return out
+
+
+FIRST_TOK, TOK_SRC = {}, defaultdict(Counter)                           # case -> {token: first call position}; token -> APIs whose result held it
+API_TOK, API_OUTN = defaultdict(Counter), Counter()                     # API -> how often each value is in its results; API -> results seen
+LISTS = {}                                                              # case -> {(API, list path): (first position, items)}
+if COL["output"]:
+    for c, g in calls[[CASE, "call_no", "_out", "_in", "task"]].groupby(CASE, sort=False):
+        ft, lt = {}, {}
+        for pos, v, vin, tk_task in zip(g["call_no"].values, g["_out"].values, g["_in"].values, g["task"].values):
+            api_ = TASK_API.get(tk_task, tk_task)
+            toks = out_tokens(v)
+            if has_value(v):
+                API_OUTN[api_] += 1
+                API_TOK[api_].update(toks)
+                for pth, ln in list_lengths(v).items():
+                    lt.setdefault((api_, pth), (pos, ln))
+            for tk in toks - out_tokens(vin):                                   # a value that only repeats the call's own request is not a result
+                if tk not in ft:
+                    ft[tk] = pos
+                    TOK_SRC[tk][api_] += 1
+        FIRST_TOK[c], LISTS[c] = ft, lt
+# a value present in (almost) every result of an API carries no information beyond "that API ran": not a trigger
+CONST_TOK = {tk for api_, cn in API_TOK.items() if API_OUTN[api_] >= args.folds for tk, k_ in cn.items() if k_ / API_OUTN[api_] >= CONSTANT}
+for c in FIRST_TOK:
+    FIRST_TOK[c] = {tk: p for tk, p in FIRST_TOK[c].items() if tk not in CONST_TOK}
+fact("const_tokens", len(CONST_TOK), "Result values ignored as triggers (present in 95%+ of one API's results)")
+PREV_TASK = calls.groupby(CASE)["task"].shift()
+FIRST_ROW = calls.assign(_prev=PREV_TASK).drop_duplicates([CASE, "task"])   # first call of each task in each case
+TRIG, trig_tests = {}, []
+for t in CAND:
+    with_t = [c for c in IDS if t in TASKS[c]]
+    without = [c for c in IDS if t not in TASKS[c]]
+    if len(with_t) < args.folds or len(without) < args.folds:
+        continue
+    rows_t = FIRST_ROW[FIRST_ROW["task"] == t]
+    prev = rows_t["_prev"].dropna().value_counts()
+    info_t = {"n": len(with_t), "by": TASK_AGENT.get(t, ""), "after": f"{prev.index[0]} ({prev.iloc[0] / len(rows_t):.0%})" if len(prev) else "start of the case",
+              "out": [], "in": []}
+    if FIRST_TOK:
+        pos_t = POS
+        cw = Counter(tk for c in with_t for tk, fp in FIRST_TOK.get(c, {}).items() if fp < pos_t[c][t])
+        co = Counter(tk for c in without for tk in FIRST_TOK.get(c, {}))
+        for tk, k_ in cw.items():
+            a_, b_ = k_ / len(with_t), co[tk] / len(without)
+            if a_ > MAJORITY and b_ < MAJORITY and a_ >= STRONG_RATIO * b_ and a_ - b_ >= STRONG_GAP:
+                _, pv = fisher_greater(k_, len(with_t) - k_, co[tk], len(without) - co[tk])
+                trig_tests.append((t, "out", tk, k_ / len(with_t), co[tk] / len(without), pv))
+    have_w, have_o = [c for c in with_t if c in MSG_W], [c for c in without if c in MSG_W]
+    if have_w and have_o:
+        cw = Counter(w for c in have_w for w in MSG_W[c])
+        co = Counter(w for c in have_o for w in MSG_W[c])
+        for w_, k_ in cw.items():
+            a_, b_ = k_ / len(have_w), co[w_] / len(have_o)
+            if a_ > MAJORITY and b_ < MAJORITY and a_ >= STRONG_RATIO * b_ and a_ - b_ >= STRONG_GAP:
+                _, pv = fisher_greater(k_, len(have_w) - k_, co[w_], len(have_o) - co[w_])
+                trig_tests.append((t, "in", w_, k_ / len(have_w), co[w_] / len(have_o), pv))
+    TRIG[t] = info_t
+for (t, kind, tk, a_, b_, pv), q in zip(trig_tests, bh([x[5] for x in trig_tests])):
+    if q < ALPHA:
+        TRIG[t][kind].append((a_ - b_, tk, a_, b_, q))
+
+
+def src_of(tk):
+    s_ = TOK_SRC.get(tk)
+    return f" from {s_.most_common(1)[0][0]}" if s_ else ""
+
+
+def trigger_text(t):
+    i_ = TRIG.get(t)
+    if not i_:
+        return "Too few interactions to test", ""
+    out_ = sorted(i_["out"], reverse=True)[:3]
+    in_ = sorted(i_["in"], reverse=True)[:3]
+    ev = "; ".join([f"earlier result{src_of(tk)}: {tk} ({a_:.0%} vs {b_:.0%}, q {p_text(q)})" for _, tk, a_, b_, q in out_] +
+                   [f"input word '{tk}' ({a_:.0%} vs {b_:.0%}, q {p_text(q)})" for _, tk, a_, b_, q in in_])
+    if out_ and in_:
+        verdict = "Triggered by an earlier result and linked to the input"
+    elif out_:
+        verdict = "Triggered by an earlier result"
+    elif in_:
+        verdict = "Linked to the input"
+    else:
+        verdict = "No trigger found in the logged data"
+    return verdict, ev
+
+
+new_rows = []
+for l in ORDER:
+    mem = FINAL["members"][l]
+    cnt = Counter(t for c in mem for t in EXTRA_OF[c])
+    for t, k_ in cnt.most_common():
+        v_, ev = trigger_text(t)
+        i_ = TRIG.get(t, {})
+        new_rows.append({"Class": CLASS[l], "Specialists handed work": l, "Interactions in class": len(mem),
+                         "New call (not in the class plan)": t, "Interactions in class with it": k_, "Share of class": k_ / len(mem),
+                         "Made by agent": TASK_AGENT.get(t, ""), "Usually right after": i_.get("after", ""),
+                         "Why it is added (verdict)": v_, "Evidence (with it vs without it, all interactions)": ev,
+                         "Interactions with it (all classes)": i_.get("n")})
+new_calls = pd.DataFrame(new_rows)
+NEWWHY = {c: "; ".join(f"{TASK_API.get(t, t)} ← {trigger_text(t)[0].lower()}" for t in sorted(EXTRA_OF[c])) for c in IDS}
+found = sum(1 for t in TRIG if TRIG[t]["out"] or TRIG[t]["in"])
+fact("new_calls", f"{found} of {len(TRIG)} tested new calls have a trigger in the logs", "Why new calls are added")
+
+chk_rows = []
+for l in ORDER:
+    mem = FINAL["members"][l]
+    w, st = why.loc[mem], STAT[l]
+    outside = w[w["versus"] != "Within typical"]
+    spread = (st["q3"] - st["q1"]) / max(st["med"], 1)
+    ic = IN_CLASS.get(CLASS[l])
+    flags = []
+    if len(mem) < args.folds:
+        flags.append(f"Small: fewer than {args.folds} interactions (cannot be tested {args.folds}-fold)")
+    if spread > ALL_SPREAD:
+        flags.append("More varied than all interactions together")
+    if ic and ic["recall"] <= ic["chance"]:
+        flags.append("Input does not separate it (no better than chance)")
+    tops = Counter(EXPL[c][3].split(" ×")[0] for c in mem if EXPL[c][3])
+    chk_rows.append({
+        "Class": CLASS[l], "Specialists handed work": l, "Interactions": len(mem),
+        "Different step sequences": len({tuple(STEPS[c]) for c in mem}),
+        "Tool calls min / median / max": f"{w['total'].min():.0f} / {st['med']:.0f} / {w['total'].max():.0f}",
+        "Typical range (Q1 – Q3)": f"{st['q1']:.0f} – {st['q3']:.0f}",
+        "Above typical range": float((w["total"] > st["q3"]).mean()), "Below typical range": float((w["total"] < st["q1"]).mean()),
+        "Main drivers outside the range (share)": "; ".join(f"{k_} {v_ / len(outside):.0%}" for k_, v_ in outside["driver"].value_counts().items()) if len(outside) else "",
+        "Most repeated APIs (share of interactions)": "; ".join(f"{k_} {v_ / len(mem):.0%}" for k_, v_ in tops.most_common(3)),
+        "Plan tasks": int(w["expected"].iloc[0]), "Plan tasks that ran (median)": st["plan_ran"],
+        "Extra tasks per case (median)": st["extra"], "Retries (median)": st["rep_same"], "Repeats with different input (median)": st["rep_other"],
+        "Follow plan order fully": float(per.loc[mem, "follows"].mean()),
+        "Most common extra tasks (share of cases)": top_share({c: TASKS[c] - PLAN_T[c] for c in mem}, mem),
+        "Plan tasks most often not run (share of cases)": top_share({c: PLAN_T[c] - TASKS[c] for c in mem}, mem),
+        "Input → class: found on unseen (recall)": ic["recall"] if ic else None,
+        "Input → class: correct when predicted (precision)": ic["precision"] if ic else None,
+        "Input → class: by chance": ic["chance"] if ic else None,
+        "Flags": "; ".join(flags) or "OK"})
+class_check = pd.DataFrame(chk_rows)
+input_class = pd.DataFrame([{"Class": k_, "Specialists handed work": next(l for l in ORDER if CLASS[l] == k_),
+                             "Found on unseen (recall)": v_["recall"], "Correct when predicted (precision)": v_["precision"], "By chance (class share)": v_["chance"]}
+                            for k_, v_ in sorted(IN_CLASS.items())])
+if IN_SUM:
+    input_class = pd.concat([pd.DataFrame([{"Class": "All tested classes (accuracy)", "Specialists handed work": f"{IN_SUM['tested']:,} interactions, {IN_SUM['classes']} classes; macro F1 {IN_SUM['macro_f1']:.3f}",
+                                            "Found on unseen (recall)": IN_SUM["acc"], "Correct when predicted (precision)": None,
+                                            "By chance (class share)": IN_SUM["base"]}]), input_class], ignore_index=True)
+input_ho = pd.DataFrame(IN_HO)
+
+# ================= CLASSES -> VARIANTS: the conditional branches each interaction took =================
+#   Principle (trace clustering + decision mining): interactions belong together when they did the same kind of work -
+#   the same SET of tasks; how many times a task ran (loops, retries) never splits a group.
+#   Class   = the experts the orchestrator handed work to (unchanged).
+#   Variant = class + the conditional branches taken: calls outside the class plan that (a) have a trigger proven in the logs
+#             (an earlier result or the input; Fisher + BH) and (b) occur in at least k interactions of the class but not in all.
+#             Groups smaller than k join the most similar variant. Branches without a proven trigger never split - they are
+#             reported as unexplained.
+PROVEN = {t for t in TRIG if TRIG[t]["out"] or TRIG[t]["in"]}
+
+
+def trigger_label(t):
+    i_ = TRIG.get(t)
+    if not i_:
+        return f"too rare to test (< {args.folds} interactions)"
+    if i_["out"]:
+        _, tk, a_, b_, q = max(i_["out"])
+        return f"when the result{src_of(tk)} has {tk} ({a_:.0%} vs {b_:.0%})"
+    if i_["in"]:
+        _, tk, a_, b_, q = max(i_["in"])
+        return f"when the input mentions '{tk}' ({a_:.0%} vs {b_:.0%})"
+    return "no trigger found in the logged data"
+
+
+def trig_tag(t):
+    """The data behind an extra call: ' ← <API>: <field> = <value>' (earlier result) or " ← input: '<word>'"; empty when none."""
+    i_ = TRIG.get(t)
+    if not i_:
+        return ""
+    if i_["out"]:
+        _, tk, a_, b_, q = max(i_["out"])
+        k_, _, v_ = tk.partition("=")
+        s_ = TOK_SRC.get(tk)
+        return f" ← {s_.most_common(1)[0][0] if s_ else '?'}: {k_} = {v_}"
+    if i_["in"]:
+        _, tk, a_, b_, q = max(i_["in"])
+        return f" ← input: '{tk}'"
+    return ""
+
+
+def trigger_plain(t):
+    """Why an extra call is made, in plain words (no numbers): the earlier result or the input that comes with it."""
+    i_ = TRIG.get(t)
+    if not i_:
+        return "too rare to check (fewer than 5 interactions make this call)"
+    if i_["out"]:
+        _, tk, a_, b_, q = max(i_["out"])
+        k_, _, v_ = tk.partition("=")
+        s_ = TOK_SRC.get(tk)
+        return f"because the result of {s_.most_common(1)[0][0] if s_ else 'an earlier call'} showed {k_} = {v_}"
+    if i_["in"]:
+        _, tk, a_, b_, q = max(i_["in"])
+        return f"because the customer's message mentions '{tk}'"
+    return "reason not visible in the logs"
+
+
+CNT = TASK_CALLS.unstack(fill_value=0).reindex(IDS).fillna(0).astype(int)    # interactions x tasks: calls of each task
+VAR, VAR_KEY, VAR_OF_CLASS = {}, {}, defaultdict(list)
+for l in ORDER:
+    mem = FINAL["members"][l]
+    cnt = Counter(t for c in mem for t in EXTRA_OF[c] if t in PROVEN)
+    defining = {t for t, k_ in cnt.items() if max(args.folds, BRANCH_SHARE * len(mem)) <= k_ < len(mem)}
+    key = {c: frozenset(EXTRA_OF[c] & defining) for c in mem}
+    groups = Counter(key.values())
+    big = sorted([k_ for k_, v_ in groups.items() if v_ >= args.folds], key=lambda k_: (-groups[k_], sorted(k_)))
+    if not big:
+        big = [frozenset()]
+
+    def nearest(k_):
+        return min(big, key=lambda b: (1 - len(k_ & b) / len(k_ | b) if (k_ | b) else 0, -groups.get(b, 0)))
+    final_key = {c: (key[c] if key[c] in big else nearest(key[c])) for c in mem}
+    sizes = Counter(final_key.values())
+    for i, k_ in enumerate(sorted(sizes, key=lambda k_: (-sizes[k_], sorted(k_)))):
+        name = f"{CLASS[l]}-{chr(65 + i) if i < 26 else i}"
+        VAR_KEY[name] = k_
+        VAR_OF_CLASS[l].append(name)
+        for c in mem:
+            if final_key[c] == k_:
+                VAR[c] = name
+VAR_MEM = defaultdict(list)
+for c in IDS:
+    VAR_MEM[VAR[c]].append(c)
+
+
+def typical_set(mem):
+    k_ = Counter(t for c in mem for t in TASKS[c])
+    return {t for t, v_ in k_.items() if v_ / len(mem) > MAJORITY}
+
+
+def jaccard(a, b):
+    return len(a & b) / len(a | b) if (a | b) else 1.0
+
+
+TYP_V = {v: typical_set(m) for v, m in VAR_MEM.items()}
+TYP_C = {l: typical_set(FINAL["members"][l]) for l in ORDER}
+SIM_V = {c: jaccard(TASKS[c], TYP_V[VAR[c]]) for c in IDS}
+SIM_C = {c: jaccard(TASKS[c], TYP_C[LABEL[c]]) for c in IDS}
+MISFIT = {}
+for l in ORDER:
+    mem = FINAL["members"][l]
+    if len(mem) < args.folds:
+        continue
+    s_ = pd.Series({c: SIM_C[c] for c in mem})
+    q1_, q3_ = s_.quantile(.25), s_.quantile(.75)
+    cut = q1_ - 1.5 * (q3_ - q1_)
+    for c in s_[s_ < cut].index:
+        MISFIT[c] = (cut, float(s_.median()))
+REF = {v: CNT.loc[m].median().map(lambda x: int(np.floor(x + .5))) for v, m in VAR_MEM.items()}   # typical calls of each task in the variant
+REF = {v: r[r > 0] for v, r in REF.items()}
+_api_n = Counter(TASK_API.get(t, t) for t in CNT.columns)
+DISP_T = {t: (f"{TASK_AGENT.get(t, '')} · {TASK_API.get(t, t)}" if _api_n[TASK_API.get(t, t)] > 1 else TASK_API.get(t, t)) for t in CNT.columns}
+
+
+# ---- why a call is repeated: what changes between the repeats, and which earlier list it walks through ----
+_rep_keys = set(TASK_CALLS[TASK_CALLS > 1].index)
+_rp = calls[[CASE, "task", "call_no", "_in"]]
+_rp = _rp[pd.MultiIndex.from_arrays([_rp[CASE], _rp["task"]]).isin(_rep_keys)]
+
+
+def in_leaves(v):
+    d = parse_json(v) if isinstance(v, str) else None
+    return leaves(d) if isinstance(d, dict) else ({"value": v} if has_value(v) else {})
+
+
+LOOP_CASE, LOOP_STATS = {}, defaultdict(lambda: {"n": 0, "same": 0, "keys": Counter(), "lists": Counter()})
+for (c, t), g in _rp.groupby([CASE, "task"], sort=False):
+    ins = list(g["_in"].values)
+    n_calls, n_diff = len(ins), len(set(map(str, ins)))
+    lv = [in_leaves(v) for v in ins]
+    keys = sorted({k_ for d_ in lv for k_ in d_} - {k_ for k_ in {k for d_ in lv for k in d_} if len({str(d_.get(k_)) for d_ in lv}) == 1})
+    first = POS[c][t]
+    match = sorted((api_, pth) for (api_, pth), (p_, ln) in LISTS.get(c, {}).items() if p_ < first and ln in (n_diff, n_calls) and ln >= 2)
+    st = LOOP_STATS[t]
+    st["n"] += 1
+    st["same"] += n_diff == 1
+    st["keys"].update(keys[:3])
+    st["lists"].update(match[:5])
+    vals = []
+    if keys:
+        for d_ in lv:
+            v_ = str(d_[keys[0]]) if keys[0] in d_ else "(missing)"
+            if v_ not in vals:
+                vals.append(v_)
+    mlen = LISTS.get(c, {}).get(match[0], (0, 0))[1] if match else 0
+    LOOP_CASE[(c, t)] = (n_calls, n_diff, keys, match, vals, mlen)
+
+LOOP_DRIVER, LOOP_TAG, loop_rows = {}, {}, []
+for t, st in LOOP_STATS.items():
+    if st["n"] < args.folds:
+        continue
+    lst = st["lists"].most_common(1)
+    key = st["keys"].most_common(1)
+    if lst and lst[0][1] / st["n"] > MAJORITY:
+        (api_, pth), k_ = lst[0]
+        drv = f"one call per item in the '{pth}' list returned by {api_}"
+        LOOP_TAG[t] = f"← {api_}.{pth}"
+    elif key and key[0][1] / st["n"] > MAJORITY:
+        drv, k_ = f"one call per different '{key[0][0]}' value", key[0][1]
+        LOOP_TAG[t] = f"varies: {key[0][0]}"
+    elif st["same"] / st["n"] > MAJORITY:
+        drv, k_ = "the same request sent again (retries)", st["same"]
+        LOOP_TAG[t] = "same input"
+    else:
+        drv, k_ = "repeated with different requests; no single driver visible in the logs", 0
+    LOOP_DRIVER[t] = drv
+    loop_rows.append({"Task (agent · API)": t, "Interactions where it repeats": st["n"], "Driver": drv, "Interactions matching the driver": k_,
+                      "Share matching": k_ / st["n"], "Repeats with identical request": st["same"],
+                      "Input fields that change (most common)": ", ".join(f"{k} ({v})" for k, v in st["keys"].most_common(3)),
+                      "Earlier lists of the same length (most common)": "; ".join(f"{a}.{p} ({v})" for (a, p), v in st["lists"].most_common(3))})
+loop_drivers = pd.DataFrame(loop_rows).sort_values("Interactions where it repeats", ascending=False) if loop_rows else pd.DataFrame()
+fact("loop_drivers", f"{sum(1 for d in LOOP_DRIVER.values() if 'no single driver' not in d)} of {len(LOOP_DRIVER)} repeating calls",
+     "Repeating calls whose driver is found in the logs")
+
+
+def repeat_text(c, t):
+    n_calls, n_diff, keys, match, vals, mlen = LOOP_CASE[(c, t)]
+    txt = f"{DISP_T[t]} ×{n_calls}"
+    if n_diff == 1:
+        txt += " · same input"
+    elif keys:
+        txt += f" · {keys[0]}: " + ", ".join(vals[:5]) + (" …" if len(vals) > 5 else "")
+    else:
+        txt += f" · {n_diff} different inputs"
+    if match:
+        txt += f" · ← {match[0][0]}.{match[0][1]} ({mlen} items)"
+    return txt
+
+
+def explain_v17(c):
+    row = CNT.loc[c]
+    row = row[row > 0]
+    ref = REF[VAR[c]]
+    allt = row.index.union(ref.index)
+    d_ = (row.reindex(allt, fill_value=0) - ref.reindex(allt, fill_value=0))
+    d_ = d_[d_ != 0]
+    total, ref_t = int(row.sum()), int(ref.sum())
+    if d_.empty:
+        return total, ref_t, f"{total} = {ref_t}"
+    parts = []
+    for t in sorted(d_.index, key=lambda t: (-abs(d_[t]), DISP_T[t])):
+        dv = int(d_[t])
+        if ref.get(t, 0) == 0:
+            kind = "" if t in PLAN_T[c] else trig_tag(t)
+        elif row.get(t, 0) == 0:
+            kind = ""
+        else:
+            r_ = int(RET_OF.get(c, pd.Series(dtype=int)).get(t, 0))
+            kind = (f" · {LOOP_TAG[t]}" if t in LOOP_TAG and dv > 0 else "")
+        parts.append(f"{DISP_T[t]} {dv:+d}{kind}")
+    shown, rest = parts[:8], int(d_.sum() - sum(int(d_[t]) for t in sorted(d_.index, key=lambda t: (-abs(d_[t]), DISP_T[t]))[:8]))
+    txt = f"{total} = {ref_t} " + "  ".join(shown) + (f"  others {rest:+d}" if len(parts) > 8 else "")
+    return total, ref_t, txt
+
+
+EXP17 = {c: explain_v17(c) for c in IDS}
+
+
+def loops_of(c, k=4):
+    row = CNT.loc[c]
+    row = row[row > 1].sort_values(ascending=False)
+    return ", ".join(f"{DISP_T[t]} ×{int(v)}" for t, v in row.head(k).items()) + (f" (+{len(row) - k} more)" if len(row) > k else "")
+
+
+LOOP_TXT = {c: loops_of(c) for c in IDS}
+VMED = {v: float(np.median([CALLS_N[c] for c in m])) for v, m in VAR_MEM.items()}
+assert all(EXP17[c][0] == CALLS_N[c] for c in IDS)
+
+
+def call_split(c):
+    row = CNT.loc[c]
+    row = row[row > 0]
+    fixed = int(row[[t for t in row.index if t in PLAN_T[c]]].sum())
+    cond = int(row[[t for t in row.index if t not in PLAN_T[c] and t in PROVEN]].sum())
+    return fixed, cond, int(row.sum()) - fixed - cond
+
+
+SPLIT = {c: call_split(c) for c in IDS}
+EXPL_SHARE = {c: (SPLIT[c][0] + SPLIT[c][1]) / max(CALLS_N[c], 1) for c in IDS}
+BRANCHES = {c: "; ".join(f"{DISP_T[t]} ({trigger_label(t)})" for t in sorted(EXTRA_OF[c] & PROVEN, key=lambda t: DISP_T[t])) for c in IDS}
+LOOPS = {c: int(CALLS_N[c] - len(TASKS[c])) for c in IDS}
+tot_calls = sum(CALLS_N.values())
+fact("variants", f"{len(VAR_MEM)} variants under {len(ORDER)} classes", "Classes split by proven conditional branches")
+fact("explained", f"{sum(SPLIT[c][0] for c in IDS) / tot_calls:.1%} plan steps · {sum(SPLIT[c][1] for c in IDS) / tot_calls:.1%} conditional steps (proven trigger) · "
+                  f"{sum(SPLIT[c][2] for c in IDS) / tot_calls:.1%} unexplained", "Calls by kind")
+fact("misfits", len(MISFIT), "Interactions that do not fit their class (task-set similarity below Q1 - 1.5 IQR of the class)")
+
+
+def iqr(x):
+    x = pd.Series(x, dtype=float)
+    return float(x.quantile(.75) - x.quantile(.25)) if len(x) else 0.0
+
+
+def loop_summary(mem, k=3):
+    lp = Counter()
+    for c in mem:
+        row = CNT.loc[c]
+        for t, v_ in row[row > 1].items():
+            lp[t] += 1
+    out = []
+    for t, _ in lp.most_common(k):
+        vals = [int(CNT.at[c, t]) for c in mem if CNT.at[c, t] > 1]
+        out.append(f"{DISP_T[t]} ×{min(vals)}" + (f"–{max(vals)}" if max(vals) != min(vals) else "") + (f" · {LOOP_TAG[t]}" if t in LOOP_TAG else " · different inputs"))
+    return "; ".join(out)
+
+
+def branch_plain(t):
+    return f"{DISP_T[t]}{trig_tag(t)}"
+
+
+var_rows = []
+for l in ORDER:
+    for v in VAR_OF_CLASS[l]:
+        m = VAR_MEM[v]
+        tc = pd.Series([CALLS_N[c] for c in m])
+        var_rows.append({"Class": CLASS[l], "Variant": v, "Specialists handed work": l,
+                         "Extra calls that define it ← data before them": "; ".join(branch_plain(t) for t in sorted(VAR_KEY[v], key=lambda t: DISP_T[t]))
+                         or "—",
+                         "Interactions": len(m),
+                         "Tool calls min / mean / median / max": f"{tc.min():.0f} / {tc.mean():.1f} / {tc.median():.0f} / {tc.max():.0f}",
+                         "Variant typical calls": int(REF[v].sum()),
+                         "Main repeated calls ×range · changing input / ← list followed": loop_summary(m)})
+class_variants = pd.DataFrame(var_rows)
+
+quality_rows, extra_cols = [], []
+for l in ORDER:
+    mem = FINAL["members"][l]
+    vs = VAR_OF_CLASS[l]
+    w_iqr = sum(iqr([CALLS_N[c] for c in VAR_MEM[v]]) * len(VAR_MEM[v]) for v in vs) / len(mem)
+    quality_rows.append({"Class": CLASS[l], "Specialists handed work": l, "Interactions": len(mem), "Variants": len(vs),
+                         "Similarity within class (median)": float(np.median([SIM_C[c] for c in mem])),
+                         "Similarity within its variants (median)": float(np.median([SIM_V[c] for c in mem])),
+                         "Explained calls": sum(SPLIT[c][0] + SPLIT[c][1] for c in mem) / max(sum(CALLS_N[c] for c in mem), 1),
+                         "Call spread in class (IQR)": iqr([CALLS_N[c] for c in mem]), "Call spread within variants (IQR)": round(w_iqr, 1),
+                         "Interactions that do not fit": sum(1 for c in mem if c in MISFIT)})
+    extra_cols.append({"Loop calls (median)": float(np.median([LOOPS[c] for c in mem])), "Main repeated calls ×range · changing input / ← list followed": loop_summary(mem),
+                       "Variants": len(vs)})
+class_quality = pd.DataFrame(quality_rows)
+ROWS_BY_HO = {r["t"]: r for r in FINAL["rows"]}
+
+
+def how_variants(l):
+    vs = VAR_OF_CLASS[l]
+    return " | ".join(f"{v} ({len(VAR_MEM[v])}): " + (" + ".join(DISP_T[t] for t in sorted(VAR_KEY[v], key=lambda t: DISP_T[t])) or "—") for v in vs)
+
+
+def class_extras(l, k=4):
+    mem = FINAL["members"][l]
+    br = Counter(t for c in mem for t in EXTRA_OF[c])
+    return "; ".join(f"{branch_plain(t)} ({v_})" for t, v_ in br.most_common(k))
+
+
+ident = pd.DataFrame([{"Variants (interactions): extra calls that define each": how_variants(l),
+                       "Extra calls not in the plan ← data before them (interactions)": class_extras(l)} for l in ORDER])
+classes = pd.concat([classes.drop(columns=["Decomposition (standard plan → hand-offs in order → APIs they bring)"]), pd.DataFrame(extra_cols), ident,
+                     classes[["Decomposition (standard plan → hand-offs in order → APIs they bring)"]]], axis=1)
+
+task_plan["Runs when"] = ["every interaction" if p.startswith("Standard") else f"after {p.replace(' sub-plan', '')}" for p in task_plan["Plan"]]
+cond_t = sorted({t for c in IDS for t in EXTRA_OF[c] & PROVEN}, key=lambda t: (-TRIG[t]["n"], t))
+task_plan = pd.concat([task_plan, pd.DataFrame([{"Plan": "Conditional step", "Stage": None, "Task (agent · API)": t,
+                                                 "System": "hand-off" if TASK_API[t] in HANDOFF else SYS_OF.get(t) or "not recorded",
+                                                 "Runs after": re.sub(r' [(].*$', '', TRIG[t]['after']), "Runs when": trig_tag(t).replace(" ← ", "", 1)} for t in cond_t])],
+                      ignore_index=True)
+
+cls_rows = []
+for l in ORDER:
+    mem = FINAL["members"][l]
+    for t in FINAL["cls"].get(l, []):
+        fr = FIRST_ROW[(FIRST_ROW["task"] == t) & FIRST_ROW[CASE].isin(mem)]["_prev"].dropna()
+        cls_rows.append({"Plan": f"{CLASS[l]} step", "Stage": None, "Task (agent · API)": t,
+                         "System": "hand-off" if TASK_API[t] in HANDOFF else SYS_OF.get(t) or "not recorded",
+                         "Runs after": fr.value_counts().index[0] if len(fr) else "start",
+                         "Runs when": f"{CLASS[l]}: {sum(1 for c in mem if t in TASKS[c])} of {len(mem)} interactions"})
+if cls_rows:
+    n_std = int((~task_plan["Plan"].eq("Conditional step")).sum())
+    task_plan = pd.concat([task_plan.iloc[:n_std], pd.DataFrame(cls_rows), task_plan.iloc[n_std:]], ignore_index=True)
+fact("class_steps", f"{len(cls_rows)} class steps in {len({r['Plan'] for r in cls_rows})} classes", "Tasks most interactions of one class run that the standard plan does not hold")
+
+unexp_rows = []
+for l in ORDER:
+    mem = FINAL["members"][l]
+    k_ = Counter(t for c in mem for t in EXTRA_OF[c] if t not in PROVEN)
+    for t, v_ in k_.most_common():
+        unexp_rows.append({"Class": CLASS[l], "Task (agent · API)": t, "Interactions with it": v_, "Share of class": v_ / len(mem),
+                           "Calls": int(sum(CNT.at[c, t] for c in mem if t in TASKS[c])), "Reason": trigger_label(t)})
+unexplained = pd.DataFrame(unexp_rows)
+misfits = pd.DataFrame([{"Interaction ID": c, "Class": CLASS[LABEL[c]], "Variant": VAR[c], "Similarity to its class": SIM_C[c],
+                         "Class median similarity": MISFIT[c][1], "Cut-off (Q1 - 1.5 IQR)": MISFIT[c][0],
+                         "Tasks it ran that its class usually does not": short_list({DISP_T[t] for t in TASKS[c] - TYP_C[LABEL[c]]}, 8),
+                         "Usual tasks of its class it did not run": short_list({DISP_T[t] for t in TYP_C[LABEL[c]] - TASKS[c]}, 8)} for c in MISFIT])
+mp_rows = []
+for l in ORDER:
+    mf = [c for c in FINAL["members"][l] if c in MISFIT]
+    if not mf:
+        continue
+    extra_ = Counter(t for c in mf for t in TASKS[c] - TYP_C[l])
+    miss_ = Counter(t for c in mf for t in TYP_C[l] - TASKS[c])
+    hos_ = Counter(t for c in mf for t in DISP.get(c, ()))
+    mp_rows.append({"Class": CLASS[l], "Specialists handed work": l, "Interactions": len(FINAL["members"][l]), "Do not fit": len(mf),
+                    "Share of class": len(mf) / len(FINAL["members"][l]),
+                    "Tasks they ran that the class usually does not (share of misfits)": "; ".join(f"{DISP_T[t]} {v_ / len(mf):.0%}" for t, v_ in extra_.most_common(6)),
+                    "Usual tasks they did not run (share of misfits)": "; ".join(f"{DISP_T[t]} {v_ / len(mf):.0%}" for t, v_ in miss_.most_common(6)),
+                    "Hand-offs in the misfits (share)": "; ".join(f"{t} {v_ / len(mf):.0%}" for t, v_ in hos_.most_common(5)) or "none",
+                    "Tool calls of misfits (median) vs class": f"{np.median([CALLS_N[c] for c in mf]):.0f} vs {STAT[l]['med']:.0f}"})
+misfit_patterns = pd.DataFrame(mp_rows)
+approved_traces = pd.DataFrame({"Interaction ID": IDS, "Class": [CLASS[LABEL[c]] for c in IDS], "Variant": [VAR[c] for c in IDS],
+                                "Approved trace": np.where(per["approved"], "yes", "no"), "Follows plan order fully": np.where(per["follows"], "yes", "no"),
+                                "Anomalous (isolation forest)": np.where(per["anomalous"], "yes", "no"), "Anomaly score": per["anomaly_score"].round(4).values})
+matrix = CNT.copy()
+matrix = matrix[matrix.sum().sort_values(ascending=False).index]
+matrix.insert(0, "Variant", [VAR[c] for c in IDS])
+matrix.insert(0, "Class", [CLASS[LABEL[c]] for c in IDS])
+matrix = matrix.reset_index().rename(columns={CASE: "Interaction ID", "case": "Interaction ID"}).sort_values(["Class", "Variant", "Interaction ID"])
+
+_st = calls[new_step][[CASE, "step_no", "task", "system"]]
+_sz = calls.groupby([CASE, "step_no"]).size()
+_st = _st.assign(_n=_sz.reindex(pd.MultiIndex.from_arrays([_st[CASE], _st["step_no"]])).values)
+STEP_FULL = (_st["task"] + " [" + _st["system"].astype(str) + "]" + np.where(_st["_n"] > 1, " ×" + _st["_n"].astype(str), "")).groupby(_st[CASE], sort=False).agg(list).to_dict()
+
+
+EXTRA_TXT = {c: "  |  ".join(branch_plain(t) for t in sorted(EXTRA_OF[c], key=lambda t: DISP_T[t])) for c in IDS}
+REPEAT_TXT = {c: "; ".join(repeat_text(c, t) for t in CNT.loc[c][CNT.loc[c] > 1].sort_values(ascending=False).index) for c in IDS}
+
+
+def all_repeats(c):
+    row = CNT.loc[c]
+    row = row[row > 1].sort_values(ascending=False)
+    return ", ".join(f"{DISP_T[t]} ×{int(v)}" for t, v in row.items())
+
+
+interactions_old = pd.DataFrame({
+    "Interaction ID": IDS,
+    "Input: first message": [FIRST_MSG.get(c) for c in IDS],
+    "Input: first tool call": [text_of(FIRST_IN.get(c)) for c in IDS],
+    "Class": [CLASS[LABEL[c]] for c in IDS], "Specialists handed work": [LABEL[c] for c in IDS],
+    "Variant": [VAR[c] for c in IDS], "Conditional branches taken": [BRANCHES[c] for c in IDS],
+    "Steps": [STEPS_N[c] for c in IDS], "Total tool calls": [CALLS_N[c] for c in IDS],
+    "Hand-off calls": per["handoff_calls"].astype(int).values, "API calls": per["api_calls"].astype(int).values,
+    "Loop / repeat calls": [LOOPS[c] for c in IDS],
+    "Loops (API ×calls)": [LOOP_TXT[c] for c in IDS],
+    "Class typical calls (median)": [STAT[LABEL[c]]["med"] for c in IDS],
+    "Variant typical calls (median)": [VMED[VAR[c]] for c in IDS],
+    "Difference from variant median": [CALLS_N[c] - VMED[VAR[c]] for c in IDS],
+    "Why it differs (per API)": [EXP17[c][2] for c in IDS],
+    "Explained calls": [EXPL_SHARE[c] for c in IDS],
+    "Similarity to its variant": [SIM_V[c] for c in IDS],
+    "Fits its class?": ["no: " + f"only {SIM_C[c]:.0%} of its tasks match its class (class median {MISFIT[c][1]:.0%})" if c in MISFIT else "yes" for c in IDS],
+    "Steps in order (agent · API [system])": [ARROW.join(f"{i + 1}. {x}" for i, x in enumerate(STEP_TXT[c])) for c in IDS]}).sort_values(["Class", "Variant", "Interaction ID"])
+interaction_checks = interactions_old[["Interaction ID", "Class", "Variant", "Total tool calls", "Class typical calls (median)", "Variant typical calls (median)",
+                                       "Difference from variant median", "Explained calls", "Similarity to its variant", "Fits its class?"]]
+del interactions_old
+interactions = pd.DataFrame({
+    "Interaction ID": IDS,
+    "Input message": [FULL_MSG.get(c) for c in IDS],
+    "Input: first tool call": [text_of(FIRST_IN.get(c)) for c in IDS],
+    "Class": [CLASS[LABEL[c]] for c in IDS], "Specialists handed work": [LABEL[c] for c in IDS],
+    "Variant": [VAR[c] for c in IDS],
+    "Steps in order (agent · tool or API [system])": [ARROW.join(f"{i + 1}. {x}" for i, x in enumerate(STEP_FULL[c])) for c in IDS],
+    "Extra calls (not in class plan) ← data before them": [EXTRA_TXT[c] for c in IDS],
+    "Steps": [STEPS_N[c] for c in IDS], "Total tool calls": [CALLS_N[c] for c in IDS],
+    "Hand-off calls": per["handoff_calls"].astype(int).values, "API calls": per["api_calls"].astype(int).values,
+    "Loop / repeat calls": [LOOPS[c] for c in IDS],
+    "Repeated calls ×n · changing input · ← list followed": [REPEAT_TXT[c] for c in IDS],
+    "Variant typical calls": [EXP17[c][1] for c in IDS],
+    "Calls vs variant typical, per API": [EXP17[c][2] for c in IDS]}).sort_values(["Class", "Variant", "Interaction ID"])
+
+# ---- workbook 2: validation ----
+METRICS = [("Specialist task precision", "sprecision", "Hand-off and specialist tasks: of those the plan predicts, share the interaction really ran"),
+           ("Specialist task recall", "srecall", "Hand-off and specialist tasks: of those the interaction ran, share the plan predicted"),
+           ("Specialist task F1", "sf1", "Balance of the two: how well the decomposition predicts the specialist work"),
+           ("Task precision", "precision", "All tasks: of those the plan predicts, share the interaction really ran"),
+           ("Task recall", "recall", "All tasks: of those the interaction ran, share the plan predicted"),
+           ("Task F1", "f1", "Balance of precision and recall over all tasks"),
+           ("Order accuracy", "order", "Of the plan's 'A before B' rules that can be checked in the trace, share that held"),
+           ("Tool-call error (median)", "mae", "Median gap between the class's typical tool-call count and the real count, in calls (lower is better)")]
+NO_BASE = {"sprecision", "srecall", "sf1"}     # one plan for all interactions contains no specialist task, so it has nothing to compare here
+accuracy = pd.DataFrame([{"Metric": m, "With decomposition": round(POOLED[k], 4),
+                          "Without decomposition (baseline)": None if k in NO_BASE else round(POOLED["b_" + k], 4),
+                          "95% CI (with)": f"{CI[k][0]:.3f} - {CI[k][1]:.3f}",
+                          "Fold mean ± sd": f"{fold_df[m].mean():.3f} ± {fold_df[m].std(ddof=1):.3f}" if m in fold_df else "",
+                          "What it measures": d} for m, k, d in METRICS])
+by_class = []
+for lab, g in OOF.groupby("label"):
+    s = scores(g)
+    by_class.append({"Class": CLASS.get(lab, "not in the final model"), "Specialists handed work": lab, "Unseen interactions tested": len(g),
+                     "Specialist task F1": None if lab == NONE_LABEL else s["sf1"], "Task F1": s["f1"], "Baseline task F1": s["b_f1"],
+                     "Order accuracy": s["order"], "Tool-call error (median)": round(s["mae"], 1)})
+by_class = pd.DataFrame(by_class).sort_values("Class")
+handoff_tab = pd.DataFrame([{
+    "Hand-off call": r["t"], "Specialist agent": r["a"], "Interactions handed work": r["nd"], "Interactions not handed work": r["nn"],
+    "Verdict": r["verdict"], "Same verdict in folds": r["stable"],
+    "Tasks that run only after this hand-off": len(r["dependent_tasks"]),
+    "Strongest task": r["best"]["task"] if r["best"] else "none",
+    "Strongest task: ran when handed work": r["best"]["with"] if r["best"] else None,
+    "Strongest task: ran when not handed work": r["best"]["without"] if r["best"] else None,
+    "Strongest task: p-value (BH)": p_text(r["best"]["q"]) if r["best"] else None,
+    "Agent made any call when handed work": r["with"], "Agent made any call when not handed work": r["without"]}
+    for r in sorted(FINAL["rows"], key=lambda r: -r["nd"])])
+handoff_tasks = pd.DataFrame([{
+    "Hand-off call": x["t"], "Task (agent · API)": x["task"], "Ran when handed work": x["with"], "Ran when not handed work": x["without"],
+    "p-value (BH)": p_text(x["q"]), "Runs only after this hand-off": "yes" if x["dependent"] else "no"}
+    for x in sorted(FINAL["task_rows"], key=lambda x: (-HANDED[x["t"]], not x["dependent"], -x["with"]))])
+edges = pd.DataFrame([{"Plan": name, **e} for name, pl in PLANS for e in pl["stats"]])
+un = per[per["anomalous"]].sort_values("anomaly_score", ascending=False)
+unusual = pd.DataFrame({"Interaction ID": un.index, "Class": un["class"], "Tool calls": un["tool_calls"].astype(int),
+                        "Repeated calls (same input)": un["repeats"].astype(int), "Anomaly score": un["anomaly_score"].round(4)})
+
+C, L, F, HM = "Exact count", "Taken from the log", "Fisher's exact test + Benjamini-Hochberg", "Heuristics Miner dependency + binomial test + BH, transitive reduction"
+GUIDE = {
+    "Classes": {"Class": ("Class ID, Class 01 = largest. A class = the exact set of experts the orchestrator handed work to (proven hand-offs)", F),
+                "Specialists handed work": ("The exact set of hand-offs that bring specialist work; this set defines the class", F),
+                "Input examples (most frequent first messages)": ("The class's most frequent first messages (the input), with how many interactions had each", L),
+                "Words that stand out in its inputs (class vs all)": ("Words found in a larger share of this class's inputs than of all inputs: share in class vs share overall", C),
+                "Interactions": ("Interactions in the class", C), "Tool calls (median)": ("Typical number of tool calls (hand-off + API). Describes the class; it does not decide it", C),
+                "Hand-off calls (median)": ("Typical number of hand-off calls", C), "API calls (median)": ("Typical number of API calls", C),
+                "Tasks in executable plan": ("Distinct tasks in the fixed plan: standard plan + the sub-plan of every hand-off in the class (see Task_Plan). Tasks, not calls: a task can run several times", HM),
+                "Loop calls (median)": ("Typical number of calls that repeat a task already called in the interaction (loops over items, retries)", C),
+                "Most common loops (share of interactions)": ("APIs most often called more than once in this class, with the share of its interactions where that happens", C),
+                "Variants": ("How many variants the class splits into by the conditional branches taken (see Class_Variants)", F),
+                "Similarity within class (median)": ("Overlap of an interaction's task set with the class's typical task set (Jaccard, 100% = identical), median over the class", C),
+                "Similarity within its variants (median)": ("Same, measured against each interaction's own variant: higher than the class value = the variants group like with like", C),
+                "Explained calls": ("Share of the class's calls that are plan steps or conditional steps with a proven trigger (loops of these included)", F),
+                "Call spread in class (IQR)": ("Middle-50% range of tool calls across the whole class", C),
+                "Call spread within variants (IQR)": ("Same, inside the variants (weighted average): smaller = the variants explain the differences", C),
+                "Interactions that do not fit": ("Interactions whose task set is far less similar to the class than the rest (below Q1 - 1.5 IQR); listed in the validation workbook (Misfits)", C),
+                "How this class is identified": ("The rule that puts an interaction in this class and the statistical proof of each expert (Fisher's exact test + BH)", F),
+                "How its variants are identified": ("Each variant with its size and the conditional branches that define it, each with the trigger proven in the logs", F),
+                "Why call counts differ inside the class": ("Share of the class's calls that are loops (with the APIs that loop most) and conditional branches", C),
+                "Decomposition (standard plan → hand-offs in order → APIs they bring)": (
+                    "How NORA decomposes a case of this class: the standard plan, then each hand-off in the order seen in the class, with the "
+                    "agent and APIs that run only after it. Conditional steps: Task_Plan", F + "; " + HM)},
+    "Class_Variants": {"Class": ("Class ID", C), "Variant": ("Class + letter; A = largest variant of the class", F),
+                       "Specialists handed work": ("What defines the class", F),
+                       "Conditional branches that define it": ("Calls outside the class plan, with their proven trigger, that this variant takes; 'none' = the class's base plan", F),
+                       "Interactions": ("Interactions in the variant", C), "Share of class": ("Share of the class in this variant", C),
+                       "Tool calls min / median / max": ("Smallest, typical and largest number of tool calls", C),
+                       "Tool calls min / mean / median / max": ("Smallest, average, typical and largest number of tool calls in the variant", C),
+                       "Typical calls (profile)": ("Sum of the typical (median) number of calls of every task in the variant: the reference used in 'Why it differs'", C),
+                       "Call spread (IQR)": ("Middle-50% range of tool calls in the variant", C),
+                       "Similarity to the variant (median)": ("Overlap of task sets with the variant's typical task set (Jaccard)", C),
+                       "Explained calls": ("Share of calls that are plan steps or conditional steps with a proven trigger", F),
+                       "Most common loops (share of interactions)": ("Tasks called more than once in an interaction, with the share of the variant where that happens", C)},
+    "Task_Plan": {"Plan": ("'Standard (every interaction)', the sub-plan a hand-off brings, or 'Conditional step' (runs only when its trigger is present)", HM),
+                  "Stage": ("Stage in the DAG; tasks in the same stage do not depend on each other and can run in parallel (empty for conditional steps)", HM),
+                  "Task (agent · API)": ("One task: the agent and the API it calls", L),
+                  "System": ("System NORA writes in front of the API name, or 'hand-off'", L),
+                  "Runs after": ("Tasks this one directly depends on, learned from the order in the traces; for a conditional step, the call that usually comes right before it", HM),
+                  "Runs when": ("always / after its hand-off / the trigger proven in the logs (Fisher's exact test + BH)", F)},
+    "Interactions": {"Interaction ID": ("One NORA case", L),
+                     "Input message": ("Every message the user wrote in the interaction, in order (‖ separates messages)", L),
+                     "Input: first tool call": ("What was sent to the first tool call of the interaction", L),
+                     "Class": ("Class ID: interactions with the same set of proven expert hand-offs", F),
+                     "Specialists handed work": ("The expert hand-offs that define the class", F),
+                     "Variant": ("Class + letter: interactions of the class that also make the same extra calls (an extra call defines a variant when it has a data trigger and 10%+ of the class makes it)", F),
+                     "Steps in order (agent · tool or API [system])": ("Every step in order: agent · tool or API [system]; ×n = the same call n times in a row", L),
+                     "Extra calls (not in class plan) ← data before them": ("Calls this interaction made that are not in its class plan. '← API: field = value' is the value from that earlier API's result found before the call; \"← input: 'word'\" is a word of the customer's message. A value is shown only when it is present in most interactions that make the call and in far fewer that do not (Fisher's exact test, proof in Branch_Triggers). No arrow = no such value in the data", F),
+                     "Steps": ("Steps in order (back-to-back calls of the same task count as one step)", C),
+                     "Total tool calls": ("All tool calls, each counted once", C), "Hand-off calls": ("Tool calls that pass work to another agent", C),
+                     "API calls": ("Tool calls that fetch from a system", C),
+                     "Loop / repeat calls": ("Calls beyond the first call of each task", C),
+                     "Repeated calls ×n · changing input · ← list followed": ("Every call made more than once: ×n = number of calls; then the input field whose value changes between the calls, with its values ('same input' = identical requests); '← API.list (k items)' = an earlier result list with the same number of items", C),
+                     "Variant typical calls": ("The typical (median) number of calls of each API in the variant, added up. It can differ from the median of the totals (Class_Variants) because each API's median is taken separately; it is the reference the next column counts from", C),
+                     "Calls vs variant typical, per API": ("'total = typical', then each API whose number of calls differs from a typical interaction of its variant (+ more, - fewer), with the data before an extra call (←) or the loop driver", C)},
+    "Classes": {"Class": ("Class ID, Class 01 = largest. Rule: interactions with exactly the same set of proven expert hand-offs from the orchestrator", C),
+                "Specialists handed work": ("The exact set of expert hand-offs that defines the class (each proven: the expert's own tasks run when it is handed work and not otherwise; proof in Handoff_Test)", F),
+                "Interactions": ("Interactions in the class", C), "Tool calls (median)": ("Typical number of tool calls (hand-off + API)", C),
+                "Hand-off calls (median)": ("Typical number of hand-off calls", C), "API calls (median)": ("Typical number of API calls", C),
+                "Tasks in executable plan": ("Distinct tasks in the class plan: standard plan + the sub-plan of every expert in the class + class steps (tasks most interactions of the class run; see Task_Plan)", HM),
+                "Loop calls (median)": ("Typical number of calls that repeat a task already called in the interaction", C),
+                "Main repeated calls ×range · changing input / ← list followed": ("The calls that repeat most, their range of calls, and the driver found in the data: 'varies: field' = input field that changes, '← API.list' = earlier result list followed, 'same input' = identical requests", C),
+                "Variants": ("How many variants the class splits into", F),
+                "Variants (interactions): extra calls that define each": ("Each variant, its number of interactions and the extra calls that define it ('—' = none)", F),
+                "Extra calls not in the plan ← data before them (interactions)": ("The most common extra calls in the class, with the data value found before them and how many interactions make them", F),
+                "Decomposition (standard plan → hand-offs in order → APIs they bring)": ("The standard plan, then each expert in order with the APIs it brings", F + "; " + HM)},
+    "Class_Variants": {"Class": ("Class ID", C), "Variant": ("Class + letter; A = largest variant of the class", F),
+                       "Specialists handed work": ("What defines the class", F),
+                       "Extra calls that define it ← data before them": ("The extra calls this variant makes beyond the class plan, with the data value found before each ('—' = none)", F),
+                       "Variant typical calls": ("The typical (median) number of calls of each API in the variant, added up: the same number as 'Variant typical calls' in Interactions", C),
+                       "Interactions": ("Interactions in the variant", C),
+                       "Tool calls min / mean / median / max": ("Smallest, average, typical and largest number of tool calls in the variant", C),
+                       "Main repeated calls ×range · changing input / ← list followed": ("Same as in Classes, for this variant", C)},
+    "Task_Plan": {"Plan": ("'Standard (every interaction)', the sub-plan an expert brings, 'Class NN step' (a task most interactions of that class run that the standard plan does not hold), or 'Conditional step'", HM),
+                  "Stage": ("Stage in the DAG; tasks in the same stage do not depend on each other and can run in parallel (empty for conditional steps)", HM),
+                  "Task (agent · API)": ("One task: the agent and the API it calls", L),
+                  "System": ("System NORA writes in front of the API name, or 'hand-off'", L),
+                  "Runs after": ("Tasks this one directly depends on, learned from the order in the traces; for a conditional step, the call that most often comes right before it", HM),
+                  "Runs when": ("every interaction / after an expert hand-off / for a class step, how many interactions of the class run it / the data value found before a conditional step (API: field = value, or input: 'word'; English stop words never count)", F)},
+    "Class_Check": {"Class": ("Class ID", C), "Specialists handed work": ("What defines the class: the exact set of hand-offs that bring specialist work", F),
+                    "Interactions": ("Interactions in the class", C),
+                    "Different step sequences": ("How many different exact step sequences the class contains", C),
+                    "Tool calls min / median / max": ("Smallest, typical and largest number of tool calls in the class", C),
+                    "Typical range (Q1 – Q3)": ("Middle 50% of the class (25th to 75th percentile)", C),
+                    "Above typical range": ("Share of the class above the range", C), "Below typical range": ("Share of the class below the range", C),
+                    "Main drivers outside the range (share)": ("For interactions outside the range: which part of the call count moved most", C),
+                    "Most repeated APIs (share of interactions)": ("APIs that are most often the most-called API of an interaction in this class", C),
+                    "Plan tasks": ("Tasks in the executable plan of the class", HM),
+                    "Plan tasks that ran (median)": ("Typical number of plan tasks an interaction of this class ran", C),
+                    "Extra tasks per case (median)": ("Typical number of distinct tasks outside the plan", C),
+                    "Retries (median)": ("Typical number of retries (same task, same input, right after itself)", C),
+                    "Repeats with different input (median)": ("Typical number of repeated calls of a task with different input", C),
+                    "Follow plan order fully": ("Share of interactions in which every 'A before B' rule of the plan held", HM),
+                    "Most common extra tasks (share of cases)": ("Tasks outside the plan, with the share of the class's interactions that ran them", C),
+                    "Plan tasks most often not run (share of cases)": ("Plan tasks most often skipped, with the share of interactions that skipped them", C),
+                    "Input → class: found on unseen (recall)": ("Of this class's interactions, share that a text model trained on other interactions put in this class from the first message alone (5-fold)", "TF-IDF + logistic regression, cross-validated"),
+                    "Input → class: correct when predicted (precision)": ("When the text model said this class, share that really were this class", "TF-IDF + logistic regression, cross-validated"),
+                    "Input → class: by chance": ("Share of this class among tested interactions: what random guessing in proportion would find", C),
+                    "Flags": ("Small (cannot be tested k-fold) · more varied than all interactions together (IQR/median) · input no better than chance at finding it · OK", C)},
+    "New_Calls_Why": {"Class": ("Class ID", C), "Specialists handed work": ("What defines the class", F), "Interactions in class": ("Interactions in the class", C),
+                      "New call (not in the class plan)": ("A task (agent · API) that some interactions of this class ran although it is not in the class plan", C),
+                      "Interactions in class with it": ("How many interactions of this class ran it", C), "Share of class": ("Share of the class that ran it", C),
+                      "Made by agent": ("Agent that makes this call", L), "Usually right after": ("The call that most often comes right before it, with share", C),
+                      "Why it is added (verdict)": ("Triggered by an earlier result / Linked to the input / both / No trigger found in the logged data", F),
+                      "Evidence (with it vs without it, all interactions)": ("The field=value of an earlier output, or the input word, that is present in more than half of the interactions with this call and far more often than without it (Fisher's exact test + BH, q < 0.05)", F),
+                      "Interactions with it (all classes)": ("Interactions across all classes that ran it (the evidence is computed on these)", C)},
+    "API_Catalog": {"Agent": ("Agent that made the call", L), "API": ("API name, system prefix removed", L),
+                    "System": ("System as NORA writes it, or 'hand-off'", L),
+                    "Layer": ("Hand-off (brings specialist work), Specialist (runs after its hand-off), Hand-off (no specialist work: the agent runs the same without it), Standard (not tied to a hand-off, runs in more than "
+                              "half of interactions), Occasional (not tied to a hand-off, runs in half or fewer) or Agent not recorded", F),
+                    "Interactions using it": ("Interactions in which this agent called it", C), "Calls": ("Calls of this API by this agent", C)},
+}
+MAIN = {"Interactions": interactions, "Classes": classes, "Class_Variants": class_variants, "Task_Plan": task_plan, "API_Catalog": catalog}
+GUIDE_SHEET = pd.DataFrame([{"Sheet": s_, "Column": c, "What it shows": GUIDE[s_][c][0], "How it is derived": GUIDE[s_][c][1]} for s_, f in MAIN.items() for c in f.columns])
+for sname, f in MAIN.items():
+    miss = [c for c in f.columns if c not in GUIDE[sname]]
+    if miss:
+        raise KeyError(f"no explanation for {sname} columns {miss}")
+VALID = {"Model_Accuracy": accuracy, "Accuracy_by_Class": by_class, "CV_Folds": fold_df, "Handoff_Test": handoff_tab, "Handoff_Tasks": handoff_tasks,
+         "Hand-off_Detection": pd.DataFrame(detect), "DAG_Edges": edges, "Duplicate_Logging": DUPLICATES,
+         "API_Two_Names": pd.DataFrame(two_names), "Anomalous": unusual, "Input_to_Class": input_class, "Input_to_Handoff": input_ho,
+         "Approved_Traces": approved_traces, "Branch_Triggers": new_calls, "Unexplained_Calls": unexplained, "Misfits": misfits, "Misfit_Patterns": misfit_patterns, "Interaction_Checks": interaction_checks,
+         "Class_Quality": class_quality, "Loop_Drivers": loop_drivers,
+         "Class_Check": class_check, "API_Count_Matrix": matrix,
+         "Column_Guide": pd.DataFrame([{"Sheet": s_, "Column": c, "What it shows": GUIDE[s_][c][0], "Method": GUIDE[s_][c][1]} for s_, f in MAIN.items() for c in f.columns])}
+PERCENT = {"Share matching", "Share of class", "Explained calls", "Similarity within class (median)", "Similarity within its variants (median)", "Similarity to the variant (median)", "Similarity to its variant", "Similarity to its class", "Class median similarity", "Cut-off (Q1 - 1.5 IQR)", "Share of class", "Above typical range", "Below typical range", "Input → class: found on unseen (recall)", "Input → class: correct when predicted (precision)", "Input → class: by chance", "Found on unseen (recall)", "Correct when predicted (precision)", "By chance (class share)", "Follow plan order fully", "Strongest task: ran when handed work", "Strongest task: ran when not handed work", "Agent made any call when handed work",
+           "Agent made any call when not handed work", "Specialist task precision", "Specialist task recall", "Specialist task F1", "Baseline specialist task F1", "Task precision", "Task recall",
+           "Task F1", "Baseline task F1", "Order accuracy", "Follow plan fully", "Ran when handed work", "Ran when not handed work",
+           "Identical input in matched pairs"}
+WIDE = {"Extra calls (not in class plan) ← data before them": 80, "Repeated calls ×n · changing input · ← list followed": 90, "Calls vs variant typical, per API": 90, "Main repeated calls ×range · changing input / ← list followed": 80, "Variants (interactions): extra calls that define each": 70, "Extra calls not in the plan ← data before them (interactions)": 80, "Extra calls that define it ← data before them": 80, "How it is derived": 45, "Extra calls (not in the class plan), and why": 80, "Repeated calls, and why": 80, "Main repeated calls, and why": 80, "Extra branch that defines it, and why": 80, "Variants and the branch that defines each": 70, "Driver": 60, "Input fields that change (most common)": 45, "Earlier lists of the same length (most common)": 60, "Input message": 70, "Steps in order (agent · tool or API [system])": 100, "Repeated calls (API ×calls)": 50, "Why it differs from its variant (per API)": 90, "How this class is identified": 80, "How its variants are identified": 90, "Why call counts differ inside the class": 70, "Loops (API ×calls)": 45, "Tasks they ran that the class usually does not (share of misfits)": 70, "Usual tasks they did not run (share of misfits)": 70, "Hand-offs in the misfits (share)": 45, "Why it differs (per API)": 100, "Conditional branches taken": 60, "Conditional branches that define it": 70, "Runs when": 50, "Most common loops (share of interactions)": 55, "Tasks it ran that its class usually does not": 60, "Usual tasks of its class it did not run": 60, "Reason": 45, "New calls and why (trigger)": 70, "Evidence (with it vs without it, all interactions)": 90, "New call (not in the class plan)": 50, "Usually right after": 50, "Why the calls differ": 90, "Main drivers outside the range (share)": 55, "Most repeated APIs (share of interactions)": 50, "Flags": 45, "Words in the input that point to this expert": 60, "Input examples (most frequent first messages)": 70, "Words that stand out in its inputs (class vs all)": 55, "Input: first message": 60, "Input: first tool call": 45, "Plan tasks not run": 50, "Extra tasks": 50, "Most common extra tasks (share of cases)": 70, "Plan tasks most often not run (share of cases)": 70, "Decomposition (standard plan → hand-offs in order → APIs they bring)": 110, "Steps in order (agent · API [system])": 100, "Runs after": 60, "What it measures": 70, "What it shows": 70,
+        "Strongest task": 50, "Specialists handed work": 45, "From task": 50, "To task": 50}
+HEAD, BAND, LINE = PatternFill("solid", fgColor="1C5CAB"), PatternFill("solid", fgColor="F2F5FA"), Border(bottom=Side(style="thin", color="D9DEE7"))
+
+
+def write_book(path, sheets, notes):
+    with pd.ExcelWriter(path, engine="openpyxl") as xw:
+        for name, frame in sheets.items():
+            frame = frame if len(frame.columns) else pd.DataFrame({"Note": ["nothing found in this data"]})
+            frame.map(lambda v: ILLEGAL_CHARACTERS_RE.sub("", v)[:32000] if isinstance(v, str) else v).to_excel(xw, sheet_name=name[:31], index=False)
+    wb = load_workbook(path)
+    for ws in wb.worksheets:
+        ws.freeze_panes = "B2"
+        ws.auto_filter.ref = ws.dimensions
+        ws.sheet_view.showGridLines = False
+        cols = [c.value for c in ws[1]]
+        for j, name in enumerate(cols, start=1):
+            cell = ws.cell(1, j)
+            cell.font, cell.fill = Font(bold=True, color="FFFFFF"), HEAD
+            cell.alignment = Alignment(vertical="center", wrap_text=True)
+            if notes and name in GUIDE.get(ws.title, {}):
+                cm = Comment(f"{GUIDE[ws.title][name][0]}\n\nMethod: {GUIDE[ws.title][name][1]}", "NORA version 1.7.5")
+                cm.width, cm.height = 320, 140
+                cell.comment = cm
+            w = max(len(str(ws.cell(i, j).value or "")) for i in range(1, ws.max_row + 1))
+            ws.column_dimensions[cell.column_letter].width = WIDE.get(name, max(11, min(70, w + 2)))
+        ws.row_dimensions[1].height = 32
+        wrap = ws.title in ("Guide", "Column_Guide")                              # short texts: wrapped, row height set from the text
+        for r, row in enumerate(ws.iter_rows(min_row=2), start=2):
+            if wrap:
+                ws.row_dimensions[r].height = 15 * max(1, max(-(-len(str(c_.value or "")) // max(1, int(ws.column_dimensions[c_.column_letter].width) - 2)) for c_ in row))
+            for j, cell in enumerate(row):
+                cell.border = LINE
+                cell.alignment = Alignment(wrap_text=wrap, vertical="top")
+                if r % 2 == 0:
+                    cell.fill = BAND
+                if cols[j] in PERCENT and isinstance(cell.value, (int, float)):
+                    cell.number_format = "0.0%"
+                elif isinstance(cell.value, int):
+                    cell.number_format = "#,##0"
+    wb.save(path)
+
+
+BOOK = OUT / "nora_task_decomposition_version_1_7_5.xlsx"
+VBOOK = OUT / "nora_task_decomposition_version_1_7_5_validation.xlsx"
+write_book(BOOK, {**MAIN, "Guide": GUIDE_SHEET}, notes=True)
+write_book(VBOOK, VALID, notes=False)
+log.info(f"   decomposition workbook -> {BOOK}")
+log.info(f"   validation workbook    -> {VBOOK}")
+
+# ---- report.md: the separate summary (every figure filled from this run) ----
+TOTAL = round(time.time() - T_START, 1)
+md = [f"# NORA task decomposition - run report (version 1.7.5)", "",
+      f"Data: `{SRC.name}` · {n:,} interactions · {FACTS['calls']:,} tool calls · run time {TOTAL:.0f} s · seed {args.seed}", "",
+      "## 1. Goal", "",
+      "Learn from NORA's own logs how a case is decomposed: which specialists the coordinator hands work to (the class), which tasks "
+      "(agent · API) run, in what dependency order (the task DAG), and how many tool and API calls it takes. This is the *Sub-Intent "
+      "Hierarchy → Executable Task DAG → Approved NORA API Plan* part of the architecture. Intent (L1-L4) is not used.", "",
+      "## 2. Data", "",
+      f"- {FACTS['rows']:,} rows read; {FACTS['other_rows']:,} rows that are not calls are set aside.",
+      f"- {FACTS['call_rows']:,} call rows become {FACTS['calls']:,} calls after removing calls written to two log tables "
+      f"(systems learned from the names: {FACTS['systems']}).",
+      f"- {FACTS['agents']} agents, {FACTS['apis']} APIs, {FACTS['tasks']} tasks. Agent known for {FACTS['agent_known']} of calls.",
+      f"- Tool calls: {FACTS['handoff_calls']:,} hand-off calls and {FACTS['api_calls']:,} API calls.", "",
+      "## 3. Method (in the order it runs)", "",
+      "| # | Step | Method | Why |", "|---|---|---|---|",
+      "| 1 | Count each call once | Same interaction + API + occurrence in two log tables, checked by identical input | The same call is written to two log tables |",
+      "| 2 | Find hand-offs | A call named after another agent in the data | The coordinator hands work to specialists through these calls |",
+      f"| 3 | Which hand-offs bring work | Fisher's exact test per task, Benjamini-Hochberg (alpha {ALPHA}) | Exact test on counts, no distribution assumed |",
+      "| 4 | Classes | Exact set of hand-offs that bring work | Counted, not clustered: no number of clusters to choose |",
+      f"| 5 | Task DAGs | Heuristics Miner dependency (>= {args.dependency}) + binomial test + BH, transitive reduction, stages | Standard process-mining method for event logs |",
+      f"| 6 | Validation | {folds}-fold cross-validation, {args.bootstrap:,} bootstrap resamples | Each interaction is tested on a model that never saw it |",
+      "| 7 | Approved traces | Plan conformance + isolation forest (Q3 + 1.5 IQR) | Clean traces for the Task SLM |", "",
+      "## 4. Results", "",
+      f"- Hand-offs found: {len(HANDOFF)}; hand-offs that bring specialist work: {FACTS['driving']}.",
+      f"- Decomposition classes: {FACTS['classes']}; {FACTS['cover']} classes cover half / 80% of interactions.",
+      f"- Standard plan run in every interaction: {FACTS['std_plan']}.",
+      "- Sub-plans (one per hand-off that brings work): " + "; ".join(f"{nm.replace(' sub-plan', '')} {len(pl['tasks'])} tasks / {len(pl['stages'])} stages" for nm, pl in PLANS[1:]) + ".",
+      "- Executable plan of an interaction = standard plan + the sub-plans of the hand-offs in its class.",
+      f"- Approved traces: {FACTS['approved']:,} of {n:,}.", "",
+      "| Class | Specialists handed work | Interactions | Tool calls (median) | API calls (median) |", "|---|---|---|---|---|"]
+md += [f"| {r['Class']} | {r['Specialists handed work']} | {r['Interactions']:,} | {r['Tool calls (median)']:.0f} | {r['API calls (median)']:.0f} |"
+       for _, r in classes.head(10).iterrows()]
+md += ["", "How the largest classes are decomposed:", ""]
+md += [f"- **{r['Class']}** ({r['Interactions']:,} interactions, ~{r['Tool calls (median)']:.0f} tool calls): "
+       f"{r['Decomposition (standard plan → hand-offs in order → APIs they bring)']}" for _, r in classes.head(6).iterrows()]
+md += ["", "## 5. Validation: accuracy on interactions the model has not seen", "",
+       "| Metric | With decomposition | Without (one plan for all) | 95% CI |", "|---|---|---|---|"]
+md += [f"| {r['Metric']} | {r['With decomposition']:.3f} | " + ("n/a" if pd.isna(r['Without decomposition (baseline)']) else f"{r['Without decomposition (baseline)']:.3f}")
+       + f" | {r['95% CI (with)']} |" for _, r in accuracy.iterrows()]
+md += ["", "Specialist metrics have no baseline: one plan for all interactions contains no specialist task. "
+       "Tool-call error is the median gap in calls, so a few looping interactions do not distort it."]
+md += ["", "## 6. Hand-offs", ""]
+md += [f"- {r['Hand-off call']} -> {r['Specialist agent']}: {r['Verdict']}"
+       + (f" ({r['Tasks that run only after this hand-off']} tasks only after it; strongest {r['Strongest task']}: "
+          f"{pct(r['Strongest task: ran when handed work'])} when handed, {pct(r['Strongest task: ran when not handed work'])} when not)"
+          if r['Tasks that run only after this hand-off'] else "") + f"; same verdict in {r['Same verdict in folds']} folds"
+       for _, r in handoff_tab.iterrows()]
+md += ["", "## 7. Classes, variants and why call counts differ", "",
+       "- Principle: interactions belong together when they did the same kind of work (the same set of tasks); loops and retries never split a group.",
+       f"- {len(ORDER)} classes (experts the orchestrator handed work to) split into {len(VAR_MEM)} variants by conditional branches with a proven trigger "
+       f"(present in >= {args.folds} interactions of the class, not in all).",
+       f"- Calls by kind: {FACTS['explained']}.",
+       f"- Repeating calls whose driver is found in the logs: {FACTS['loop_drivers']} (validation workbook, Loop_Drivers).",
+       f"- Trigger rule: present in more than half with the call and less than half without, at least twice as often and 30 points more; "
+       f"values constant in one API's results ignored ({FACTS['const_tokens']}); a branch defines a variant only when 10%+ of the class takes it.",
+       f"- Loops / repeats: {sum(LOOPS.values()) / tot_calls:.1%} of all calls are a task called again (loops over items, retries).",
+       f"- Task-set similarity (median): {np.median(list(SIM_C.values())):.0%} to the class, {np.median(list(SIM_V.values())):.0%} to the variant.",
+       f"- Call spread (IQR, weighted): {np.average(class_quality['Call spread in class (IQR)'], weights=class_quality['Interactions']):.1f} in classes vs "
+       f"{np.average(class_quality['Call spread within variants (IQR)'], weights=class_quality['Interactions']):.1f} within variants.",
+       f"- Interactions that do not fit their class: {len(MISFIT)} (validation workbook, Misfits and Misfit_Patterns).",
+       "- Trigger rule: present in more than half of the interactions with the new call and in less than half without it (same rule as the hand-off test), "
+       "Fisher's exact test + BH; values that only repeat the call's own request are ignored.",
+       f"- Calls outside the plan: {found} of {len(TRIG)} tested have a proven trigger (Branch_Triggers); the rest are listed in Unexplained_Calls."]
+md += ["", "## 8. Honest check: does the input predict the class?", ""]
+if IN_SUM:
+    md += [f"- From the first message alone, on unseen interactions: accuracy {IN_SUM['acc']:.1%} vs {IN_SUM['base']:.1%} by always guessing the biggest class; "
+           f"macro F1 {IN_SUM['macro_f1']:.3f} ({IN_SUM['tested']:,} interactions, {IN_SUM['classes']} classes with >= {args.folds} interactions)."]
+    md += [f"- Input -> {r['Hand-off call']}: AUC {r['AUC on unseen (0.5 = chance, 1 = perfect)']:.3f} ({r['Reading']}); words: {r['Words in the input that point to this expert']}" for r in IN_HO]
+    weak = class_check[class_check["Flags"].str.contains("Input does not")]
+    md += [f"- Classes the input does not separate: {len(weak)} ({', '.join(weak['Class'].head(10))}{' …' if len(weak) > 10 else ''})."]
+else:
+    md += ["- Not tested: not enough interactions with a logged first message."]
+md += ["", "## 9. Files", "",
+       f"- `{BOOK.name}` - the decomposition: Interactions (with input), Classes, Class_Variants, Task_Plan (with conditional steps), API_Catalog (hover a header for its meaning).",
+       f"- `{VBOOK.name}` - validation: accuracy, accuracy by class, folds, hand-off test, DAG edges, data preparation, approved traces, branch triggers, unexplained calls, misfits, class check, input checks, API count matrix.",
+       "- `run.log` - the full log of this run."]
+(OUT / "report.md").write_text("\n".join(md), encoding="utf-8")
+log.info(f"   report -> {OUT / 'report.md'}")
+log.info(f"Finished in {TOTAL:.0f}s")

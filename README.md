@@ -45,5 +45,12 @@ Flow:
 	7.	Sub-classes (variants): extra calls with a proven trigger, made by at least 10% of a class, split the class into variants (trace clustering based on decision mining). For example, Class 01-A/B/C.
 	8.	Repeats: when the same API is called many times, we compare the inputs of those calls to find what drives it. For example, search_socs ×15 makes one call for each SOC code returned earlier. An identical input each time means a retry.
 
+
+	#####
+
+
+	
+python .\nora_agent_summary.py --book ".\task_decomposition_version_1_8_3\nora_task_decomposition_version_1_8_3.xlsx"
+
   
 

@@ -1,0 +1,45 @@
+# NORA - Agent summary: which agent makes which calls.
+# Reads the API_Catalog sheet of the decomposition workbook you already have (same cleaned calls, duplicates already
+# removed) and writes one row per agent. The decomposition workbook is not changed.
+#
+#   python .\nora_agent_summary.py --book ".\task_decomposition_version_1_8_3\nora_task_decomposition_version_1_8_3.xlsx"
+
+import argparse
+from pathlib import Path
+
+import pandas as pd
+
+p = argparse.ArgumentParser()
+p.add_argument("--book", required=True, help="the decomposition workbook (.xlsx) that has the API_Catalog sheet")
+p.add_argument("--out", default=None, help="output file; default: nora_agent_summary.xlsx next to the workbook")
+a = p.parse_args()
+
+book = Path(a.book)
+cat = pd.read_excel(book, sheet_name="API_Catalog")
+cat["Agent"] = cat["Agent"].fillna("—")
+
+rows = []
+for agent, g in cat.groupby("Agent"):
+    g = g.sort_values(["Calls", "Interactions using it"], ascending=False)
+    rows.append({
+        "Agent": agent,
+        "Calls": int(g["Calls"].sum()),
+        "Different APIs": len(g),
+        "Systems": ", ".join(sorted(g["System"].dropna().astype(str).unique())),
+        "Most interactions for one API": int(g["Interactions using it"].max()),
+        "APIs it calls (calls · interactions)": "; ".join(
+            f"{r.API} ({int(r.Calls):,} · {int(r['Interactions using it']):,})" for _, r in g.iterrows()),
+    })
+summary = pd.DataFrame(rows).sort_values("Calls", ascending=False)
+
+# one row per agent + API as well, for filtering
+detail = cat[["Agent", "API", "System", "Layer", "Interactions using it", "Calls"]].sort_values(["Agent", "Calls"], ascending=[True, False])
+
+out = Path(a.out) if a.out else book.with_name("nora_agent_summary.xlsx")
+with pd.ExcelWriter(out) as xw:
+    summary.to_excel(xw, sheet_name="Agent_Summary", index=False)
+    detail.to_excel(xw, sheet_name="Agent_API_Detail", index=False)
+
+print(f"\n{len(summary)} agents · {int(summary['Calls'].sum()):,} calls (same total as API_Catalog: {int(cat['Calls'].sum()):,})")
+print(summary[["Agent", "Calls", "Different APIs", "Systems"]].to_string(index=False))
+print(f"\nSaved: {out}\n")

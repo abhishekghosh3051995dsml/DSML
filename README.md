@@ -84,5 +84,7 @@ Findings:
 	•	The user's input doesn't decide the path. Intent is always "clarification_needed" and the category is mostly "Other". The path depends on what NORA's tools return.
 	•	Outcome differs by class. Cases with a specialist hand-off almost always finish the root cause. Cases with none (Class 01, 604) often don't: 330 have no completed root cause and 329 hit tool errors, mostly 401 Unauthorized.
 
+
+These are the main observations. For every interaction, the sheet logs the exact call flow: each agent, tool and API called, in order, with its extra and repeated calls. Two issues stand out: (1) tool authorization errors (401 Unauthorized), concentrated in Class 01, where no specialist is handed the case; and (2) three snowflake queries that frequently run twice, once with numdays = 7 and once without, which adds avoidable calls. The rest of the detail is in the other sheets: Decomposition (steps per case), Task_Plan (the learned plan), API_Catalog (agents and APIs) and Classes / Class_Variants.
   
 

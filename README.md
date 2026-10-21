@@ -52,5 +52,37 @@ Flow:
 	
 python .\nora_agent_summary.py --book ".\task_decomposition_version_1_8_3\nora_task_decomposition_version_1_8_3.xlsx"
 
+
+Hi Sendil, here's the output and the findings from this method.
+
+Technology: process mining and statistics on NORA's own logs. No LLM or prompting is used, so the same data always gives the same result.
+
+Flow, input → output:
+① Input from the logs: the user's message, the category they selected, what NORA recorded, NORA's reply and the feedback
+→ ② Remove calls logged twice (record linkage)
+→ ③ Each interaction's steps in time order, as agent → tool/API (process-mining event log)
+→ ④ Check which specialist hand-offs really bring work (Fisher's exact test + Benjamini–Hochberg)
+→ ⑤ Group cases by those hand-offs into 67 classes
+→ ⑥ Learn the task plan and its order (Heuristics Miner, dependency ≥ 0.9)
+→ ⑦ Mark every call outside the plan and find the data value that triggers it (decision mining)
+→ ⑧ Split each class by those triggered calls into 89 variants (trace clustering)
+→ ⑨ Explain every repeated call (input comparison)
+→ ⑩ Show, API by API, why each case differs from a typical case (median profile)
+
+Findings:
+
+	•	NORA runs one core plan: 34 tasks in 5 stages (subscription, device, usage, provisioning, outage, location, SOC and history checks). On top of that come 11 specialist sub-plans and 174 class-specific steps. 93.6% of all calls are explained by this plan.
+	•	11 of the 13 orchestrator hand-offs bring real specialist work: HSI, Billing, Data, Voice, Inseego, Roaming, Cradlepoint, Messaging, Digits, IoT and Wholesale. Sim_agent and Audit_agent run whether or not they're handed work.
+	•	6.4% of calls are outside the plan. Half of them (3.2%) have a proven trigger in the data, covering 37 of the 56 extra-call types. For example:
+	•	get_pgw_udm ← qtm_cellsector_ref_query: has_open_site_ticket = false;
+	•	get_pgw_hss ← the LTE/5G attempts-and-drops query;
+	•	get_keys ← category "T-Mobile Business Internet".
+	•	Repeats drive most of the difference in call counts. A driver was found for 44 of the 56 APIs that repeat:
+	•	search_socs runs once per SOC code;
+	•	three snowflake queries frequently run twice (with and without numdays = 7);
+	•	a few cases loop the same call hundreds of times.
+	•	The user's input doesn't decide the path. Intent is always "clarification_needed" and the category is mostly "Other". The path depends on what NORA's tools return.
+	•	Outcome differs by class. Cases with a specialist hand-off almost always finish the root cause. Cases with none (Class 01, 604) often don't: 330 have no completed root cause and 329 hit tool errors, mostly 401 Unauthorized.
+
   
 

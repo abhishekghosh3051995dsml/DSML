@@ -1,0 +1,360 @@
+# %%
+import ast
+import csv
+import json
+import re
+from collections import Counter, defaultdict
+from itertools import combinations
+from pathlib import Path
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+
+FILE_NAME = "interactions.csv"
+CSV_PATH = None
+KEY = None  # leave None to detect the interaction key from the data
+CHUNK_ROWS = 100_000
+LOWCARD_MAX = 200
+COUNTER_CAP = 1_000
+JSON_SAMPLE_PER_CHUNK = 2_000
+JSON_MAX_DEPTH = 3
+JSON_LEAF_CAP = 50
+CROSSTAB_MAX_VALUES = 30
+UUID_PATTERN = r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+
+
+def locate_csv(name):
+    local = Path.cwd() / name
+    if local.exists():
+        return local
+    roots = [p for p in Path.home().iterdir() if p.is_dir() and p.name.lower().startswith("onedrive")]
+    hits = [f for root in roots for f in root.rglob(name)]
+    if not hits:
+        raise FileNotFoundError(f"{name} not found in {Path.cwd()} or under OneDrive")
+    return max(hits, key=lambda f: f.stat().st_mtime)
+
+
+def detect_format(path):
+    for enc in ("utf-8-sig", "cp1252", "latin-1"):
+        try:
+            with open(path, encoding=enc, newline="") as fh:
+                head = fh.read(64 * 1024)
+            return enc, csv.Sniffer().sniff(head, delimiters=",;\t|").delimiter
+        except (UnicodeDecodeError, csv.Error):
+            continue
+    return "latin-1", ","
+
+
+def read_chunks(usecols=None, dtypes=None):
+    return pd.read_csv(path, sep=sep, encoding=encoding, dtype=dtypes or str,
+                       usecols=usecols, chunksize=CHUNK_ROWS, low_memory=False)
+
+
+def parse_structured(value):
+    value = value.strip()
+    if not value or value[0] not in "{[":
+        return None
+    try:
+        return json.loads(value)
+    except ValueError:
+        try:
+            return ast.literal_eval(value)
+        except (ValueError, SyntaxError, MemoryError, RecursionError):
+            return None
+
+
+def walk(obj, prefix, depth, paths, leaves):
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            p = f"{prefix}.{k}" if prefix else str(k)
+            paths.add(p)
+            if depth < JSON_MAX_DEPTH:
+                walk(v, p, depth + 1, paths, leaves)
+    elif isinstance(obj, list):
+        p = f"{prefix}[]"
+        paths.add(p)
+        for item in obj[:20]:
+            walk(item, p, depth + 1, paths, leaves)
+    else:
+        leaves.append((prefix, obj))
+
+
+path = Path(CSV_PATH) if CSV_PATH else locate_csv(FILE_NAME)
+encoding, sep = detect_format(path)
+OUT = path.with_name("interactions_eda")
+OUT.mkdir(exist_ok=True)
+columns = pd.read_csv(path, nrows=0, sep=sep, encoding=encoding).columns.tolist()
+print(f"{path}  |  {path.stat().st_size / 1024**2:,.1f} MB  |  {encoding}  |  {sep!r}  |  {len(columns)} columns")
+
+# %%
+n_rows = 0
+non_null = Counter()
+hashes = defaultdict(list)
+lengths = defaultdict(list)
+counters = {c: Counter() for c in columns}
+overflow = set()
+pair_both, pair_equal = Counter(), Counter()
+uuid_hits, uuid_checked = Counter(), Counter()
+row_hashes = []
+json_cols = None
+json_sampled, json_failed = Counter(), Counter()
+json_paths = defaultdict(Counter)
+json_leaf = defaultdict(Counter)
+json_leaf_overflow = set()
+
+for i, chunk in enumerate(read_chunks()):
+    n_rows += len(chunk)
+    notna = chunk.notna()
+    non_null.update(notna.sum().to_dict())
+    row_hashes.append(pd.util.hash_pandas_object(chunk, index=False).to_numpy())
+
+    for c in columns:
+        s = chunk[c].dropna()
+        if s.empty:
+            continue
+        hashes[c].append(pd.util.hash_pandas_object(s, index=False).to_numpy())
+        lengths[c].append(s.str.len().to_numpy(dtype=np.int32))
+        if c not in overflow:
+            counters[c].update(s.value_counts().to_dict())
+            if len(counters[c]) > COUNTER_CAP:
+                overflow.add(c)
+                counters[c] = Counter()
+        probe = s.head(200)
+        uuid_checked[c] += len(probe)
+        uuid_hits[c] += int(probe.str.match(UUID_PATTERN, flags=re.I).sum())
+
+    for a, b in combinations(columns, 2):
+        both = notna[a] & notna[b]
+        nb = int(both.sum())
+        if nb:
+            pair_both[(a, b)] += nb
+            pair_equal[(a, b)] += int((chunk.loc[both, a] == chunk.loc[both, b]).sum())
+
+    if json_cols is None:
+        json_cols = []
+        for c in columns:
+            head = chunk[c].dropna().head(100).str.lstrip()
+            if len(head) and head.str[:1].isin(["{", "["]).mean() >= 0.8:
+                json_cols.append(c)
+
+    sub = chunk.iloc[::max(1, len(chunk) // JSON_SAMPLE_PER_CHUNK)]
+    for c in json_cols:
+        for value in sub[c].dropna():
+            obj = parse_structured(value)
+            json_sampled[c] += 1
+            if obj is None:
+                json_failed[c] += 1
+                continue
+            paths, leaves = set(), []
+            walk(obj, "", 0, paths, leaves)
+            json_paths[c].update(paths)
+            for p, v in leaves:
+                k = (c, p)
+                if k in json_leaf_overflow:
+                    continue
+                json_leaf[k][str(v)[:120]] += 1
+                if len(json_leaf[k]) > JSON_LEAF_CAP:
+                    json_leaf_overflow.add(k)
+                    del json_leaf[k]
+
+    print(f"chunk {i + 1}: {n_rows:,} rows")
+
+# %%
+distinct = {c: int(np.unique(np.concatenate(hashes[c])).size) if hashes[c] else 0 for c in columns}
+duplicate_rows = n_rows - int(np.unique(np.concatenate(row_hashes)).size)
+uuid_share = {c: uuid_hits[c] / uuid_checked[c] if uuid_checked[c] else 0.0 for c in columns}
+lowcard = [c for c in columns if c not in overflow and 1 <= distinct[c] <= LOWCARD_MAX]
+empty_cols = [c for c in columns if non_null[c] == 0]
+partial_cols = [c for c in columns if 0 < non_null[c] < n_rows]
+
+profile = []
+for c in columns:
+    lens = np.concatenate(lengths[c]) if lengths[c] else np.array([0])
+    profile.append({
+        "column": c,
+        "non_null": non_null[c],
+        "null": n_rows - non_null[c],
+        "fill_pct": round(100 * non_null[c] / n_rows, 2),
+        "distinct": distinct[c],
+        "uuid_like_pct": round(100 * uuid_share[c], 1),
+        "len_min": int(lens.min()),
+        "len_p50": int(np.percentile(lens, 50)),
+        "len_p95": int(np.percentile(lens, 95)),
+        "len_max": int(lens.max()),
+        "categorical": c in lowcard,
+        "structured": c in json_cols,
+        "parse_fail_pct": round(100 * json_failed[c] / json_sampled[c], 2) if json_sampled[c] else None,
+    })
+profile = pd.DataFrame(profile)
+profile.to_csv(OUT / "01_column_profile.csv", index=False)
+
+value_counts = pd.DataFrame(
+    [(c, v, n) for c in lowcard for v, n in counters[c].most_common()],
+    columns=["column", "value", "rows"],
+)
+value_counts.to_csv(OUT / "02_value_counts_rows.csv", index=False)
+
+variants = []
+for c in lowcard:
+    groups = defaultdict(list)
+    for v in counters[c]:
+        groups[v.strip().lower()].append(v)
+    variants += [(c, k, " | ".join(vs)) for k, vs in groups.items() if len(vs) > 1]
+pd.DataFrame(variants, columns=["column", "normalised", "raw_forms"]).to_csv(OUT / "03_case_variants.csv", index=False)
+
+pairs = pd.DataFrame(
+    [(a, b, pair_both[(a, b)], pair_equal[(a, b)]) for (a, b) in pair_both if pair_equal[(a, b)]],
+    columns=["column_a", "column_b", "rows_both_filled", "rows_equal"],
+)
+pairs["agreement_pct"] = (100 * pairs.rows_equal / pairs.rows_both_filled).round(3)
+pairs.sort_values("agreement_pct", ascending=False).to_csv(OUT / "04_column_pairs.csv", index=False)
+
+json_path_rows = [(c, p, n, json_sampled[c] - json_failed[c])
+                  for c in json_cols for p, n in json_paths[c].most_common()]
+pd.DataFrame(json_path_rows, columns=["column", "path", "records_with_path", "records_parsed"]) \
+    .to_csv(OUT / "05_structured_paths.csv", index=False)
+pd.DataFrame([(c, p, v, n) for (c, p), cnt in json_leaf.items() for v, n in cnt.most_common()],
+             columns=["column", "path", "value", "count"]).to_csv(OUT / "06_structured_values.csv", index=False)
+
+print(f"rows {n_rows:,}  |  duplicate rows {duplicate_rows:,}")
+print(f"empty columns: {empty_cols}")
+print(f"categorical columns: {lowcard}")
+print(f"structured columns: {json_cols}")
+print(profile[["column", "fill_pct", "distinct", "len_p50", "len_max", "categorical", "structured", "parse_fail_pct"]].to_string(index=False))
+
+# %%
+if KEY is None:
+    candidates = [c for c in columns
+                  if non_null[c] == n_rows and uuid_share[c] >= 0.95 and 1 < distinct[c] < n_rows]
+    if not candidates:
+        raise ValueError("no interaction key found; set KEY manually")
+    KEY = min(candidates, key=lambda c: (distinct[c], columns.index(c)))
+
+key_aliases = [b if a == KEY else a for (a, b) in pair_both
+               if KEY in (a, b) and pair_equal[(a, b)] == pair_both[(a, b)] == n_rows]
+flag_cols = [c for c in partial_cols if c not in lowcard]
+cat_types = {c: pd.CategoricalDtype(sorted(counters[c])) for c in lowcard if c != KEY}
+
+frames = []
+for chunk in read_chunks(usecols=[KEY] + list(cat_types) + flag_cols):
+    slim = chunk[[KEY]].copy()
+    for c, t in cat_types.items():
+        slim[c] = chunk[c].astype(t)
+    for c in flag_cols:
+        slim[f"has_{c}"] = chunk[c].notna()
+    frames.append(slim)
+slim = pd.concat(frames, ignore_index=True)
+del frames
+
+g = slim.groupby(KEY, sort=False)
+inter = pd.DataFrame({"rows": g.size()})
+for c in cat_types:
+    inter[f"{c}_n_values"] = g[c].nunique()
+    uniq = slim[[KEY, c]].dropna().drop_duplicates()
+    inter[c] = uniq.groupby(KEY, observed=True)[c].agg(lambda s: "|".join(sorted(map(str, s))))
+for c in flag_cols:
+    inter[f"rows_with_{c}"] = g[f"has_{c}"].sum()
+inter.to_csv(OUT / "07_interaction_level.csv")
+
+consistency = []
+for c in cat_types:
+    n = inter[f"{c}_n_values"]
+    present = n[n > 0]
+    consistency.append({
+        "column": c,
+        "interactions_with_value": len(present),
+        "interactions_without_value": int((n == 0).sum()),
+        "single_value": int((present == 1).sum()),
+        "multi_value": int((present > 1).sum()),
+        "max_values": int(present.max()) if len(present) else 0,
+    })
+consistency = pd.DataFrame(consistency)
+consistency.to_csv(OUT / "08_label_consistency.csv", index=False)
+
+labels = consistency.loc[
+    (consistency.interactions_with_value > 0)
+    & (consistency.single_value / consistency.interactions_with_value.clip(lower=1) >= 0.95)
+    & consistency.column.map(lambda c: len(cat_types[c].categories) <= CROSSTAB_MAX_VALUES),
+    "column",
+].tolist()
+
+label_rows = []
+for c in cat_types:
+    for value, grp in inter.groupby(inter[c].fillna("<missing>")):
+        row = {"column": c, "value": value, "interactions": len(grp),
+               "rows_total": int(grp.rows.sum()), "rows_median": float(grp.rows.median()),
+               "rows_p90": float(grp.rows.quantile(0.9)), "rows_max": int(grp.rows.max())}
+        for f in flag_cols:
+            row[f"interactions_with_{f}"] = int((grp[f"rows_with_{f}"] > 0).sum())
+        label_rows.append(row)
+pd.DataFrame(label_rows).sort_values(["column", "interactions"], ascending=[True, False]) \
+    .to_csv(OUT / "09_interaction_value_counts.csv", index=False)
+
+bridge = []
+for lab in labels:
+    lab_map = inter[lab]
+    for c in cat_types:
+        if c == lab:
+            continue
+        uniq = slim[[KEY, c]].dropna().drop_duplicates()
+        uniq["label"] = uniq[KEY].map(lab_map).fillna("<missing>")
+        counts = uniq.groupby(["label", c], observed=True).size().reset_index(name="interactions")
+        counts.insert(0, "label_column", lab)
+        counts.insert(2, "column", c)
+        bridge.append(counts.rename(columns={c: "value"}))
+if bridge:
+    pd.concat(bridge, ignore_index=True).to_csv(OUT / "10_label_vs_columns_interactions.csv", index=False)
+
+rpi = inter.rows
+checks = pd.DataFrame([
+    ("total_rows", n_rows),
+    ("total_columns", len(columns)),
+    ("interaction_key", KEY),
+    ("key_identical_columns", ", ".join(key_aliases)),
+    ("interactions", len(inter)),
+    ("duplicate_rows", duplicate_rows),
+    ("empty_columns", ", ".join(empty_cols)),
+    ("label_columns", ", ".join(labels)),
+    ("rows_per_interaction_min", int(rpi.min())),
+    ("rows_per_interaction_median", float(rpi.median())),
+    ("rows_per_interaction_mean", round(float(rpi.mean()), 2)),
+    ("rows_per_interaction_p90", float(rpi.quantile(0.9))),
+    ("rows_per_interaction_p99", float(rpi.quantile(0.99))),
+    ("rows_per_interaction_max", int(rpi.max())),
+], columns=["check", "value"])
+checks.to_csv(OUT / "00_checks.csv", index=False)
+
+print(checks.to_string(index=False))
+print()
+print(consistency.to_string(index=False))
+
+# %%
+fig, ax = plt.subplots(figsize=(9, 5))
+bins = np.unique(np.logspace(0, np.log10(rpi.max() + 1), 40).astype(int))
+ax.hist(rpi, bins=bins, color="#3b6ea5", edgecolor="white")
+ax.set_xscale("log")
+ax.set_xlabel("rows per interaction (log scale)")
+ax.set_ylabel("interactions")
+ax.set_title("Rows per interaction")
+fig.tight_layout()
+fig.savefig(OUT / "rows_per_interaction.png", dpi=150)
+plt.close(fig)
+
+for c in cat_types:
+    vc = inter[c].fillna("<missing>").value_counts()
+    if len(vc) > CROSSTAB_MAX_VALUES:
+        continue
+    fig, ax = plt.subplots(figsize=(9, max(3, 0.35 * len(vc) + 1.5)))
+    vc.sort_values().plot.barh(ax=ax, color="#3b6ea5")
+    for y, v in enumerate(vc.sort_values()):
+        ax.text(v, y, f" {v:,}", va="center", fontsize=8)
+    ax.set_xlabel("interactions")
+    ax.set_title(f"Interactions by {c}")
+    fig.tight_layout()
+    fig.savefig(OUT / f"interactions_by_{c}.png", dpi=150)
+    plt.close(fig)
+
+print(f"outputs: {OUT}")

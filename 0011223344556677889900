@@ -1,0 +1,1227 @@
+# %%
+import ast
+import csv
+import json
+import re
+from collections import Counter, defaultdict
+from itertools import combinations
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import sklearn
+from openpyxl.styles import Alignment, Font
+from scipy.cluster.hierarchy import fcluster, linkage
+from scipy.sparse import hstack
+from scipy.spatial.distance import squareform
+from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS, CountVectorizer
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import adjusted_rand_score, balanced_accuracy_score, f1_score, roc_auc_score
+from sklearn.model_selection import StratifiedKFold, train_test_split
+
+FILE_NAME = "interactions.csv"
+CSV_PATH = None
+ROLE_OVERRIDES = {}  # only if a detected role is wrong, e.g. {"label": "intent"}
+CHUNK_ROWS = 50_000
+SAMPLE_EVERY = 10
+CARD_CAP = 5_000
+LABEL_MAX_VALUES = 50
+MAJORITY = 0.5
+MIN_SUPPORT = 5
+GENERIC_TOKEN_SHARE = 0.25
+AGENT_LINK_COVERAGE = 0.8
+SECONDARY_ORDER_AGREE = 0.95
+UNIVERSAL_KEY_SHARE = 0.95
+CONTEXT_MAX_VALUES = 30
+FAMILY_ALPHA = 0.05
+PERMUTATIONS = 9999
+PERM_BATCH = 500
+LEAF_MAX_LEN = 40
+LEAF_CAP = 120
+TEST_SIZE = 0.2
+FOLDS = 5
+BOOTSTRAPS = 30
+C_GRID = (0.03, 0.1, 0.3, 1.0, 3.0)
+TRIGGER_MIN_AUC = 0.7
+TOP_TRIGGERS = 5
+EXCEL_CELL_MAX = 32_000
+SEED = 42
+UUID_PATTERN = r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+NOISY_VALUE = re.compile(r"\d{4,}|^[0-9a-fA-F\-]{12,}$")
+DIGITS = re.compile(r"\d{6,}")
+EMAIL = re.compile(r"\S+@\S+\.\S+")
+NUMERIC = re.compile(r"^[-+]?\d+(\.\d+)?([eE][-+]?\d+)?$|^\d{4}-\d{2}-\d{2}")
+MASKED_PAIR = re.compile(r"[A-Za-z_ ]{0,40}:\s*#+\s*[,;]?\s*")
+EN_STOP = sorted(ENGLISH_STOP_WORDS)
+
+
+def locate_csv(name):
+    local = Path.cwd() / name
+    if local.exists():
+        return local
+    roots = [p for p in Path.home().iterdir() if p.is_dir() and p.name.lower().startswith("onedrive")]
+    hits = [f for root in roots for f in root.rglob(name)]
+    if not hits:
+        raise FileNotFoundError(f"{name} not found in {Path.cwd()} or under OneDrive")
+    return max(hits, key=lambda f: f.stat().st_mtime)
+
+
+def detect_format(path):
+    for enc in ("utf-8-sig", "cp1252", "latin-1"):
+        try:
+            with open(path, encoding=enc, newline="") as fh:
+                head = fh.read(64 * 1024)
+            return enc, csv.Sniffer().sniff(head, delimiters=",;\t|").delimiter
+        except (UnicodeDecodeError, csv.Error):
+            continue
+    return "latin-1", ","
+
+
+def read_chunks():
+    return pd.read_csv(path, sep=sep, encoding=encoding, dtype=str, chunksize=CHUNK_ROWS, low_memory=False)
+
+
+def parse_json(value):
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    if not value or value[0] not in "{[":
+        return None
+    try:
+        return json.loads(value)
+    except ValueError:
+        try:
+            return ast.literal_eval(value)
+        except (ValueError, SyntaxError, MemoryError, RecursionError):
+            return None
+
+
+def leaves(obj, keys=(), depth=0, max_depth=8):
+    if isinstance(obj, dict):
+        if depth < max_depth:
+            for k, v in obj.items():
+                yield from leaves(v, keys + (str(k),), depth + 1, max_depth)
+    elif isinstance(obj, list):
+        if depth < max_depth:
+            for v in obj[:50]:
+                yield from leaves(v, keys, depth + 1, max_depth)
+    else:
+        yield keys, obj
+
+
+def dict_lists(obj, keys=(), depth=0):
+    if depth > 3:
+        return
+    if isinstance(obj, list):
+        if obj and all(isinstance(i, dict) for i in obj[:20]):
+            yield keys, obj
+    elif isinstance(obj, dict):
+        for k, v in obj.items():
+            yield from dict_lists(v, keys + (str(k),), depth + 1)
+
+
+def dig(obj, keys):
+    for k in keys:
+        if not isinstance(obj, dict) or k not in obj:
+            return None
+        obj = obj[k]
+    return obj
+
+
+def to_epoch(v):
+    if v is None or isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        x = float(v)
+        if 9.4e8 <= x <= 4.2e9:
+            return x
+        if 9.4e11 <= x <= 4.2e12:
+            return x / 1000
+        return None
+    if isinstance(v, str) and 10 <= len(v) <= 40 and re.match(r"\d{4}-\d{2}-\d{2}", v):
+        t = pd.to_datetime(v, errors="coerce", utc=True)
+        return None if pd.isna(t) else t.timestamp()
+    return None
+
+
+def mask(text):
+    text = EMAIL.sub("#", text)
+    return DIGITS.sub(lambda m: "#" * len(m.group()), text)
+
+
+def clean_instruction(text):
+    text = MASKED_PAIR.sub("", mask(text))
+    text = re.sub(r"#{2,}", "", text)
+    return re.sub(r"\s{2,}", " ", text).strip(" ,;|")
+
+
+def tokens(name):
+    return {t for t in re.split(r"[^a-z0-9]+", re.sub(r"([a-z])([A-Z])", r"\1_\2", name).lower()) if t}
+
+
+def collapse(items):
+    out = []
+    for item in items:
+        if out and out[-1][0] == item:
+            out[-1][1] += 1
+        else:
+            out.append([item, 1])
+    return [f"{i} ×{n}" if n > 1 else i for i, n in out]
+
+
+def normal_threshold(shares):
+    v = np.unique(np.round(np.asarray(shares, float), 6))[::-1]
+    if len(v) < 2:
+        return MAJORITY
+    gaps = v[:-1] - v[1:]
+    i = int(gaps.argmax())
+    return max((v[i] + v[i + 1]) / 2, MAJORITY)
+
+
+L1_ARGS = ({"l1_ratio": 1.0} if tuple(int(x) for x in sklearn.__version__.split(".")[:2]) >= (1, 8)
+           else {"penalty": "l1"})
+
+
+def sparse_logit(C):
+    return LogisticRegression(solver="liblinear", C=C, class_weight="balanced", **L1_ARGS)
+
+
+def letters(i):
+    s = ""
+    i += 1
+    while i:
+        i, r = divmod(i - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+
+path = Path(CSV_PATH) if CSV_PATH else locate_csv(FILE_NAME)
+encoding, sep = detect_format(path)
+OUT = path.with_name("task_decomposition")
+OUT.mkdir(exist_ok=True)
+columns = pd.read_csv(path, nrows=0, sep=sep, encoding=encoding).columns.tolist()
+print(f"{path}  |  {path.stat().st_size / 1024**2:,.1f} MB  |  {encoding}  |  {sep!r}  |  {len(columns)} columns")
+
+# %%
+n_rows = 0
+non_null, length_sum = Counter(), Counter()
+uuid_hits, uuid_seen, json_hits, json_seen = Counter(), Counter(), Counter(), Counter()
+values = {c: set() for c in columns}
+high_card = set()
+co_fill = Counter()
+samples = []
+
+for chunk in read_chunks():
+    chunk.index = range(n_rows, n_rows + len(chunk))
+    n_rows += len(chunk)
+    notna = chunk.notna()
+    non_null.update(notna.sum().to_dict())
+    for a, b in combinations(columns, 2):
+        co_fill[(a, b)] += int((notna[a] & notna[b]).sum())
+    for c in columns:
+        s = chunk[c].dropna()
+        if s.empty:
+            continue
+        lens = s.str.len()
+        length_sum[c] += int(lens.sum())
+        probe = s.iloc[:: max(1, len(s) // 300)]
+        uuid_seen[c] += len(probe)
+        uuid_hits[c] += int(probe.str.match(UUID_PATTERN, flags=re.I).sum())
+        json_seen[c] += len(probe)
+        json_hits[c] += int(probe.str.lstrip().str[:1].isin(["{", "["]).sum())
+        if c not in high_card:
+            values[c].update(s.unique())
+            cap = 1_000_000 if lens.mean() <= 64 else CARD_CAP
+            if len(values[c]) > cap:
+                high_card.add(c)
+                values[c] = set()
+    samples.append(chunk.iloc[::SAMPLE_EVERY])
+    print(f"profiled {n_rows:,} rows")
+
+sample = pd.concat(samples)
+del samples
+fill = {c: non_null[c] / n_rows for c in columns}
+distinct = {c: len(values[c]) if c not in high_card else 10**9 for c in columns}
+uuid_share = {c: uuid_hits[c] / uuid_seen[c] if uuid_seen[c] else 0.0 for c in columns}
+json_cols = [c for c in columns if json_seen[c] and json_hits[c] / json_seen[c] >= 0.8]
+mean_len = {c: length_sum[c] / non_null[c] if non_null[c] else 0.0 for c in columns}
+
+
+def pair_fill(a, b):
+    return co_fill[(a, b)] if (a, b) in co_fill else co_fill[(b, a)]
+
+
+key_candidates = [c for c in columns if fill[c] == 1 and uuid_share[c] >= 0.95 and 1 < distinct[c] < n_rows]
+KEY = ROLE_OVERRIDES.get("key") or min(key_candidates, key=lambda c: (distinct[c], columns.index(c)))
+
+step_candidates = [c for c in columns
+                   if 0 < fill[c] < 1 and c not in json_cols and c not in high_card and uuid_share[c] < 0.5
+                   and mean_len[c] <= 80 and distinct[c] <= 0.05 * non_null[c]]
+pairs = []
+for a, b in combinations(step_candidates, 2):
+    both = pair_fill(a, b)
+    pairs.append((both / (non_null[a] + non_null[b] - both), both, a, b))
+if not pairs and not {"actor", "action"} <= ROLE_OVERRIDES.keys():
+    raise ValueError(f"no actor/action column pair found among {step_candidates}; set ROLE_OVERRIDES")
+_, _, a, b = max(pairs) if pairs else (0, 0, None, None)
+ACTOR = ROLE_OVERRIDES.get("actor") or (a if distinct[a] <= distinct[b] else b)
+ACTION = ROLE_OVERRIDES.get("action") or (b if ACTOR == a else a)
+lowcard_full = [c for c in columns if fill[c] >= 0.99 and c not in high_card and 2 <= distinct[c] <= LABEL_MAX_VALUES]
+
+profile = pd.DataFrame({
+    "column": columns,
+    "fill": [round(fill[c], 4) for c in columns],
+    "distinct": [distinct[c] if distinct[c] < 10**9 else f">{CARD_CAP}" for c in columns],
+    "uuid_like": [round(uuid_share[c], 2) for c in columns],
+    "structured": [c in json_cols for c in columns],
+    "mean_len": [round(mean_len[c]) for c in columns],
+})
+print(profile.to_string(index=False))
+print(f"\nkey={KEY}  actor={ACTOR}  action={ACTION}  structured={json_cols}")
+
+# %%
+ts_score = Counter()
+for c in json_cols:
+    for value in sample[c].dropna():
+        obj = parse_json(value)
+        if not isinstance(obj, dict):
+            continue
+        seen = set()
+        for keys, v in leaves(obj, max_depth=2):
+            if keys not in seen and to_epoch(v) is not None:
+                seen.add(keys)
+                ts_score[(c, keys)] += 1
+ranked = [p for p, _ in ts_score.most_common()]
+TS_PATHS = ranked[:1]
+if ranked:
+    def field_time(c, keys):
+        return sample[c].map(lambda v: to_epoch(dig(parse_json(v), keys)))
+
+    primary = field_time(*ranked[0])
+    spans = pd.DataFrame({"k": sample[KEY], "t": primary}).dropna().groupby("k")["t"].agg(["min", "max", "size"])
+    spans = spans[spans["size"] > 1]
+    limit = float((spans["max"] - spans["min"]).median()) if len(spans) else 0.0
+    for c, keys in ranked[1:]:
+        if ts_score[(c, keys)] < 0.5 * ts_score[ranked[0]] or limit <= 0:
+            break
+        diff = (field_time(c, keys) - primary).abs().dropna()
+        if len(diff) and (diff <= limit).mean() >= SECONDARY_ORDER_AGREE:
+            TS_PATHS.append((c, keys))
+            break
+if not TS_PATHS:
+    print("no timestamp field found; file row order is used for step order")
+
+msg_stats = defaultdict(lambda: {"lists": 0, "items": [], "per_list": []})
+for _, r in sample[sample[ACTION].isna()].iterrows():
+    for c in json_cols:
+        obj = parse_json(r[c])
+        for keys, lst in dict_lists(obj):
+            st = msg_stats[(c, keys)]
+            st["lists"] += 1
+            flat = [{k: v for k, v in leaves(item, max_depth=2) if isinstance(v, str)} for item in lst[:50]]
+            if len(st["items"]) < 5_000:
+                st["items"].extend(flat)
+            st["per_list"].append(flat)
+
+MSG = None
+best = (0, 0)
+for (c, keys), st in msg_stats.items():
+    items = st["items"]
+    if not items:
+        continue
+    fields = Counter(k for it in items for k in it)
+    role_opts, content_opts = [], []
+    for f, n in fields.items():
+        vals = [it[f] for it in items if f in it]
+        if n >= 0.9 * len(items) and max(map(len, vals)) <= 30 and 1 <= len(set(vals)) <= 10:
+            role_opts.append((-len(set(vals)), len(f), f))
+        if np.mean([bool(re.match(UUID_PATTERN, v, re.I)) for v in vals]) < 0.5:
+            content_opts.append((np.mean([len(v.split()) for v in vals]), f))
+    if not role_opts:
+        continue
+    role = sorted(role_opts)[0][2]
+    content = max((o for o in content_opts if o[1] != role), default=(0, None))
+    if content[0] < 3:
+        continue
+    multi = sum(len({it.get(role) for it in lst}) > 1 for lst in st["per_list"])
+    if (multi, st["lists"]) > best:
+        best = (multi, st["lists"])
+        MSG = {"col": c, "keys": keys, "role": role, "content": content[1]}
+del msg_stats
+
+if MSG:
+    first_roles = Counter()
+    for value in sample[MSG["col"]].dropna():
+        lst = dig(parse_json(value), MSG["keys"])
+        if isinstance(lst, list) and lst and isinstance(lst[0], dict):
+            first_roles[dict((k, v) for k, v in leaves(lst[0], max_depth=2)).get(MSG["role"])] += 1
+    first_roles.pop(None, None)
+    CUSTOMER = first_roles.most_common(1)[0][0] if first_roles else None
+else:
+    CUSTOMER = None
+print(f"order fields: {[(c, '.'.join(k)) for c, k in TS_PATHS]}")
+print(f"messages: {MSG}  customer role: {CUSTOMER}")
+
+
+def context_tokens(obj, skip=()):
+    out, seen = [], set()
+    for keys, v in leaves(obj, max_depth=6):
+        if not keys or keys[0] in skip or isinstance(v, (dict, list)) or v is None:
+            continue
+        key = ".".join(keys[-2:])
+        s = str(v).strip()
+        if not s:
+            continue
+        if NOISY_VALUE.search(s) or NUMERIC.match(s) or set(s) <= set("#*xX-"):
+            typ, val = "id", ""
+        elif len(s) > LEAF_MAX_LEN:
+            typ, val = "text", ""
+        else:
+            typ, val = "cat", s.lower()
+        tok = f"{key}\x1e{val}\x1e{typ}"
+        if tok not in seen:
+            seen.add(tok)
+            out.append(tok)
+    return "\x1f".join(out) or None
+
+
+def arg_text(rec, objs):
+    for c in sorted(objs, key=lambda c: len(rec[c])):
+        texts = [v for _, v in leaves(objs[c]) if isinstance(v, str) and len(v.split()) >= 3
+                 and v.lstrip()[:1] not in ("{", "[") and parse_json(v) is None]
+        if texts:
+            cleaned = clean_instruction(max(texts, key=len))
+            return cleaned[:300] or None
+    return None
+
+
+def leaf_tokens(objs, action, actor):
+    out = []
+    seen = set()
+    for c, obj in objs.items():
+        for keys, v in leaves(obj):
+            if not isinstance(v, (str, bool)):
+                continue
+            s = str(v).strip()
+            if (not 0 < len(s) <= LEAF_MAX_LEN or s in (action, actor) or NOISY_VALUE.search(s)
+                    or NUMERIC.match(s)):
+                continue
+            tok = f"{keys[-1] if keys else c}={s.lower()}"
+            if tok not in seen:
+                seen.add(tok)
+                out.append(tok)
+                if len(out) >= LEAF_CAP:
+                    return "\x1f".join(out)
+    return "\x1f".join(out)
+
+
+# %%
+acting = sample[sample[ACTION].notna()]
+input_candidates = [c for c in json_cols if acting[c].notna().mean() >= MAJORITY]
+INPUT_COL = min(input_candidates, key=lambda c: acting[c].dropna().str.len().mean()) if input_candidates else None
+CONTEXT_COL = max((c for c in json_cols if c != INPUT_COL), key=lambda c: fill[c], default=None)
+print(f"tool input column: {INPUT_COL}  context column: {CONTEXT_COL}")
+keep = list(dict.fromkeys([KEY, ACTOR, ACTION] + lowcard_full))
+frames, msg_rows = [], []
+offset = 0
+for chunk in read_chunks():
+    chunk.index = range(offset, offset + len(chunk))
+    offset += len(chunk)
+    base = chunk[keep].copy()
+    base["row"] = chunk.index
+    ts_vals = [[] for _ in TS_PATHS]
+    args, leaf_col, ctx_col = [], [], []
+    for idx, rec in zip(chunk.index, chunk.to_dict("records")):
+        parsed = {}
+
+        def get(c):
+            if c not in parsed:
+                parsed[c] = parse_json(rec[c])
+            return parsed[c]
+
+        for i, (c, keys) in enumerate(TS_PATHS):
+            ts_vals[i].append(to_epoch(dig(get(c), keys)))
+        if isinstance(rec[ACTION], str):
+            objs = {c: get(c) for c in json_cols if isinstance(rec[c], str) and get(c) is not None}
+            inp = get(INPUT_COL) if INPUT_COL and isinstance(rec[INPUT_COL], str) else None
+            args.append(arg_text(rec, {INPUT_COL: inp}) if inp is not None else None)
+            leaf_col.append(leaf_tokens(objs, rec[ACTION], rec[ACTOR]))
+            ctx_col.append(context_tokens(get(INPUT_COL)) if INPUT_COL and isinstance(rec[INPUT_COL], str) else None)
+            continue
+        args.append(None)
+        leaf_col.append(None)
+        lst = dig(get(MSG["col"]), MSG["keys"]) if MSG and isinstance(rec[MSG["col"]], str) else None
+        cobj = get(CONTEXT_COL) if isinstance(lst, list) and CONTEXT_COL and isinstance(rec[CONTEXT_COL], str) else None
+        ctx_col.append(context_tokens(cobj, skip={k[0] for k, _ in dict_lists(cobj) if k}) if cobj is not None else None)
+        if True:
+            if isinstance(lst, list):
+                for pos, item in enumerate(lst):
+                    flat = dict(leaves(item, max_depth=2))
+                    content = flat.get(MSG["content"])
+                    if isinstance(content, str) and content.strip():
+                        msg_rows.append((rec[KEY], idx, pos, flat.get(MSG["role"]), content.strip()))
+    for i in range(len(TS_PATHS)):
+        base[f"ts{i}"] = ts_vals[i]
+    base["arg"] = args
+    base["leaves"] = leaf_col
+    base["ctx"] = ctx_col
+    frames.append(base)
+    print(f"extracted {offset:,} rows")
+
+events = pd.concat(frames, ignore_index=True)
+del frames, sample
+messages = pd.DataFrame(msg_rows, columns=[KEY, "row", "pos", "role", "content"])
+del msg_rows
+ts_cols = [c for c in events.columns if re.fullmatch(r"ts\d", c)]
+events = events.sort_values([KEY] + ts_cols + ["row"], na_position="last").reset_index(drop=True)
+events["order"] = events.groupby(KEY).cumcount()
+
+g = events.groupby(KEY)
+constancy = {c: float((g[c].nunique(dropna=False) <= 1).mean()) for c in lowcard_full}
+label_candidates = [c for c in lowcard_full if constancy[c] >= 0.99 and c not in (KEY, ACTOR, ACTION)]
+LABEL = ROLE_OVERRIDES.get("label") or label_candidates[0]
+label_copies = [c for c in label_candidates if c != LABEL and (events[c] == events[LABEL]).all()]
+event_candidates = [c for c in lowcard_full if constancy[c] < 0.99 and c not in (KEY, ACTOR, ACTION)]
+EVENT = ROLE_OVERRIDES.get("event") or (max(event_candidates, key=lambda c: distinct[c]) if event_candidates else None)
+
+roles = pd.DataFrame([
+    ("key", KEY), ("label", LABEL), ("label_copies", ", ".join(label_copies)), ("event_type", EVENT),
+    ("actor", ACTOR), ("action", ACTION),
+    ("order_fields", ", ".join(f"{c}.{'.'.join(k)}" for c, k in TS_PATHS)),
+    ("message_list", f"{MSG['col']}.{'.'.join(MSG['keys'])}" if MSG else ""),
+    ("message_role_field", ".".join(MSG["role"]) if MSG else ""),
+    ("message_text_field", ".".join(MSG["content"]) if MSG else ""),
+    ("customer_role", CUSTOMER),
+], columns=["role", "column_or_field"])
+print(roles.to_string(index=False))
+
+
+# %%
+actions = events[ACTION].dropna().unique().tolist()
+sep_chars = Counter(ch for a in actions for ch in set(re.sub(r"[A-Za-z0-9_]", "", a)))
+plain = {a for a in actions if not re.search(r"[^A-Za-z0-9_]", a)}
+prefixes = {}
+for ch in sep_chars:
+    for p in {a.split(ch, 1)[0] for a in actions if ch in a and a.split(ch, 1)[1] in plain}:
+        prefixes[p] = ch
+
+
+def split_name(a):
+    for p, ch in prefixes.items():
+        if a.startswith(p + ch):
+            return a[len(p) + 1:], p
+    return a, None
+
+
+steps = events[events[ACTION].notna()].copy()
+parts = steps[ACTION].map(split_name)
+steps["step"] = parts.str[0]
+steps["api_seen"] = parts.str[1]
+steps["variant"] = steps["api_seen"].notna()
+api_map = (steps.dropna(subset=["api_seen"]).groupby("step")["api_seen"]
+           .agg(lambda s: s.value_counts().index[0]).to_dict())
+steps["api"] = steps["api_seen"].fillna(steps["step"].map(api_map))
+
+both = steps.groupby(KEY)["variant"].agg(["any", "all"])
+mixed = both.index[both["any"] & ~both["all"]]
+before = len(steps)
+steps["occ"] = steps.groupby([KEY, "step", "variant"]).cumcount()
+steps = steps.drop_duplicates([KEY, "step", "occ"], keep="first").drop(columns="occ")
+print(f"prefixes: {prefixes}")
+print(f"conversations logged in both name forms: {len(mixed)}  duplicate rows removed: {before - len(steps)}")
+
+agents = events[ACTOR].dropna().unique().tolist()
+step_names = steps["step"].unique().tolist()
+tok_agent = {a: tokens(a) for a in agents}
+tok_step = {s: tokens(s) for s in step_names}
+generic = ({t for t, n in Counter(t for a in agents for t in tok_agent[a]).items() if n >= GENERIC_TOKEN_SHARE * len(agents)}
+           | {t for t, n in Counter(t for s in step_names for t in tok_step[s]).items() if n >= GENERIC_TOKEN_SHARE * len(step_names)})
+agent_keys = events.dropna(subset=[ACTOR]).groupby(ACTOR)[KEY].agg(set).to_dict()
+step_keys = steps.groupby("step")[KEY].agg(set).to_dict()
+step_owner = steps.groupby("step")[ACTOR].agg(lambda s: s.value_counts().index[0] if s.notna().any() else None).to_dict()
+calls_agent, link_rows = {}, []
+for s in step_names:
+    best = (0.0, None, 0.0)
+    for a in agents:
+        if a == step_owner.get(s) or not (tok_step[s] & tok_agent[a]) - generic:
+            continue
+        shared = len(step_keys[s] & agent_keys[a])
+        coverage, precision = shared / len(agent_keys[a]), shared / len(step_keys[s])
+        if coverage >= AGENT_LINK_COVERAGE and precision >= MAJORITY and coverage > best[0]:
+            best = (coverage, a, precision)
+    if best[1]:
+        calls_agent[s] = best[1]
+        link_rows.append({"step": s, "called_by": step_owner.get(s), "agent": best[1],
+                          "agent_runs_with_call": round(best[0], 4), "call_followed_by_agent": round(best[2], 4)})
+steps["target"] = steps["step"].map(calls_agent)
+steps["kind"] = np.where(steps["target"].notna(), "agent", "tool")
+steps = steps.sort_values([KEY, "order"]).reset_index(drop=True)
+
+own_orders = {g: np.sort(v.to_numpy()) for g, v in events.dropna(subset=[ACTOR]).groupby([KEY, ACTOR])["order"]}
+calls = steps[steps.kind == "agent"]
+anchor, last_call, logged_after = {}, {}, 0
+for idx, k, t, o in zip(calls.index, calls[KEY], calls["target"], calls["order"]):
+    arr = own_orders.get((k, t))
+    lo = last_call.get((k, t), -1)
+    if arr is not None:
+        inside = arr[(arr > lo) & (arr < o)]
+        if len(inside):
+            logged_after += 1
+            anchor[idx] = inside[0] - 0.5
+    last_call[(k, t)] = o
+call_logged_after = logged_after / len(calls) if len(calls) else 0.0
+if call_logged_after >= MAJORITY:
+    steps["order"] = steps["order"].astype(float)
+    steps.loc[list(anchor), "order"] = list(anchor.values())
+    steps = steps.sort_values([KEY, "order"]).reset_index(drop=True)
+print(f"agent calls logged after the called agent's own steps: {logged_after}/{len(calls)}"
+      f"  re-anchored: {call_logged_after >= MAJORITY}")
+
+leaf_lists = steps["leaves"].fillna("").str.split("\x1f")
+key_values = defaultdict(set)
+key_rows = Counter()
+for toks in leaf_lists:
+    seen = set()
+    for t in toks:
+        if "=" in t:
+            key, val = t.split("=", 1)
+            key_values[key].add(val)
+            seen.add(key)
+    key_rows.update(seen)
+tool_rows = int(steps["leaves"].notna().sum()) or 1
+DROP_KEYS = {k for k in key_values if key_rows[k] / tool_rows >= UNIVERSAL_KEY_SHARE or len(key_values[k]) == 1}
+steps["leaves"] = ["\x1f".join(t for t in toks if t.split("=", 1)[0] not in DROP_KEYS) or None for toks in leaf_lists]
+print(f"record fields dropped from evidence ({len(DROP_KEYS)}): {sorted(DROP_KEYS)}")
+
+print(f"agent calls linked: {calls_agent}")
+
+ts_main = ts_cols[:1]
+agent_events = pd.concat([
+    events.dropna(subset=[ACTOR])[[KEY, "order", ACTOR] + ts_main].rename(columns={ACTOR: "agent"}),
+    steps.dropna(subset=["target"])[[KEY, "order", "target"] + ts_main].rename(columns={"target": "agent"}),
+]).sort_values([KEY, "order"]).drop_duplicates([KEY, "agent"])
+agent_order = agent_events.groupby(KEY)["agent"].agg(list)
+first_info = {(k, a): (float(t) if ts_main and pd.notna(t) else np.nan, o)
+              for k, a, o, t in zip(agent_events[KEY], agent_events["agent"], agent_events["order"],
+                                    agent_events[ts_main[0]] if ts_main else [np.nan] * len(agent_events))}
+work = steps[steps.kind == "tool"].groupby([KEY, ACTOR]).size().to_dict()
+
+messages = messages.merge(events[[KEY, "row", "order"]], on=[KEY, "row"])
+messages = messages.sort_values([KEY, "order", "pos"]).drop_duplicates([KEY, "role", "content"])
+first_customer = (messages[messages.role == CUSTOMER].groupby(KEY)["content"].first()
+                  if CUSTOMER is not None else pd.Series(dtype=str))
+reply_roles = messages.loc[messages.role != CUSTOMER, "role"].value_counts()
+AI_ROLE = reply_roles.index[0] if len(reply_roles) else None
+replies = (messages[messages.role == AI_ROLE].groupby(KEY)["content"].agg(" ".join)
+           if AI_ROLE is not None else pd.Series(dtype=str))
+messages_by_key = {k: grp.groupby("row") for k, grp in messages.groupby(KEY)}
+
+
+def flow(grp):
+    seq = []
+    msg_rows_k = messages_by_key.get(grp.name)
+    used = set()
+    for _, r in grp.iterrows():
+        if msg_rows_k is not None and r["row"] in msg_rows_k.groups and r["row"] not in used:
+            used.add(r["row"])
+            seq.extend(str(x) for x in msg_rows_k.get_group(r["row"])["role"])
+        elif pd.notna(r[ACTION]):
+            continue
+        elif EVENT and pd.notna(r[EVENT]):
+            seq.append(str(r[EVENT]))
+    return " → ".join(collapse(seq))
+
+
+def step_label(s):
+    return f"{s} [{api_map[s]}]" if s in api_map else s
+
+
+def compact(seq):
+    owners, counts, first = [], defaultdict(Counter), defaultdict(list)
+    for o, s in seq:
+        if o not in counts:
+            owners.append(o)
+        if s not in counts[o]:
+            first[o].append(s)
+        counts[o][s] += 1
+    out = []
+    for o in owners:
+        items = ", ".join(f"{step_label(s)} ×{counts[o][s]}" if counts[o][s] > 1 else step_label(s) for s in first[o])
+        out.append(f"{o}: {items}" if o else items)
+    return " → ".join(out)
+
+
+conv = events.groupby(KEY).agg(**{LABEL: (LABEL, "first"), "rows": ("row", "size")})
+conv["input_message"] = first_customer.reindex(conv.index).fillna("").map(mask)
+conv["reply"] = replies.reindex(conv.index).fillna("").map(mask)
+conv["has_steps"] = conv.index.isin(steps[KEY].unique())
+conv["agents"] = agent_order.reindex(conv.index).map(lambda x: x if isinstance(x, list) else [])
+conv["flow"] = (events[events[KEY].isin(conv.index[~conv.has_steps])].groupby(KEY).apply(flow)
+                .reindex(conv.index).fillna(""))
+step_seq = steps.groupby(KEY).apply(lambda d: list(zip(d[ACTOR].fillna(""), d["step"])))
+conv["seq"] = step_seq.reindex(conv.index).map(lambda x: x if isinstance(x, list) else [])
+print(f"customer role: {CUSTOMER}  reply role: {AI_ROLE}")
+
+# %%
+eda = conv.groupby(LABEL).agg(conversations=("rows", "size"), with_steps=("has_steps", "sum"),
+                             rows_median=("rows", "median"), rows_max=("rows", "max"))
+eda["without_steps"] = eda.conversations - eda.with_steps
+eda["steps_median"] = conv.groupby(LABEL)["seq"].agg(lambda s: float(np.median([len(x) for x in s if x])) if any(s) else 0)
+eda = eda.sort_values("conversations", ascending=False)
+print(eda.to_string())
+labels_sorted = eda.index.tolist()
+
+conv_label = conv[LABEL]
+# %%
+agent_convs = agent_events.groupby("agent")[KEY].nunique()
+agent_share = agent_convs / conv.has_steps.sum()
+GLOBAL_CORE = set(agent_share.index[agent_share >= normal_threshold(agent_share.values)])
+GLOBAL_CORE |= {step_owner[s] for s in calls_agent if step_owner.get(s)}
+specialists = sorted(set(agent_share.index) - GLOBAL_CORE)
+kat = (steps[(steps.kind == "tool") & steps[ACTOR].isin(specialists)]
+       .drop_duplicates([KEY, ACTOR, "step"])[[KEY, ACTOR, "step"]])
+
+
+def by_size(members):
+    return sorted(members, key=lambda a: (-agent_convs.get(a, 0), a))
+
+
+def usage_matrix(weights=None):
+    w = kat[KEY].map(weights).fillna(0.0) if weights is not None else pd.Series(1.0, index=kat.index)
+    m = kat.assign(w=w).groupby([ACTOR, "step"])["w"].sum().unstack(fill_value=0)
+    return m.reindex(index=specialists, columns=TOOLS, fill_value=0).to_numpy(float)
+
+
+def bh(p):
+    p = np.asarray(p, float)
+    order = np.argsort(p)
+    ranked = p[order] * len(p) / np.arange(1, len(p) + 1)
+    q = np.minimum.accumulate(ranked[::-1])[::-1]
+    out = np.empty_like(q)
+    out[order] = np.minimum(q, 1.0)
+    return out
+
+
+def similarity(M):
+    df = (M > 0).sum(-2, keepdims=True)
+    X = np.log1p(M) * (np.log((1 + M.shape[-2]) / (1 + df)) + 1)
+    norm = np.linalg.norm(X, axis=-1, keepdims=True)
+    X = np.divide(X, norm, out=np.zeros_like(X), where=norm > 0)
+    return X @ np.swapaxes(X, -1, -2)
+
+
+def families_from(M, rng):
+    active = [i for i in range(len(specialists)) if M[i].sum() > 0]
+    labels = {a: i for i, a in enumerate(specialists)}
+    if len(active) < 2:
+        return labels, []
+    I, J = map(np.array, zip(*combinations(active, 2)))
+    obs = similarity(M)[I, J]
+    exceed, done = np.zeros(len(I)), 0
+    while done < PERMUTATIONS:
+        b = min(PERM_BATCH, PERMUTATIONS - done)
+        order = rng.random((b,) + M.shape).argsort(-1)
+        null = similarity(np.take_along_axis(np.broadcast_to(M, (b,) + M.shape), order, -1))
+        exceed += (null[:, I, J] >= obs - 1e-12).sum(0)
+        done += b
+    p = (exceed + 1) / (PERMUTATIONS + 1)
+    p[obs <= 1e-12] = 1.0
+    q = bh(p)
+    D = np.ones((len(specialists), len(specialists)))
+    np.fill_diagonal(D, 0)
+    D[I, J] = D[J, I] = q
+    sub = D[np.ix_(active, active)]
+    cut = fcluster(linkage(squareform(sub, checks=False), method="complete"), FAMILY_ALPHA, "distance")
+    for i, c in zip(active, cut):
+        labels[specialists[i]] = len(specialists) + int(c)
+    shared = ((M[I] > 0) & (M[J] > 0)).sum(1)
+    return labels, list(zip([specialists[i] for i in I], [specialists[j] for j in J], shared, obs, p, q))
+
+
+def as_sets(labels):
+    out = defaultdict(set)
+    for a, l in labels.items():
+        out[l].add(a)
+    return list(out.values())
+
+
+TOOLS = sorted(kat["step"].unique())
+USAGE = usage_matrix()
+rng = np.random.default_rng(SEED)
+fam_labels, fam_pairs = families_from(USAGE, rng)
+ref_sets = as_sets(fam_labels)
+keys_all = np.array(sorted(kat[KEY].unique()))
+fam_ari, jac = [], defaultdict(list)
+for _ in range(BOOTSTRAPS if len(keys_all) else 0):
+    lb, _ = families_from(usage_matrix(Counter(rng.choice(keys_all, len(keys_all)))), rng)
+    fam_ari.append(adjusted_rand_score([fam_labels[a] for a in specialists], [lb[a] for a in specialists]))
+    boot_sets = as_sets(lb)
+    for i, F in enumerate(ref_sets):
+        jac[i].append(max(len(F & G) / len(F | G) for G in boot_sets))
+family_stab = [{"family": " + ".join(by_size(F)), "agents": len(F),
+                "bootstrap_jaccard": round(float(np.mean(jac[i])), 4) if jac[i] else np.nan}
+               for i, F in enumerate(ref_sets)]
+family_pairs = pd.DataFrame([{"agent_a": a, "agent_b": b, "shared_tools": int(x), "similarity": round(float(sv), 4),
+                              "p_value": float(p), "q_value_bh": float(qv), "same_family": fam_labels[a] == fam_labels[b]}
+                             for a, b, x, sv, p, qv in fam_pairs])
+
+FAMILIES = [by_size(F) for F in ref_sets]
+CORE_FAMILY = by_size(GLOBAL_CORE)
+family_name, family_members = {}, {}
+for members in FAMILIES + [CORE_FAMILY]:
+    name = " + ".join(members)
+    family_members[name] = members
+    for a in members:
+        family_name[a] = name
+print(f"core agents (all labels): {CORE_FAMILY}")
+print(f"specialist families ({len(FAMILIES)}):")
+print(pd.DataFrame(family_stab).to_string(index=False))
+if fam_ari:
+    print(f"family bootstrap ARI: {np.mean(fam_ari):.4f} ± {np.std(fam_ari):.4f}")
+if len(family_pairs):
+    print(family_pairs[family_pairs.q_value_bh <= FAMILY_ALPHA].to_string(index=False))
+
+# %%
+def normal_path(seqs):
+    n = len(seqs)
+    share, pos, owner = Counter(), defaultdict(list), defaultdict(Counter)
+    for seq in seqs:
+        first = {}
+        for i, (o, s) in enumerate(seq):
+            owner[s][o] += 1
+            first.setdefault(s, i / max(len(seq) - 1, 1))
+        for s, p in first.items():
+            share[s] += 1
+            pos[s].append(p)
+    if not share:
+        return [], set()
+    thr = normal_threshold([v / n for v in share.values()])
+    chosen = [s for s, v in share.items() if v / n >= thr]
+    chosen.sort(key=lambda s: np.median(pos[s]))
+    return [(owner[s].most_common(1)[0][0], s) for s in chosen], set(chosen)
+
+
+def family_load(k, f):
+    return sum(work.get((k, a), 0) for a in family_members[f])
+
+
+def main_family(k, fams, core):
+    first = {}
+    for f in fams:
+        vals = [first_info[(k, a)] for a in family_members[f] if a not in core and (k, a) in first_info]
+        first[f] = min(vals, key=lambda v: v[1])
+    earliest = min(first.values(), key=lambda v: v[1])
+    if np.isnan(earliest[0]):
+        tied = [f for f in fams if first[f][1] == earliest[1]]
+    else:
+        tied = [f for f in fams if first[f][0] == earliest[0]]
+    return max(tied, key=lambda f: (family_load(k, f), -first[f][1]))
+
+
+core_agents, core_names, class_paths, class_rows, agree_rows = {}, {}, {}, [], []
+for c in ("class_id", "class", "main", "by_work", "subclass_id", "subclass"):
+    conv[c] = ""
+conv["units"] = [[] for _ in range(len(conv))]
+conv["extra"] = [[] for _ in range(len(conv))]
+
+for lab in labels_sorted:
+    tool_keys = conv.index[(conv[LABEL] == lab) & conv.has_steps].tolist()
+    if not tool_keys:
+        continue
+    n = len(tool_keys)
+    share = Counter(a for k in tool_keys for a in set(conv.at[k, "agents"]))
+    core = {a for a, v in share.items() if v / n >= normal_threshold([v / n for v in share.values()])}
+    core_agents[lab] = core
+    core_names[lab] = " + ".join(by_size(core))
+    for k in tool_keys:
+        ags = conv.at[k, "agents"]
+        fams = list(dict.fromkeys(family_name[a] for a in ags if a not in core))
+        conv.at[k, "units"] = fams
+        if fams:
+            main = main_family(k, fams, core)
+            conv.at[k, "by_work"] = max(fams, key=lambda f: family_load(k, f))
+        else:
+            main = core_names[lab]
+            conv.at[k, "by_work"] = main
+        conv.at[k, "main"] = main
+    multi = [k for k in tool_keys if len(conv.at[k, "units"]) > 1]
+    agree_rows.append({LABEL: lab, "conversations_with_2plus_families": len(multi),
+                       "first_called_equals_most_work": int(sum(conv.at[k, "main"] == conv.at[k, "by_work"] for k in multi))})
+
+    sizes = conv.loc[tool_keys, "main"].value_counts()
+    big = [c for c, v in sizes.items() if v >= MIN_SUPPORT]
+    rare = [c for c, v in sizes.items() if v < MIN_SUPPORT]
+    groups = [(c, [c]) for c in big] + ([(" ; ".join(rare), rare)] if rare else [])
+    for i, (name, members) in enumerate(groups, 1):
+        cid = f"{lab.upper()}-{i}"
+        keys = [k for k in tool_keys if conv.at[k, "main"] in members]
+        conv.loc[keys, "class_id"] = cid
+        conv.loc[keys, "class"] = name
+        plan, plan_set = normal_path(conv.loc[keys, "seq"].tolist())
+        class_paths[cid] = (plan, plan_set)
+        in_plan = {family_name.get(o) for o, _ in plan} | {family_name.get(calls_agent.get(x)) for _, x in plan}
+        for k in keys:
+            main = conv.at[k, "main"]
+            extra_f = sorted(f for f in conv.at[k, "units"] if f != main and f not in in_plan)
+            conv.at[k, "subclass"] = " | ".join([main] + extra_f)
+        j = 0
+        for sub, cnt in conv.loc[keys, "subclass"].value_counts().items():
+            sid = f"{cid}{letters(j)}" if cnt >= MIN_SUPPORT else f"{cid}X"
+            j += cnt >= MIN_SUPPORT
+            conv.loc[[k for k in keys if conv.at[k, "subclass"] == sub], "subclass_id"] = sid
+        for k in keys:
+            conv.at[k, "extra"] = [(o, s) for o, s in conv.at[k, "seq"] if s not in plan_set]
+        class_rows.append({LABEL: lab, "class_id": cid, "class": name, "conversations": len(keys), "kind": "steps",
+                           "mixed": len(members) > 1})
+    print(f"{lab}: core agents {by_size(core)}  classes {len(groups)}")
+
+
+
+# %%
+nostep = conv.index[~conv.has_steps].tolist()
+
+issue_rows = steps.dropna(subset=["arg"]).sort_values([KEY, "kind", "order"])
+conv["context_issue"] = issue_rows.groupby(KEY)["arg"].first().reindex(conv.index).fillna("")
+
+
+REPLY_ONLY = "Reply only (no task action)"
+conv["class_source"] = np.where(conv.has_steps, "NORA routing", "no tool steps in log")
+for lab in labels_sorted:
+    keys = [k for k in nostep if conv.at[k, LABEL] == lab]
+    if not keys:
+        continue
+    cid = f"{lab.upper()}-{sum(1 for r in class_rows if r[LABEL] == lab) + 1}"
+    common_flow = conv.loc[keys, "flow"].value_counts().index[0]
+    class_paths[cid] = ([("", common_flow)] if common_flow else [], set())
+    class_rows.append({LABEL: lab, "class_id": cid, "class": REPLY_ONLY, "conversations": len(keys),
+                       "kind": "messages", "mixed": False})
+    conv.loc[keys, ["class_id", "class", "main", "subclass"]] = [cid, REPLY_ONLY, REPLY_ONLY, REPLY_ONLY]
+    print(f"{lab}: conversations without tool steps {len(keys)} -> {cid}")
+
+for cid, idx in conv.groupby("class_id").groups.items():
+    j = 0
+    for sub, cnt in conv.loc[idx, "subclass"].value_counts().items():
+        ok = cnt >= MIN_SUPPORT and sub != "Unknown"
+        conv.loc[[k for k in idx if conv.at[k, "subclass"] == sub], "subclass_id"] = f"{cid}{letters(j)}" if ok else f"{cid}X"
+        j += ok
+
+mixed_by = {r["class_id"]: r["mixed"] for r in class_rows}
+classes = (conv.groupby([LABEL, "class_id", "class"])
+           .agg(conversations=("rows", "size"), with_steps=("has_steps", "sum")).reset_index())
+classes["kind"] = np.where(classes.with_steps > 0, "steps", "messages")
+classes["mixed"] = classes["class_id"].map(mixed_by).fillna(False).astype(bool)
+
+# %%
+trigger_rows, conv_evidence = [], defaultdict(dict)
+leaf_rows = steps[(steps.kind == "tool") & steps["leaves"].notna()]
+
+for lab in labels_sorted:
+    core = core_agents.get(lab)
+    if not core:
+        continue
+    keys = conv.index[(conv[LABEL] == lab) & conv.has_steps].tolist()
+    rows = leaf_rows[leaf_rows[KEY].isin(keys) & leaf_rows[ACTOR].isin(core)]
+    leaf_docs = (rows.assign(doc=["\x1f".join(f"{s}.{t}" for t in l.split("\x1f") if t)
+                                  for s, l in zip(rows["step"], rows["leaves"])])
+                 .groupby(KEY)["doc"].agg("\x1f".join).reindex(keys).fillna(""))
+    mats, names = [], []
+    msg_vec = CountVectorizer(binary=True, stop_words=EN_STOP, min_df=MIN_SUPPORT, max_df=0.95,
+                              token_pattern=r"(?u)\b[a-zA-Z][a-zA-Z]+\b")
+    leaf_vec = CountVectorizer(binary=True, lowercase=False, min_df=MIN_SUPPORT, max_df=0.95,
+                               tokenizer=lambda s: [t for t in s.split("\x1f") if t], token_pattern=None)
+    for vec, docs, prefix in ((msg_vec, conv.loc[keys, "input_message"], f"{CUSTOMER}:"), (leaf_vec, leaf_docs, "")):
+        try:
+            mats.append(vec.fit_transform(docs))
+            names += [prefix + f for f in vec.get_feature_names_out()]
+        except ValueError:
+            pass
+    if not mats:
+        continue
+    X = hstack(mats).tocsr()
+    names = np.array(names)
+    support = np.asarray(X.sum(0)).ravel()
+    for F in sorted(set(f for k in keys for f in conv.at[k, "units"])):
+        y = np.array([F in conv.at[k, "units"] for k in keys], dtype=int)
+        if y.sum() < MIN_SUPPORT or (1 - y).sum() < MIN_SUPPORT:
+            continue
+        Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=TEST_SIZE, stratify=y, random_state=SEED)
+        folds = min(FOLDS, int(ytr.sum()), int((1 - ytr).sum()))
+        cv_scores = {}
+        if folds >= 2:
+            skf = StratifiedKFold(folds, shuffle=True, random_state=SEED)
+            for C in C_GRID:
+                aucs = [roc_auc_score(ytr[va], sparse_logit(C).fit(Xtr[tr], ytr[tr]).predict_proba(Xtr[va])[:, 1])
+                        for tr, va in skf.split(Xtr, ytr)]
+                cv_scores[C] = (float(np.mean(aucs)), float(np.std(aucs)))
+        C = max(cv_scores, key=lambda c: cv_scores[c][0]) if cv_scores else 1.0
+        p = sparse_logit(C).fit(Xtr, ytr).predict_proba(Xte)[:, 1]
+        test_auc = roc_auc_score(yte, p)
+        coef = sparse_logit(C).fit(X, y).coef_[0]
+        pos_hits = np.asarray(X[y == 1].sum(0)).ravel()
+        lift = np.divide(pos_hits / y.sum(), support / len(y), out=np.zeros_like(coef), where=support > 0)
+        good = np.where((coef > 0) & (support >= MIN_SUPPORT) & (lift > 1))[0]
+        good = good[np.argsort(-coef[good])]
+        valid = test_auc >= TRIGGER_MIN_AUC
+        trigger_rows.append({LABEL: lab, "family": F, "conversations_with": int(y.sum()),
+                             "conversations_without": int((1 - y).sum()), "C": C, "folds": folds,
+                             "cv_auc_mean": round(cv_scores.get(C, (np.nan, np.nan))[0], 4),
+                             "cv_auc_std": round(cv_scores.get(C, (np.nan, np.nan))[1], 4),
+                             "test_auc": round(test_auc, 4),
+                             "test_balanced_accuracy": round(balanced_accuracy_score(yte, p >= 0.5), 4),
+                             "test_f1": round(f1_score(yte, p >= 0.5), 4),
+                             "evidence": ", ".join(names[good[:TOP_TRIGGERS]]) if valid else ""})
+        if valid and len(good):
+            sub = X[:, good]
+            for r, k in enumerate(keys):
+                if y[r] and sub[r].nnz:
+                    conv_evidence[k][F] = ", ".join(names[good[sub[r].indices[:3]]])
+
+
+# %%
+first_arg = steps.dropna(subset=["target"]).drop_duplicates([KEY, "target"]).set_index([KEY, "target"])["arg"].to_dict()
+
+
+def evidence(k):
+    plan = class_paths.get(conv.at[k, "class_id"], ([], set()))[0]
+    normal = {family_name.get(o) for o, _ in plan} | {family_name.get(calls_agent.get(s)) for _, s in plan}
+    out = []
+    for f in conv.at[k, "units"]:
+        if f in normal:
+            continue
+        arg = next((first_arg.get((k, a)) for a in family_members[f] if isinstance(first_arg.get((k, a)), str)), None)
+        bits = [x for x in (arg, conv_evidence[k].get(f)) if x]
+        if bits:
+            out.append(f"{f} ← {' | '.join(bits)}")
+    return "; ".join(out)
+
+
+tool_steps = steps[steps.kind == "tool"]
+conv["steps"] = [compact(s) if s else f for s, f in zip(conv["seq"], conv["flow"])]
+conv["agents_used"] = conv["agents"].map(", ".join)
+conv["tools"] = tool_steps.groupby(KEY)["step"].agg(lambda s: ", ".join(dict.fromkeys(s))).reindex(conv.index).fillna("")
+conv["tool_calls"] = tool_steps.groupby(KEY).size().reindex(conv.index).fillna(0).astype(int)
+tool_steps = tool_steps.assign(api=tool_steps["api"].fillna("not logged"))
+conv["apis"] = (tool_steps.groupby(KEY)["api"]
+                .agg(lambda s: ", ".join(f"{a} ×{n}" for a, n in s.value_counts().items())).reindex(conv.index).fillna(""))
+conv["extra_steps"] = conv["extra"].map(compact)
+conv["extra_step_evidence"] = [evidence(k) for k in conv.index]
+
+
+# %%
+# %%
+plan_rows = []
+for _, r in classes.iterrows():
+    sub = conv[conv.class_id == r.class_id]
+    plan = class_paths[r.class_id][0]
+    normal = {family_name.get(o) for o, _ in plan} | {family_name.get(calls_agent.get(x)) for _, x in plan}
+    extra_fams = Counter(f for us in sub["units"] for f in us if f not in normal)
+    extra_tools = Counter(x for ex in sub["extra"] for x in dict.fromkeys(
+        x for o, x in ex if x not in calls_agent and family_name.get(o) in normal))
+    plan_rows.append({
+        LABEL: r[LABEL], "class_id": r.class_id, "class": r["class"], "conversations": r.conversations,
+        "with_tool_steps": int(r.with_steps), "messages_only": int(r.conversations - r.with_steps),
+        "normal_steps": compact(plan) if r.kind == "steps" else (plan[0][1] if plan else ""),
+        "agents": ", ".join(dict.fromkeys([o for o, _ in plan if o] + [calls_agent[x] for _, x in plan if x in calls_agent])),
+        "apis": ", ".join(dict.fromkeys(api_map[s] for _, s in plan if s in api_map)),
+        "subclasses": sub["subclass_id"].nunique(),
+        "extra_families": ", ".join(f"{f} ({n})" for f, n in extra_fams.most_common()),
+        "extra_tools": ", ".join(f"{x} ({n})" for x, n in extra_tools.most_common(15)),
+    })
+class_plan = pd.DataFrame(plan_rows)
+
+trig_by = {(r[LABEL], r["family"]): r for r in trigger_rows}
+fam_rows = []
+for lab in labels_sorted:
+    keys = conv.index[(conv[LABEL] == lab) & conv.has_steps].tolist()
+    if not keys:
+        continue
+    core = core_agents[lab]
+    core_keys = [k for k in keys if set(conv.at[k, "agents"]) & core]
+    core_plan = normal_path([[(o, s) for o, s in conv.at[k, "seq"] if o in core] for k in core_keys])[0]
+    fam_rows.append({LABEL: lab, "family": core_names[lab], "agents": ", ".join(by_size(core)),
+                     "conversations": len(core_keys), "main_class_in": int((conv.loc[keys, "main"] == core_names[lab]).sum()),
+                     "normal_steps": compact(core_plan), "apis": ", ".join(dict.fromkeys(api_map[s] for _, s in core_plan if s in api_map)),
+                     "why_called": ""})
+    for F, cnt in Counter(f for k in keys for f in conv.at[k, "units"]).most_common():
+        members = set(family_members[F])
+        fk = [k for k in keys if F in conv.at[k, "units"]]
+        seqs = [[(o, s) for o, s in conv.at[k, "seq"] if o in members or calls_agent.get(s) in members] for k in fk]
+        plan = normal_path(seqs)[0]
+        tr = trig_by.get((lab, F))
+        fam_rows.append({LABEL: lab, "family": F, "agents": ", ".join(family_members[F]), "conversations": cnt,
+                         "main_class_in": int((conv.loc[fk, "main"] == F).sum()), "normal_steps": compact(plan),
+                         "apis": ", ".join(dict.fromkeys(api_map[s] for _, s in plan if s in api_map)),
+                         "why_called": tr["evidence"] if tr is not None else ""})
+families = pd.DataFrame(fam_rows)
+
+
+agent_generic = {t for t, n in Counter(t for a in agents for t in tok_agent[a]).items()
+                 if n >= GENERIC_TOKEN_SHARE * len(agents)}
+display = {}
+for a in agents:
+    parts = [p for p in re.split(r"_+", a) if p and p.lower() not in agent_generic]
+    display[a] = " ".join(parts) if parts else a
+if len(set(display.values())) < len(display):
+    display = {a: a for a in agents}
+NAME_RE = re.compile(r"(?<![A-Za-z0-9_])(" + "|".join(map(re.escape, sorted(agents, key=len, reverse=True))) + r")(?![A-Za-z0-9_])") if agents else None
+
+
+def is_text(col):
+    return not (pd.api.types.is_numeric_dtype(col) or pd.api.types.is_bool_dtype(col))
+
+
+def readable(v):
+    return NAME_RE.sub(lambda m: display[m.group(1)], v) if isinstance(v, str) and NAME_RE else v
+
+
+conv["decomposition_type"] = np.where(conv.has_steps, "tool run", "messages only")
+label_rank = {l: i for i, l in enumerate(labels_sorted)}
+id_rank = lambda s: s.str.extract(r"-(\d+)", expand=False).astype(float)
+
+ctx_rows = events.loc[events["ctx"].notna(), [KEY, "ctx", ACTION]]
+ctx_rows["is_action"] = ctx_rows[ACTION].notna()
+row_keys, rows_by_source = Counter(), ctx_rows["is_action"].value_counts().to_dict()
+key_vals, key_convs, key_types = defaultdict(set), defaultdict(set), defaultdict(Counter)
+for k, c, src in zip(ctx_rows[KEY], ctx_rows["ctx"], ctx_rows["is_action"]):
+    present = set()
+    for tok in c.split("\x1f"):
+        key, val, typ = tok.split("\x1e")
+        present.add(key)
+        key_convs[key].add(k)
+        key_types[key][typ] += 1
+        if val and len(key_vals[key]) <= CONTEXT_MAX_VALUES:
+            key_vals[key].add(val)
+    row_keys.update((src, key) for key in present)
+universal = {key for (src, key), n in row_keys.items() if n >= UNIVERSAL_KEY_SHARE * rows_by_source[src]}
+frequent = {key for key, ks in key_convs.items() if len(ks) >= MIN_SUPPORT and key not in universal}
+kind_of = {key: key_types[key].most_common(1)[0][0] for key in frequent}
+ATTR_KEYS = {key for key in frequent if kind_of[key] == "cat" and 2 <= len(key_vals[key]) <= CONTEXT_MAX_VALUES}
+ID_KEYS = {key for key in frequent if kind_of[key] == "id"}
+print(f"context attributes ({len(ATTR_KEYS)}): {sorted(ATTR_KEYS)}")
+print(f"context identifiers ({len(ID_KEYS)}): {sorted(ID_KEYS)}")
+
+
+def context_parts(tokens):
+    attrs, ids = [], []
+    for tok in tokens:
+        key, val, _ = tok.split("\x1e")
+        if key in ATTR_KEYS and val:
+            attrs.append(f"{key}={val}")
+        elif key in ID_KEYS:
+            ids.append(key)
+    return ", ".join(dict.fromkeys(attrs)), ", ".join(dict.fromkeys(ids))
+
+
+conv_tokens = ctx_rows.groupby(KEY)["ctx"].agg(lambda s: [t for c in s for t in c.split("\x1f")])
+parts = conv_tokens.map(context_parts)
+conv["context_attributes"] = parts.str[0].reindex(conv.index).fillna("")
+conv["context_identifiers"] = parts.str[1].reindex(conv.index).fillna("")
+L1_COL, L2_COL, L4_COL = "Intent-L1", "Intent-L2", "Intent-L4"
+task = conv.reset_index()
+task = task.assign(_l=task[LABEL].map(label_rank), _c=id_rank(task["class_id"])).sort_values(["_l", "_c", "subclass_id"])
+decomp = pd.DataFrame({
+    "Interaction ID": task[KEY],
+    L1_COL: task[LABEL], L2_COL: "", L4_COL: "",
+    "User Content": task["input_message"],
+    "Context - Issue": task["context_issue"],
+    "Context - Attributes": task["context_attributes"],
+    "Context - Identifiers Used": task["context_identifiers"],
+    "Task Class ID": task["class_id"], "Task Class": task["class"],
+    "Task Class Source": task["class_source"],
+    "Task Subclass ID": task["subclass_id"], "Task Subclass": task["subclass"],
+    "Task Type": task["decomposition_type"],
+    "Task Actions (ordered)": task["steps"],
+    "No. of Task Actions": [len(s) if s else 0 for s in task["seq"]],
+    "Agents": task["agents_used"], "Tools": task["tools"], "APIs": task["apis"],
+    "Extra Task Actions": task["extra_steps"], "Why Extra Task Actions": task["extra_step_evidence"],
+})
+
+content_of, l1_of = conv["input_message"].to_dict(), conv[LABEL].to_dict()
+action_rows = []
+for k, grp in steps.groupby(KEY, sort=False):
+    for i, r in enumerate(grp.itertuples(index=False), 1):
+        o, s_, kind, api, ctx = getattr(r, ACTOR), r.step, r.kind, r.api, r.ctx
+        attrs, ids = context_parts(ctx.split("\x1f")) if isinstance(ctx, str) else ("", "")
+        action_rows.append({"Interaction ID": k, "Step": i, "Agent": o if isinstance(o, str) else "",
+                            "Task Action": s_, "Action Type": "agent call" if kind == "agent" else "tool",
+                            "API": api if isinstance(api, str) else ("" if kind == "agent" else "not logged"),
+                            "Inputs": ", ".join(x for x in (ids, attrs) if x)})
+for k in nostep:
+    i = 0
+    for part in [p for p in conv.at[k, "flow"].split(" → ") if p]:
+        role, _, times = part.partition(" ×")
+        for _ in range(int(times) if times.isdigit() else 1):
+            i += 1
+            action_rows.append({"Interaction ID": k, "Step": i, "Agent": role, "Task Action": "message",
+                                "Action Type": "message", "API": "", "Inputs": ""})
+actions_df = pd.DataFrame(action_rows)
+actions_df.insert(1, L1_COL, actions_df["Interaction ID"].map(l1_of))
+actions_df.insert(2, L2_COL, "")
+actions_df.insert(3, L4_COL, "")
+actions_df.insert(4, "User Content", actions_df["Interaction ID"].map(content_of))
+actions_df.insert(5, "Task Class", actions_df["Interaction ID"].map(conv["class"]))
+order_map = {k: i for i, k in enumerate(decomp["Interaction ID"])}
+actions_df = actions_df.assign(_o=actions_df["Interaction ID"].map(order_map)).sort_values(["_o", "Step"]).drop(columns="_o")
+
+plan = class_plan.assign(_l=class_plan[LABEL].map(label_rank), _c=id_rank(class_plan["class_id"])).sort_values(["_l", "_c"])
+plan = pd.DataFrame({
+    L1_COL: plan[LABEL], "Task Class ID": plan["class_id"], "Task Class": plan["class"],
+    "Interactions": plan["conversations"], "With Tool Steps": plan["with_tool_steps"],
+    "Messages Only": plan["messages_only"], "Normal Task Actions (ordered)": plan["normal_steps"],
+    "Agents": plan["agents"], "APIs": plan["apis"].where(plan["messages_only"] > 0, plan["apis"].replace("", "not logged")), "Task Subclasses": plan["subclasses"],
+    "Extra Agents Called (interactions)": plan["extra_families"],
+    "Extra Tools Called (interactions)": plan["extra_tools"],
+})
+
+fam_sheet = pd.DataFrame({
+    L1_COL: families[LABEL], "Agent Family": families["family"], "Agents": families["agents"],
+    "Interactions Using It": families["conversations"], "Interactions Where It Is The Main Class": families["main_class_in"],
+    "Normal Task Actions (ordered)": families["normal_steps"], "APIs": families["apis"].replace("", "not logged"),
+    "Why It Is Called (evidence)": families["why_called"],
+}).assign(_l=families[LABEL].map(label_rank)).sort_values("_l", kind="stable").drop(columns="_l")
+
+msg_only = decomp["Task Type"] == "messages only"
+for c in ("Agents", "Tools", "APIs"):
+    decomp.loc[msg_only, c] = "none (reply only, no agent/tool/API call)"
+
+for frame in (decomp, actions_df, plan, fam_sheet):
+    for c in frame.columns:
+        if is_text(frame[c]) and c not in ("Interaction ID", "User Content", "Tools", "APIs", "Context - Issue"):
+            frame[c] = frame[c].map(readable)
+        if is_text(frame[c]):
+            frame[c] = frame[c].map(lambda v: v[:EXCEL_CELL_MAX] if isinstance(v, str) else ("" if pd.isna(v) else v))
+
+with pd.ExcelWriter(OUT / "nora_task_decomposition.xlsx", engine="openpyxl") as xw:
+    for name, frame in {"Task Decomposition": decomp, "Task Actions": actions_df, "Class Task Plan": plan,
+                        "Agent Families": fam_sheet}.items():
+        frame.to_excel(xw, sheet_name=name, index=False)
+    for ws in xw.book.worksheets:
+        ws.freeze_panes = "B2"
+        ws.auto_filter.ref = ws.dimensions
+        for cell in ws[1]:
+            cell.font = Font(bold=True)
+        for col in ws.columns:
+            width = max(len(str(c.value)) if c.value is not None else 0 for c in col[:200])
+            ws.column_dimensions[col[0].column_letter].width = min(max(10, width + 2), 70)
+            if width > 70:
+                for c in col[1:]:
+                    c.alignment = Alignment(wrap_text=True, vertical="top")
+
+by_key = {k: g for k, g in actions_df.groupby("Interaction ID", sort=False)}
+with open(OUT / "nora_task_decomposition_slm.jsonl", "w", encoding="utf-8") as fh:
+    for rec in decomp.to_dict("records"):
+        g = by_key.get(rec["Interaction ID"])
+        fh.write(json.dumps({
+            "interaction_id": rec["Interaction ID"], "intent_l1": rec[L1_COL], "intent_l2": "", "intent_l4": "",
+            "content": rec["User Content"],
+            "context": {"issue": rec["Context - Issue"], "attributes": rec["Context - Attributes"],
+                        "identifiers": rec["Context - Identifiers Used"]},
+            "task_class": rec["Task Class"], "task_subclass": rec["Task Subclass"], "task_type": rec["Task Type"],
+            "task_actions": [] if g is None else [
+                {"step": int(x["Step"]), "agent": x["Agent"], "action": x["Task Action"], "type": x["Action Type"],
+                 "api": x["API"], "inputs": x["Inputs"]} for x in g.to_dict("records")],
+            "extra_task_actions": rec["Extra Task Actions"], "why_extra": rec["Why Extra Task Actions"],
+        }, ensure_ascii=False) + "\n")
+
+print(f"outputs: {OUT / 'nora_task_decomposition.xlsx'}  |  {OUT / 'nora_task_decomposition_slm.jsonl'}")
+print(plan[[L1_COL, "Task Class ID", "Task Class", "Interactions", "With Tool Steps", "Messages Only"]].to_string(index=False))

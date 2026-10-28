@@ -65,6 +65,10 @@ FUNC = re.compile(r"\b[a-z][a-z0-9]*(?:_[A-Za-z0-9]+)+\b")
 ID = re.compile(r"^[0-9a-fA-F-]{16,}$|^[A-Za-z0-9_-]{20,}$")
 
 
+def slug(name):
+    return re.sub(r"\W+", "_", str(name))
+
+
 def looks_json(v):
     return v[:1] in "{[" and v[-1:] in "}]"
 
@@ -109,7 +113,7 @@ for c in pipe_cols:
     )
     tokens = tokens[tokens != ""]
     counts = tokens.value_counts().rename_axis("token").reset_index(name="rows")
-    counts.to_csv(out / f"tokens_{re.sub(r'\W+', '_', c)}.csv", index=False)
+    counts.to_csv(out / f"tokens_{slug(c)}.csv", index=False)
     print(f"\n{c}: {len(counts)} distinct tokens")
     print(counts.head(40).to_string(index=False))
 
@@ -138,7 +142,7 @@ for c in json_cols:
         except json.JSONDecodeError:
             bad += 1
     paths = pd.DataFrame(acc.most_common(), columns=["path", "count"])
-    paths.to_csv(out / f"json_paths_{re.sub(r'\W+', '_', c)}.csv", index=False)
+    paths.to_csv(out / f"json_paths_{slug(c)}.csv", index=False)
     print(f"\n{c}: {len(paths)} paths, {bad} unparsed")
     print(paths.head(60).to_string(index=False))
 
@@ -148,7 +152,7 @@ for c in func_cols:
     toks = src[c].dropna().astype(str).str.findall(FUNC).explode().dropna()
     toks = toks[~toks.str.startswith("NORA_")]
     counts = toks.value_counts().rename_axis("token").reset_index(name="rows")
-    counts.to_csv(out / f"func_tokens_{re.sub(r'\W+', '_', c)}.csv", index=False)
+    counts.to_csv(out / f"func_tokens_{slug(c)}.csv", index=False)
     print(f"\n{c}: {len(counts)} distinct snake_case tokens (NORA_ agents excluded)")
     print(counts.head(40).to_string(index=False))
 

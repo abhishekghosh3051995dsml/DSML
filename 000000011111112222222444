@@ -1,0 +1,846 @@
+# %%
+import argparse
+import ast
+import json
+import re
+import sys
+import time
+import zlib
+from array import array
+from collections import Counter, defaultdict
+from functools import lru_cache
+from itertools import chain
+from pathlib import Path
+
+import pandas as pd
+from openpyxl import load_workbook
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
+
+ap = argparse.ArgumentParser()
+ap.add_argument("--csv", default=r"C:\Datascience\Uday\interactons\interactions.csv")
+ap.add_argument("--baseline", default="baseline_56705_mapped_C046D46E.xlsx")
+ap.add_argument("--out", default=r"C:\Datascience\nora_function_parameters")
+ap.add_argument("--chunk", type=int, default=50000)
+ap.add_argument("--max-rows", type=int, default=0)
+ap.add_argument("--conv-col", default="interaction_id")
+ap.add_argument("--intent-col", default="intent")
+ap.add_argument("--agent-col", default="agent")
+ap.add_argument("--func-col", default="function_name")
+ap.add_argument("--input-col", default="input")
+ap.add_argument("--output-col", default="output")
+ap.add_argument("--error-col", default="error")
+ap.add_argument("--messages-col", default="messages")
+ap.add_argument("--data-col", default="data")
+ap.add_argument("--source-col", default="source")
+ap.add_argument("--optional-share", type=float, default=0.01)
+ap.add_argument("--arg-keys", default="function_arguments,arguments")
+ap.add_argument("--form-key", default="user_inputs")
+ap.add_argument("--level-cols", default="")
+ap.add_argument("--min-trace-len", type=int, default=4)
+ap.add_argument("--min-message-len", type=int, default=6)
+ap.add_argument("--agent-call-suffix", default="_agent")
+ap.add_argument("--usual-share", type=float, default=0.5)
+ap.add_argument("--other-share", type=float, default=0.1)
+ap.add_argument("--min-link", type=int, default=5)
+ap.add_argument("--max-listed", type=int, default=5)
+ap.add_argument("--fixed-ratio", type=int, default=10)
+ap.add_argument("--no-mask", action="store_true")
+args, _ = ap.parse_known_args()
+
+src = Path(args.csv)
+if not src.is_file():
+    sys.exit(f"not found: {src}")
+out = Path(args.out)
+out.mkdir(parents=True, exist_ok=True)
+
+ROLE = {k: getattr(args, k) for k in
+        ["conv_col", "intent_col", "agent_col", "func_col", "input_col",
+         "output_col", "error_col", "messages_col", "data_col"]}
+header = list(pd.read_csv(src, nrows=0, encoding="utf-8-sig").columns)
+missing = [v for v in ROLE.values() if v not in header]
+if missing:
+    sys.exit(f"columns not in file: {missing}\navailable: {header}")
+ARG_KEYS = [k.strip() for k in args.arg_keys.split(",") if k.strip()]
+SRC_COL = args.source_col if args.source_col in header else None
+USECOLS = list(ROLE.values()) + ([SRC_COL] if SRC_COL else [])
+READ = dict(dtype=str, encoding="utf-8-sig", encoding_errors="replace", keep_default_na=False,
+            chunksize=args.chunk, nrows=args.max_rows or None)
+print(src, f"{src.stat().st_size / 1e9:.2f} GB  ->  {out}")
+
+# %%
+TS_RE = re.compile(r'"_ts"\s*:\s*(\d+)')
+PREFIX_RE = re.compile(r"^([a-z]{2,12})-(.+)$")
+SEP_RE = re.compile(r"[\s()+\-]")
+FLOAT_RE = re.compile(r"^-?\d+\.\d+$")
+DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}")
+LEVEL_RE = re.compile(r"(?i)(?:^|[^a-z0-9])l([1-9])(?:$|[^0-9])")
+
+
+def as_obj(raw):
+    if isinstance(raw, (dict, list)):
+        return raw
+    if not isinstance(raw, str):
+        return None
+    raw = raw.strip()
+    if raw[:1] not in "{[":
+        return None
+    try:
+        return json.loads(raw)
+    except ValueError:
+        try:
+            return ast.literal_eval(raw)
+        except (ValueError, SyntaxError, MemoryError, RecursionError):
+            return None
+
+
+def leaves(obj, prefix="", nested=0):
+    if isinstance(obj, str) and nested < 4 and obj.lstrip()[:1] in ("{", "["):
+        parsed = as_obj(obj)
+        if isinstance(parsed, (dict, list)):
+            yield from leaves(parsed, prefix, nested + 1)
+            return
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            yield from leaves(v, f"{prefix}.{k}" if prefix else str(k), nested)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from leaves(v, f"{prefix}[]", nested)
+    else:
+        yield prefix, obj
+
+
+def norm(v):
+    if v is None or isinstance(v, bool):
+        return None
+    if isinstance(v, float):
+        return f"{int(v * 1000) / 1000:.3f}"
+    s = str(v).strip()
+    if not s:
+        return None
+    if len(s) < 25 and FLOAT_RE.match(s):
+        return f"{int(float(s) * 1000) / 1000:.3f}"
+    d = SEP_RE.sub("", s)
+    if d.isdigit() and len(d) >= 10:
+        return d[-10:]
+    return s
+
+
+def mask(v):
+    s = str(v).strip()
+    if args.no_mask:
+        return s[:200]
+    if DATE_RE.match(s):
+        return s[:19]
+    if len(s) < 25 and FLOAT_RE.match(s) and abs(float(s)) <= 180:
+        return f"{float(s):.1f}"
+    if sum(ch.isdigit() for ch in s) >= 7:
+        s = re.sub(r"\d(?=(?:\D*\d){2})", "X", s)
+    return s if len(s) <= 60 else s[:57] + "..."
+
+
+def split_name(f):
+    m = PREFIX_RE.match(f)
+    return (m.group(2), m.group(1)) if m else (f, "")
+
+
+def depth(path):
+    return path.count(".") + path.count("[]")
+
+
+@lru_cache(maxsize=None)
+def shape(nv):
+    if nv.isdigit():
+        return f"d{len(nv)}"
+    if FLOAT_RE.match(nv):
+        return "f"
+    return None
+
+
+@lru_cache(maxsize=None)
+def name_tokens(path):
+    last = path.replace("[]", "").split(".")[-1]
+    last = re.sub(r"([a-z])([A-Z])", r"\1 \2", last).lower()
+    return frozenset(t[:-1] if len(t) > 3 and t.endswith("s") else t
+                     for t in re.split(r"[^a-z0-9]+", last) if t)
+
+
+def names_match(a, b):
+    return any(len(x) >= 3 and len(y) >= 3 and (x.startswith(y) or y.startswith(x)) for x in a for y in b)
+
+
+def in_text(nv, text):
+    return re.search(rf"(?<!\w){re.escape(nv.casefold())}(?!\w)", text) is not None
+
+
+def id_parts(nv):
+    if "," in nv and " " not in nv.strip():
+        parts = [norm(x) for x in nv.split(",")]
+        parts = [x for x in parts if x]
+        if len(parts) > 1:
+            return parts
+    return [nv]
+
+
+def conv_half(name):
+    return zlib.crc32(name.encode()) & 1
+
+
+# %%
+conv_index, conv_names, conv_intent = {}, [], {}
+ts_rows, conv_rows = array("q"), array("l")
+calls, calls_half = Counter(), Counter()
+key_convs = defaultdict(set)
+logged_as = defaultdict(Counter)
+pstat = defaultdict(Counter)
+pvals = defaultdict(set)
+pexample = {}
+consumers = defaultdict(dict)
+records = defaultdict(dict)
+form_fields = defaultdict(dict)
+texts = defaultdict(lambda: defaultdict(set))
+first_type = Counter()
+user_type = None
+errors = Counter()
+agreement = Counter()
+arg_logged = Counter()
+VAL_CAP = 1001
+REC_CAP = 500
+
+n_rows = 0
+t0 = time.time()
+for chunk in pd.read_csv(src, usecols=USECOLS, **READ):
+    C, I, A, F, P, E, M, D = (chunk[ROLE[k]].tolist() for k in
+                              ["conv_col", "intent_col", "agent_col", "func_col",
+                               "input_col", "error_col", "messages_col", "data_col"])
+    S = chunk[SRC_COL].tolist() if SRC_COL else [""] * len(chunk)
+    for i in range(len(chunk)):
+        conv = C[i]
+        cid = conv_index.get(conv)
+        if cid is None:
+            cid = conv_index[conv] = len(conv_names)
+            conv_names.append(conv)
+        if I[i] and cid not in conv_intent:
+            conv_intent[cid] = I[i]
+        m = TS_RE.search(D[i])
+        ts = int(m.group(1)) if m else 0
+        ts_rows.append(ts)
+        conv_rows.append(cid)
+
+        if M[i]:
+            msgs = as_obj(M[i])
+            if isinstance(msgs, list):
+                for j, msg in enumerate(msgs):
+                    if not isinstance(msg, dict):
+                        continue
+                    t = str(msg.get("type", ""))
+                    body = msg.get("data") if isinstance(msg.get("data"), dict) else msg
+                    content = body.get("content")
+                    if j == 0 and user_type is None:
+                        first_type[t] += 1
+                    if isinstance(content, str) and content and (user_type is None or t == user_type):
+                        texts[cid][t].add(content[:5000])
+                if user_type is None and first_type.total() >= 200:
+                    user_type = first_type.most_common(1)[0][0]
+                    for tx in texts.values():
+                        for t in [t for t in tx if t != user_type]:
+                            del tx[t]
+            d = as_obj(D[i])
+            if isinstance(d, dict):
+                rec = records[cid]
+                body = {k: v for k, v in d.items() if k != ROLE["messages_col"] and not str(k).startswith("_")}
+                form = body.pop(args.form_key, None)
+                form_leaves = list(leaves(form, args.form_key)) if form is not None else []
+                ff = form_fields[cid]
+                for path, v in form_leaves:
+                    fv = norm(v)
+                    if fv is None:
+                        continue
+                    last = path.replace("[]", "").split(".")[-1]
+                    if last.endswith("Type") and isinstance(v, str) and len(v) <= 30:
+                        ff.setdefault(path[:-4], [set(), None])[0].update(name_tokens(v) | {v.lower()})
+                    entry = ff.setdefault(path, [set(), None])
+                    entry[0].update(name_tokens(path))
+                    entry[1] = shape(fv)
+                for path, v in chain(form_leaves, leaves(body)):
+                    is_form = path.startswith(args.form_key)
+                    if not is_form and (len(rec) >= REC_CAP or depth(path) > 2):
+                        continue
+                    nv = norm(v)
+                    if not nv or not args.min_trace_len <= len(nv) <= 64:
+                        continue
+                    old = rec.get(nv)
+                    if old is None or (is_form and not old.startswith(args.form_key)):
+                        rec[nv] = path
+
+        f = F[i]
+        if not f:
+            continue
+        base, prefix = split_name(f)
+        log = "system" if prefix else "agent"
+        agent = A[i]
+        half = conv_half(conv)
+        key = (agent, base, log)
+        calls[key] += 1
+        calls_half[key + (half,)] += 1
+        key_convs[key].add(cid)
+        logged_as[base][f] += 1
+        if E[i]:
+            errors[(E[i].strip()[:250], f)] += 1
+
+        p = as_obj(P[i])
+        p = p if isinstance(p, dict) and p else None
+        fa = None
+        if p is None or agreement.total() < 5000:
+            d = as_obj(D[i])
+            if isinstance(d, dict):
+                for k in ARG_KEYS:
+                    fa = as_obj(d.get(k))
+                    if isinstance(fa, dict):
+                        break
+                    fa = None
+            if p is not None:
+                agreement["same keys" if fa is not None and set(fa) == set(p)
+                          else "different keys" if fa is not None else "no argument field in data"] += 1
+        params = p if p is not None else (fa or {})
+        arg_logged[(S[i], log, "with arguments" if params else "no arguments")] += 1
+
+        seen = set()
+        cons = consumers[cid]
+        for path, v in leaves(params):
+            pkey = key + (path,)
+            if path not in seen:
+                seen.add(path)
+                pstat[pkey]["n"] += 1
+                pstat[pkey][f"h{half}"] += 1
+            nv = norm(v)
+            if nv is None:
+                continue
+            if len(pvals[pkey]) < VAL_CAP:
+                pvals[pkey].add(nv)
+            if pkey not in pexample:
+                pexample[pkey] = v
+            for part in id_parts(nv):
+                ck = (part, agent, base, path)
+                if ck not in cons or ts < cons[ck]:
+                    cons[ck] = ts
+
+    n_rows += len(chunk)
+    print(f"pass 1: {n_rows:,} rows  {len(conv_names):,} conversations  {time.time() - t0:,.0f}s", flush=True)
+
+if user_type is None and first_type:
+    user_type = first_type.most_common(1)[0][0]
+form_convs = sum(1 for r in records.values() if any(p.startswith(args.form_key) for p in r.values()))
+print(f"pass 1 done: {n_rows:,} rows, {sum(calls.values()):,} calls, {len(conv_names):,} conversations")
+print(f"user message type: {user_type}  conversation records: {len(records):,}  with {args.form_key}: {form_convs:,}")
+print("input vs data arguments:", dict(agreement))
+
+# %%
+agent_calls = Counter()
+for (agent, base, log), c in calls.items():
+    if agent:
+        agent_calls[(base, agent)] += c
+dominant = {}
+for (base, agent), _ in agent_calls.most_common():
+    dominant.setdefault(base, agent)
+NO_AGENT = "(system log only)"
+
+
+def res(agent, base):
+    return agent or dominant.get(base, NO_AGENT)
+
+
+value_origin = defaultdict(dict)
+unresolved = defaultdict(set)
+for cid, cons in consumers.items():
+    rec = records.get(cid, {})
+    tx = texts.get(cid)
+    text = "\n".join(tx.get(user_type, ())).casefold() if tx else ""
+    org = value_origin[cid]
+    for nv in {ck[0] for ck in cons}:
+        if len(nv) < args.min_trace_len:
+            org[nv] = ("fixed", "")
+        elif rec.get(nv, "").startswith(args.form_key):
+            org[nv] = ("form", rec[nv])
+        elif text and len(nv) >= args.min_message_len and in_text(nv, text):
+            org[nv] = ("message", "")
+        else:
+            unresolved[cid].add(nv)
+texts.clear()
+print(f"values left for API-output search: {sum(len(v) for v in unresolved.values()):,} "
+      f"in {len(unresolved):,} conversations")
+
+# %%
+producers = defaultdict(lambda: defaultdict(dict))
+if unresolved:
+    r0 = 0
+    t0 = time.time()
+    cols = [ROLE["conv_col"], ROLE["agent_col"], ROLE["func_col"], ROLE["output_col"]]
+    for chunk in pd.read_csv(src, usecols=cols, **READ):
+        C, A, F, O = (chunk[c].tolist() for c in cols)
+        if C and conv_names[conv_rows[r0]] != C[0]:
+            sys.exit(f"row alignment lost at row {r0}")
+        for i in range(len(chunk)):
+            o = O[i]
+            if not o or not F[i]:
+                continue
+            r = r0 + i
+            vals = unresolved.get(conv_rows[r])
+            if not vals:
+                continue
+            hits = {v for v in vals if v in o}
+            if not hits:
+                continue
+            base = split_name(F[i])[0]
+            ts = ts_rows[r]
+            obj = as_obj(o)
+            found = [(v, "(text)") for v in hits] if obj is None else \
+                [(nv, path) for path, leaf in leaves(obj) if (nv := norm(leaf)) in hits]
+            prod = producers[conv_rows[r]]
+            for nv, path in found:
+                k = (A[i], base, path)
+                if k not in prod[nv] or ts < prod[nv][k]:
+                    prod[nv][k] = ts
+        r0 += len(chunk)
+        print(f"pass 2: {r0:,} rows  {time.time() - t0:,.0f}s", flush=True)
+
+for cid, pending in unresolved.items():
+    org = value_origin[cid]
+    prod = producers.get(cid, {})
+    rec = records.get(cid, {})
+    ff = form_fields.get(cid, {})
+    uses = defaultdict(list)
+    for (nv, agent, base, param), ts in consumers[cid].items():
+        if nv in pending:
+            uses[nv].append((ts, base, param))
+    for nv, u in uses.items():
+        first_ts = min(x[0] for x in u)
+        used_at = {}
+        for ts, base, _ in u:
+            if base not in used_at or ts < used_at[base]:
+                used_at[base] = ts
+        ptoks = frozenset().union(*(name_tokens(p) for _, _, p in u))
+        best = None
+        for (pa, pb, pp), pts in prod.get(nv, {}).items():
+            if pts > first_ts:
+                continue
+            ub = used_at.get(pb)
+            if ub is not None and ub <= pts:
+                continue
+            is_text = pp == "(text)"
+            if is_text and pb.lower().endswith(args.agent_call_suffix):
+                continue
+            named = bool(ptoks & name_tokens(pp))
+            if nv.isdigit() and len(nv) <= 6 and not named:
+                continue
+            score = (named, not is_text, -pts)
+            if best is None or score > best[0]:
+                best = (score, (res(pa, pb), pb, pp))
+        if best:
+            org[nv] = ("api", best[1])
+        elif nv in rec:
+            org[nv] = ("record", rec[nv])
+        elif (sh := shape(nv)) and (hit := next((p for p, (toks, fsh) in ff.items()
+                                                 if fsh == sh and names_match(ptoks, toks)), None)):
+            org[nv] = ("form name", hit)
+        elif " " in nv and len(nv) > 20:
+            org[nv] = ("agent", "")
+        else:
+            org[nv] = ("none", "")
+records.clear()
+producers.clear()
+form_fields.clear()
+
+# %%
+SRC = {"form": "User form (Cosmos)",
+       "form name": "User form (Cosmos), matched by field name",
+       "message": "User message (Cosmos)",
+       "record": "Conversation record (Cosmos)",
+       "api": "API output",
+       "agent": "Agent generated",
+       "fixed": "Fixed value",
+       "none": "Not found in logs"}
+
+fcalls = defaultdict(Counter)
+fcalls_half = defaultdict(Counter)
+fconvs = defaultdict(set)
+for (agent, base, log), c in calls.items():
+    fk = (res(agent, base), base)
+    fcalls[fk][log] += c
+    fconvs[fk] |= key_convs[(agent, base, log)]
+for (agent, base, log, h), c in calls_half.items():
+    fcalls_half[(res(agent, base), base)][(log, h)] += c
+
+pmerge = defaultdict(Counter)
+pvals_m = defaultdict(set)
+pex_m = {}
+for (agent, base, log, param), st in pstat.items():
+    rk = (res(agent, base), base, param)
+    pmerge[rk][log] += st["n"]
+    pmerge[rk][(log, 0)] += st["h0"]
+    pmerge[rk][(log, 1)] += st["h1"]
+    if len(pvals_m[rk]) < VAL_CAP:
+        pvals_m[rk] |= pvals[(agent, base, log, param)]
+    ex = pexample.get((agent, base, log, param))
+    if ex is not None and (rk not in pex_m or log == "agent"):
+        pex_m[rk] = ex
+
+
+def fn_calls(fk):
+    return max(fcalls[fk].values(), default=0)
+
+
+def p_calls(rk):
+    return max(pmerge[rk]["agent"], pmerge[rk]["system"])
+
+
+@lru_cache(maxsize=None)
+def is_fixed(rk):
+    n = len(pvals_m[rk])
+    return 0 < n <= args.max_listed and p_calls(rk) >= args.fixed_ratio * n
+
+
+src_count = defaultdict(Counter)
+src_half = defaultdict(Counter)
+src_detail = defaultdict(lambda: defaultdict(Counter))
+dep_convs = Counter()
+dep_users = defaultdict(Counter)
+for cid, cons in consumers.items():
+    org = value_origin[cid]
+    h = conv_half(conv_names[cid])
+    done, deps = set(), set()
+    for nv, agent, base, param in cons:
+        rk = (res(agent, base), base, param)
+        if (nv, rk) in done:
+            continue
+        done.add((nv, rk))
+        source, detail = org.get(nv, ("none", ""))
+        if source == "fixed":
+            source = "fixed" if is_fixed(rk) else "agent"
+        elif source == "none" and is_fixed(rk):
+            source = "fixed"
+        src_count[rk][source] += 1
+        src_half[(rk, h)][source] += 1
+        if source == "api":
+            ua, ub, field = detail
+            src_detail[rk][source][f"{ub} -> {field}"] += 1
+            deps.add((ua, ub, field, rk[0], base, param))
+        elif detail:
+            src_detail[rk][source][detail] += 1
+    for ua, ub, field, ca, cb, param in deps:
+        dep_users[(ua, ub, field, param)][cb] += 1
+    for k in {(ua, ub, field, param) for ua, ub, field, ca, cb, param in deps}:
+        dep_convs[k] += 1
+consumers.clear()
+value_origin.clear()
+
+
+def share(rk, h=None):
+    fk = rk[:2]
+    best = 0.0
+    for log in ("agent", "system"):
+        n = fcalls[fk][log] if h is None else fcalls_half[fk][(log, h)]
+        w = pmerge[rk][log] if h is None else pmerge[rk][(log, h)]
+        if n:
+            best = max(best, w / n)
+    return best
+
+
+def short_field(text):
+    head, sep, tail = text.rpartition(" -> ")
+    parts = [x for x in tail.replace("[]", "").split(".") if x]
+    tail = ".".join(parts[-2:]) if parts else tail
+    return f"{head} -> {tail}" if sep else tail
+
+
+def example(rk):
+    vals = pvals_m[rk]
+    if 0 < len(vals) <= args.max_listed and all(len(v) <= 20 and sum(c.isdigit() for c in v) < 7 for v in vals):
+        return " | ".join(sorted(vals, key=lambda v: (len(v), v)))
+    return mask(pex_m[rk]) if rk in pex_m else ""
+
+
+# %%
+params_of = defaultdict(list)
+for rk in pmerge:
+    params_of[rk[:2]].append(rk)
+for fk in params_of:
+    params_of[fk].sort(key=lambda rk: -p_calls(rk))
+
+agent_order = sorted({fk[0] for fk in fcalls}, key=lambda a: (a == NO_AGENT, a.lower()))
+fn_rows = []
+for a in agent_order:
+    fks = sorted((fk for fk in fcalls if fk[0] == a), key=lambda fk: -fn_calls(fk))
+    for fk in fks:
+        rks = params_of.get(fk) or [None]
+        for rk in rks:
+            row = {"Agent": a, "Function": fk[1]}
+            if rk is None:
+                row.update({"Parameter": "(no parameters)", "Calls": fn_calls(fk), "Value source": "",
+                            "Source field": "", "Example value": ""})
+            else:
+                sc = src_count[rk]
+                total = sum(sc.values())
+                main = sc.most_common(1)[0][0] if total else ""
+                det = src_detail[rk][main].most_common(1) if main else []
+                row.update({"Parameter": rk[2], "Calls": p_calls(rk),
+                            "Value source": SRC.get(main, ""), "Source field": short_field(det[0][0]) if det else "",
+                            "Example value": example(rk)})
+            fn_rows.append(row)
+fp = pd.DataFrame(fn_rows)
+
+
+def usual_params(fk):
+    out = []
+    for rk in params_of.get(fk, []):
+        sh = share(rk)
+        if sh >= args.usual_share:
+            out.append(rk[2])
+        elif sh >= args.optional_share:
+            out.append(f"{rk[2]} (optional)")
+    return out
+
+
+ag_rows = []
+for a in agent_order:
+    fks = sorted((fk for fk in fcalls if fk[0] == a), key=lambda fk: -fn_calls(fk))
+    weight = Counter()
+    for fk in fks:
+        for rk in params_of.get(fk, []):
+            if share(rk) >= args.usual_share:
+                weight[rk[2]] += p_calls(rk)
+    ag_rows.append({"Agent": a,
+                    "Conversations": len(set().union(*(fconvs[fk] for fk in fks))),
+                    "Functions": len(fks),
+                    "Function names": ", ".join(fk[1] for fk in fks),
+                    "Parameters needed": ", ".join(p for p, _ in weight.most_common())})
+ag = pd.DataFrame(ag_rows)
+
+dep = pd.DataFrame([{"Upstream agent": ua, "Upstream function": ub, "Output field": short_field(field),
+                     "Parameter": param, "Conversations": n,
+                     "Used by functions": ", ".join(f for f, c in dep_users[(ua, ub, field, param)].most_common()
+                                                    if c >= args.min_link)}
+                    for (ua, ub, field, param), n in dep_convs.items() if n >= args.min_link])
+if len(dep):
+    up_total = dep.groupby("Upstream function")["Conversations"].transform("sum")
+    dep = (dep.assign(_t=up_total)
+           .sort_values(["_t", "Upstream function", "Conversations"], ascending=[False, True, False])
+           .drop(columns="_t").reset_index(drop=True))
+print(f"{len(fcalls)} agent-function pairs, {len(fp)} parameter rows, {len(dep)} dependency links")
+
+# %%
+def locate(name):
+    p = Path(name)
+    if p.is_file():
+        return p
+    home = Path.home()
+    for root in [Path.cwd(), Path(r"C:\Datascience")] + sorted(home.glob("OneDrive*")):
+        if not root.is_dir():
+            continue
+        hits = [h for h in root.rglob(p.name) if not h.name.startswith("~$")]
+        if hits:
+            return max(hits, key=lambda h: h.stat().st_mtime)
+    return None
+
+
+def split_cell(v):
+    return [t.strip() for t in str(v).split("|") if t.strip()]
+
+
+intent = pd.DataFrame()
+coverage = []
+levels = []
+base_path = locate(args.baseline)
+if base_path is None:
+    print("baseline not found, Intent_Actions sheet skipped")
+else:
+    wb = load_workbook(base_path, read_only=True)
+    sheet = max(wb.worksheets, key=lambda ws: (ws.max_row or 0) * (ws.max_column or 0)).title
+    wb.close()
+    head = pd.read_excel(base_path, sheet_name=sheet, header=None, nrows=15)
+    filled = head.notna().sum(axis=1)
+    hrow = int(filled[filled >= 0.6 * filled.max()].index[0]) if filled.max() else 0
+    bcols = [str(c).strip() for c in pd.read_excel(base_path, sheet_name=sheet, header=hrow, nrows=0).columns]
+    if args.level_cols:
+        levels = [c.strip() for c in args.level_cols.split(",")]
+    else:
+        found = [(int(m.group(1)), c) for c in bcols if (m := LEVEL_RE.search(c))]
+        levels = [c for _, c in sorted(found)]
+    need = [c for c in levels + [ROLE["agent_col"], ROLE["func_col"], ROLE["conv_col"]] if c in bcols]
+    b = pd.read_excel(base_path, sheet_name=sheet, header=hrow, dtype=str)
+    b.columns = [str(c).strip() for c in b.columns]
+    b = b[need].fillna("")
+    print(f"baseline {base_path.name} [{sheet}] {len(b):,} rows, levels: {levels}")
+
+    fn_agents = defaultdict(set)
+    for a, f in fcalls:
+        fn_agents[f].add(a)
+    usual = {fk: ", ".join(usual_params(fk)) for fk in fcalls}
+    cnt = Counter()
+    unmatched = Counter()
+    for row in b.itertuples(index=False):
+        r = dict(zip(need, row))
+        fns = {split_name(f)[0] for f in split_cell(r.get(ROLE["func_col"], ""))}
+        if not fns:
+            continue
+        lv = tuple(r.get(c, "") or "(blank)" for c in levels)
+        row_agents = set(split_cell(r.get(ROLE["agent_col"], "")))
+        for f in fns:
+            ags = fn_agents.get(f)
+            if not ags:
+                unmatched[f] += 1
+                cnt[lv + ("(not in interactions)", f)] += 1
+                continue
+            for a in sorted(ags & row_agents) or [max(ags, key=lambda x: fn_calls((x, f)))]:
+                cnt[lv + (a, f)] += 1
+
+    rows = [dict(zip(levels + ["Agent", "Function"], k), Parameters=usual.get(k[-2:], ""), Messages=n)
+            for k, n in cnt.items()]
+    intent = pd.DataFrame(rows).fillna("")
+    if len(intent):
+        sort_cols = []
+        for i, c in enumerate(levels):
+            tot = intent.groupby(levels[:i + 1])["Messages"].transform("sum")
+            intent[f"_t{i}"] = -tot
+            sort_cols += [f"_t{i}", c]
+        intent = (intent.sort_values(sort_cols + ["Agent", "Messages"], ascending=[True] * (len(sort_cols) + 1) + [False])
+                  .drop(columns=[c for c in intent.columns if c.startswith("_t")]).reset_index(drop=True))
+
+    bconv = {t for v in b.get(ROLE["conv_col"], pd.Series(dtype=str)) for t in split_cell(v)}
+    bfns = {split_name(f)[0] for v in b[ROLE["func_col"]] for f in split_cell(v)}
+    coverage = [("Baseline rows", len(b)),
+                ("Baseline rows with functions", int((b[ROLE["func_col"]] != "").sum())),
+                ("Baseline conversations", len(bconv)),
+                ("Baseline conversations in interactions file", len(bconv & conv_index.keys())),
+                ("Baseline functions", len(bfns)),
+                ("Baseline functions found in interactions file", len(bfns & set(fn_agents))),
+                ("Baseline functions with parameters", sum(1 for f in bfns if any(params_of.get((a, f)) for a in fn_agents.get(f, ())))),
+                ("Baseline functions not in interactions file", ", ".join(sorted(bfns - set(fn_agents))))]
+    for k, v in coverage:
+        print(f"  {k}: {v}")
+
+# %%
+stab = []
+for fk in fcalls:
+    if not any(fcalls_half[fk][(log, 0)] and fcalls_half[fk][(log, 1)] for log in ("agent", "system")):
+        continue
+    halves = []
+    for h in (0, 1):
+        rks = params_of.get(fk, [])
+        halves.append(({rk[2] for rk in rks if share(rk, h) >= args.usual_share},
+                       {rk[2] for rk in rks if share(rk, h) >= 0.99}))
+    jac = lambda x, y: 1.0 if not x and not y else len(x & y) / len(x | y)
+    stab.append({"Agent": fk[0], "Function": fk[1],
+                 "Calls half A": max(fcalls_half[fk][(l, 0)] for l in ("agent", "system")),
+                 "Calls half B": max(fcalls_half[fk][(l, 1)] for l in ("agent", "system")),
+                 "Usual parameters Jaccard": round(jac(halves[0][0], halves[1][0]), 4),
+                 "Always-present parameters Jaccard": round(jac(halves[0][1], halves[1][1]), 4)})
+stab = pd.DataFrame(stab)
+
+src_stab = []
+for rk in src_count:
+    a, b_ = src_half[(rk, 0)], src_half[(rk, 1)]
+    if sum(a.values()) >= 20 and sum(b_.values()) >= 20:
+        ma, mb = a.most_common(1)[0][0], b_.most_common(1)[0][0]
+        src_stab.append({"Agent": rk[0], "Function": rk[1], "Parameter": rk[2],
+                         "Values half A": sum(a.values()), "Values half B": sum(b_.values()),
+                         "Main source half A": SRC[ma], "Main source half B": SRC[mb], "Same": ma == mb})
+src_stab = pd.DataFrame(src_stab)
+
+dist = pd.DataFrame([{"Agent": rk[0], "Function": rk[1], "Parameter": rk[2],
+                      **{SRC[s]: sc[s] for s in SRC}} for rk, sc in src_count.items()])
+overall = Counter()
+for sc in src_count.values():
+    overall.update(sc)
+total_vals = sum(overall.values())
+summary = [("Rows read", n_rows), ("Conversations", len(conv_names)), ("Function calls", sum(calls.values())),
+           ("Agent-function pairs", len(fcalls)),
+           ("Calls where input and data arguments have the same keys", agreement["same keys"]),
+           ("Calls compared (input vs data arguments)", agreement.total())] + coverage + \
+          [("Functions in split-half test", len(stab)),
+           ("Mean usual-parameter Jaccard", round(stab["Usual parameters Jaccard"].mean(), 4) if len(stab) else ""),
+           ("Mean always-present-parameter Jaccard", round(stab["Always-present parameters Jaccard"].mean(), 4) if len(stab) else ""),
+           ("Parameters in source-stability test", len(src_stab)),
+           ("Main source same in both halves", int(src_stab["Same"].sum()) if len(src_stab) else "")] + \
+          [(f"Values: {SRC[s]}", overall[s]) for s in SRC] + [("Values traced to a source", total_vals - overall["none"]),
+                                                             ("Values checked", total_vals)]
+summary = pd.DataFrame(summary, columns=["Measure", "Value"])
+skipped = pd.DataFrame([{"Error": e, "Function": f, "Rows": n} for (e, f), n in errors.most_common()])
+arg_diag = pd.DataFrame([{"Row source": s_, "Log": l_, "Arguments": a_, "Calls": n}
+                         for (s_, l_, a_), n in sorted(arg_logged.items())])
+print("calls by row source and whether arguments were logged:")
+print(arg_diag.to_string(index=False))
+print(summary.to_string(index=False))
+
+# %%
+HEAD_FILL = PatternFill("solid", fgColor="1F3864")
+BAND_FILL = PatternFill("solid", fgColor="EAF0F8")
+HEAD_FONT = Font(bold=True, color="FFFFFF", name="Calibri", size=11)
+BODY_FONT = Font(name="Calibri", size=10)
+REPEAT_FONT = Font(name="Calibri", size=10, color="A6A6A6")
+THIN = Side(style="thin", color="BFBFBF")
+GROUP = Side(style="medium", color="1F3864")
+WRAP_COLS = {"Source field", "Other sources", "Parameters", "Parameters needed", "Function names",
+             "Output field", "Example value", "Error", "Value"}
+
+
+def write_sheet(w, name, df, group_cols=(), repeat_cols=()):
+    df = df.reset_index(drop=True)
+    repeat_cols = set(group_cols) | set(repeat_cols)
+    df.to_excel(w, sheet_name=name, index=False)
+    ws = w.sheets[name]
+    n_rows, n_cols = len(df) + 1, len(df.columns)
+    ws.freeze_panes = ws.cell(row=2, column=len(group_cols) + 1)
+    ws.auto_filter.ref = f"A1:{get_column_letter(n_cols)}{n_rows}"
+    ws.row_dimensions[1].height = 32
+    for cell in ws[1]:
+        cell.fill, cell.font = HEAD_FILL, HEAD_FONT
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.border = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
+    keys = [tuple(r) for r in df[list(group_cols)].itertuples(index=False)] if group_cols else [None] * len(df)
+    band, prev = False, object()
+    for i, key in enumerate(keys, start=2):
+        new_group = key != prev
+        if new_group:
+            band = not band
+        for j, col in enumerate(df.columns, start=1):
+            cell = ws.cell(row=i, column=j)
+            cell.font = BODY_FONT
+            if band and group_cols:
+                cell.fill = BAND_FILL
+            cell.border = Border(left=THIN, right=THIN, bottom=THIN,
+                                 top=GROUP if (new_group and group_cols and i > 2) else THIN)
+            cell.alignment = Alignment(vertical="top", wrap_text=col in WRAP_COLS)
+            if isinstance(cell.value, (int, float)) and not isinstance(cell.value, bool):
+                cell.number_format = "#,##0" if float(cell.value).is_integer() else "0.0000"
+                cell.alignment = Alignment(horizontal="right", vertical="top")
+            if col in repeat_cols and not new_group:
+                cell.font = REPEAT_FONT
+        prev = key
+    for j, col in enumerate(df.columns, start=1):
+        width = max([len(str(col)) + 4] + df[col].astype(str).str.len().tolist()) + 2
+        ws.column_dimensions[get_column_letter(j)].width = min(max(width, 10), 55 if col in WRAP_COLS else 40)
+
+
+def save(path, sheets):
+    with pd.ExcelWriter(path, engine="openpyxl") as w:
+        for name, df, groups, repeats in sheets:
+            if len(df):
+                write_sheet(w, name, df, groups, repeats)
+    print("saved", path)
+
+
+save(out / "nora_function_parameter_map.xlsx", [
+    ("Intent_Actions", intent, tuple(levels), ()),
+    ("Agent_Summary", ag, (), ()),
+    ("Function_Parameters", fp, ("Agent", "Function"), ()),
+    ("Parameter_Dependencies", dep, ("Upstream function",), ("Upstream agent",)),
+])
+save(out / "nora_function_parameter_validation.xlsx", [
+    ("Summary", summary, (), ()),
+    ("Parameter_Stability", stab, (), ()),
+    ("Source_Stability", src_stab, (), ()),
+    ("Source_Distribution", dist, ("Agent", "Function"), ()),
+    ("Skipped_Calls", skipped, (), ()),
+    ("Arguments_Logged", arg_diag, (), ()),
+])

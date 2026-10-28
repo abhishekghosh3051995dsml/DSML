@@ -1,0 +1,164 @@
+# %%
+import argparse
+import json
+import re
+import sys
+from collections import Counter
+from pathlib import Path
+
+import pandas as pd
+from openpyxl import load_workbook
+
+ap = argparse.ArgumentParser()
+ap.add_argument("--file", default="baseline_56705_mapped_C046D46E.xlsx")
+ap.add_argument("--out", default="source_sheet_profile")
+args, _ = ap.parse_known_args()
+
+
+def locate(name):
+    p = Path(name)
+    if p.is_file():
+        return p
+    home = Path.home()
+    roots = [Path.cwd()] + sorted(home.glob("OneDrive*")) + [home]
+    for root in roots:
+        hits = [h for h in root.rglob(p.name) if not h.name.startswith("~$")]
+        if hits:
+            return max(hits, key=lambda h: h.stat().st_mtime)
+    sys.exit(f"not found: {name}")
+
+
+path = locate(args.file)
+out = Path(args.out)
+out.mkdir(exist_ok=True)
+print(path)
+
+# %%
+wb = load_workbook(path, read_only=True)
+sheet_dims = pd.DataFrame(
+    [{"sheet": ws.title, "max_row": ws.max_row, "max_col": ws.max_column} for ws in wb.worksheets]
+)
+wb.close()
+print(sheet_dims.to_string(index=False))
+
+
+def header_row(sheet):
+    head = pd.read_excel(path, sheet_name=sheet, header=None, nrows=15)
+    filled = head.notna().sum(axis=1)
+    if filled.max() == 0:
+        return 0
+    return int(filled[filled >= 0.6 * filled.max()].index[0])
+
+
+sheets = {}
+for s in sheet_dims["sheet"]:
+    h = header_row(s)
+    df = pd.read_excel(path, sheet_name=s, header=h, dtype=str)
+    df = df.dropna(how="all").dropna(axis=1, how="all")
+    df.columns = [str(c).strip() for c in df.columns]
+    sheets[s] = df
+    print(f"\n{s}: header row {h}, {df.shape[0]} rows x {df.shape[1]} cols")
+    print(list(df.columns))
+
+# %%
+FUNC = re.compile(r"\b[a-z][a-z0-9]*(?:_[A-Za-z0-9]+)+\b")
+ID = re.compile(r"^[0-9a-fA-F-]{16,}$|^[A-Za-z0-9_-]{20,}$")
+
+
+def looks_json(v):
+    return v[:1] in "{[" and v[-1:] in "}]"
+
+
+profile = []
+for s, df in sheets.items():
+    for c in df.columns:
+        v = df[c].dropna().astype(str).str.strip()
+        v = v[v != ""]
+        n = len(v)
+        if n == 0:
+            profile.append({"sheet": s, "column": c, "non_null": 0})
+            continue
+        top = v.value_counts().head(3)
+        profile.append({
+            "sheet": s,
+            "column": c,
+            "non_null": n,
+            "unique": v.nunique(),
+            "max_len": int(v.str.len().max()),
+            "json_rows": int(v.map(looks_json).sum()),
+            "pipe_rows": int(v.str.contains(r"\|").sum()),
+            "func_token_rows": int(v.str.contains(FUNC).sum()),
+            "id_like_rows": int(v.str.match(ID).sum()),
+            "top_values": " || ".join(f"{k[:80]} ({cnt})" for k, cnt in top.items()),
+        })
+
+profile = pd.DataFrame(profile)
+profile.to_csv(out / "column_profile.csv", index=False)
+pd.set_option("display.width", 250, "display.max_colwidth", 120)
+print(profile.drop(columns="top_values").to_string(index=False))
+
+# %%
+src_name = max(sheets, key=lambda s: sheets[s].shape[0] * sheets[s].shape[1])
+src = sheets[src_name]
+print(f"main sheet: {src_name}")
+
+pipe_cols = profile.query("sheet == @src_name and pipe_rows > 0")["column"].tolist()
+for c in pipe_cols:
+    tokens = (
+        src[c].dropna().astype(str).str.split("|").explode().str.strip()
+    )
+    tokens = tokens[tokens != ""]
+    counts = tokens.value_counts().rename_axis("token").reset_index(name="rows")
+    counts.to_csv(out / f"tokens_{re.sub(r'\W+', '_', c)}.csv", index=False)
+    print(f"\n{c}: {len(counts)} distinct tokens")
+    print(counts.head(40).to_string(index=False))
+
+# %%
+json_cols = profile.query("sheet == @src_name and json_rows > 0")["column"].tolist()
+
+
+def walk(obj, prefix, acc):
+    if isinstance(obj, dict):
+        for k, val in obj.items():
+            p = f"{prefix}.{k}" if prefix else k
+            acc[p] += 1
+            walk(val, p, acc)
+    elif isinstance(obj, list):
+        for item in obj[:50]:
+            walk(item, f"{prefix}[]", acc)
+
+
+for c in json_cols:
+    acc, bad = Counter(), 0
+    for v in src[c].dropna().astype(str):
+        if not looks_json(v.strip()):
+            continue
+        try:
+            walk(json.loads(v), "", acc)
+        except json.JSONDecodeError:
+            bad += 1
+    paths = pd.DataFrame(acc.most_common(), columns=["path", "count"])
+    paths.to_csv(out / f"json_paths_{re.sub(r'\W+', '_', c)}.csv", index=False)
+    print(f"\n{c}: {len(paths)} paths, {bad} unparsed")
+    print(paths.head(60).to_string(index=False))
+
+# %%
+func_cols = profile.query("sheet == @src_name and func_token_rows > 0")["column"].tolist()
+for c in func_cols:
+    toks = src[c].dropna().astype(str).str.findall(FUNC).explode().dropna()
+    toks = toks[~toks.str.startswith("NORA_")]
+    counts = toks.value_counts().rename_axis("token").reset_index(name="rows")
+    counts.to_csv(out / f"func_tokens_{re.sub(r'\W+', '_', c)}.csv", index=False)
+    print(f"\n{c}: {len(counts)} distinct snake_case tokens (NORA_ agents excluded)")
+    print(counts.head(40).to_string(index=False))
+
+# %%
+id_cols = profile.query("sheet == @src_name and id_like_rows > 0")["column"].tolist()
+print("id-like columns:", id_cols)
+sample = src.sample(min(5, len(src)), random_state=0)
+sample.to_csv(out / "sample_rows.csv", index=False)
+for _, row in sample.iterrows():
+    print("\n" + "-" * 60)
+    for c, v in row.items():
+        if pd.notna(v):
+            print(f"{c}: {str(v)[:300]}")

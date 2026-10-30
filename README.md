@@ -60,3 +60,16 @@ Notes:
 Open points:
 - msisdn and lat/long are linked to the user form by field name, because the export looks anonymised field by field. @Uday, can you confirm?
 - The 2% not found in the logs needs the API team's input on how those parameters are filled.
+
+
+python -m pip install --upgrade "scikit-learn>=1.3" pandas numpy scipy joblib openpyxl matplotlib --index-url https://pypi.org/simple --trusted-host pypi.org --trusted-host files.pythonhosted.org
+
+python -m pip install rapidfuzz statsmodels cleanlab --index-url https://pypi.org/simple --trusted-host pypi.org --trusted-host files.pythonhosted.org
+
+
+python -m pip install torch --index-url https://pypi.org/simple --trusted-host pypi.org --trusted-host files.pythonhosted.org
+
+
+python -c "import sklearn, pandas, numpy, scipy, openpyxl, rapidfuzz, statsmodels; print('sklearn', sklearn.__version__); from sklearn.cluster import HDBSCAN; print('CORE OK')"
+
+python -c "import torch; print('torch', torch.__version__, 'OK')"

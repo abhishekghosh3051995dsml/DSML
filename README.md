@@ -73,3 +73,7 @@ python -m pip install torch --index-url https://pypi.org/simple --trusted-host p
 python -c "import sklearn, pandas, numpy, scipy, openpyxl, rapidfuzz, statsmodels; print('sklearn', sklearn.__version__); from sklearn.cluster import HDBSCAN; print('CORE OK')"
 
 python -c "import torch; print('torch', torch.__version__, 'OK')"
+
+
+python -c "from importlib.metadata import version as v; print('sklearn', v('scikit-learn'), 'torch', v('torch')); from sklearn.cluster import HDBSCAN; print('CORE OK')"
+

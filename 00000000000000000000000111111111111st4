@@ -1,0 +1,443 @@
+# %%
+import argparse
+import re
+import time
+import warnings
+from collections import defaultdict
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+from scipy.optimize import minimize
+from scipy.sparse import csr_matrix, hstack
+from scipy.stats import binomtest
+from sklearn.decomposition import TruncatedSVD
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import LogisticRegression, SGDClassifier
+from sklearn.metrics import accuracy_score, f1_score
+from sklearn.model_selection import StratifiedGroupKFold
+from sklearn.naive_bayes import ComplementNB
+from sklearn.neural_network import MLPClassifier
+from sklearn.preprocessing import normalize
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--stage1", default=r"C:\Datascience\nora_l2l4\stage1_profile")
+parser.add_argument("--stage2", default=r"C:\Datascience\nora_l2l4\stage2_taxonomy")
+parser.add_argument("--stage3", default=r"C:\Datascience\nora_l2l4\stage3_weak_labels")
+parser.add_argument("--outdir", default=r"C:\Datascience\nora_l2l4\stage4_model")
+parser.add_argument("--folds", type=int, default=5)
+parser.add_argument("--template-share", type=float, default=0.3)
+parser.add_argument("--min-class-count", type=int, default=3)
+parser.add_argument("--target-precision", type=float, default=0.95)
+parser.add_argument("--conformal-alpha", type=float, default=0.10)
+parser.add_argument("--lsa-dims", type=int, default=300)
+parser.add_argument("--seed", type=int, default=0)
+args, _ = parser.parse_known_args()
+warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", message=".*Maximum iterations.*")
+
+stage1, stage2, stage3, outdir = map(Path, (args.stage1, args.stage2, args.stage3, args.outdir))
+outdir.mkdir(parents=True, exist_ok=True)
+rng = np.random.default_rng(args.seed)
+t0 = time.time()
+
+
+def tick(msg):
+    print(f"[{time.time() - t0:6.0f}s] {msg}")
+
+
+# %%
+df = pd.read_csv(stage1 / "stage1_clean.csv", keep_default_na=False)
+roles = pd.read_csv(stage1 / "column_roles.csv").set_index("role")["column"]
+text_col, l1_col = roles["text"], roles["l1"]
+df["is_template"] = df["is_template"].astype(str).str.lower().eq("true")
+df["text_clean"] = df["text_clean"].astype(str)
+
+taxonomy = pd.read_csv(stage2 / "taxonomy.csv", keep_default_na=False)
+template_labels = pd.read_csv(stage2 / "stage2_template_labels.csv", keep_default_na=False)
+weak = pd.read_csv(stage3 / "stage3_weak_labels.csv", keep_default_na=False)
+ticket_map = pd.read_csv(stage3 / "ticket_name_map.csv", keep_default_na=False)
+variants = pd.read_csv(stage3 / "name_word_variants.csv", keep_default_na=False)
+
+l4_parent = dict(zip(taxonomy["Intent-L4"], taxonomy["Intent-L2"]))
+matrix_l1 = {l4: {x for x in str(v).split("|") if x} for l4, v in zip(taxonomy["Intent-L4"], taxonomy["matrix_l1"])}
+observed_l1 = {l4: {x for x in str(v).split("|") if x} for l4, v in zip(taxonomy["Intent-L4"], taxonomy["observed_l1"])}
+ticket_only = {l4 for l4, m in matrix_l1.items() if m == {"TICKET"}}
+to_ticket = dict(zip(ticket_map["Intent-L4"], ticket_map["Intent-L4_under_TICKET"]))
+from_ticket = defaultdict(set)
+for base, tk in to_ticket.items():
+    from_ticket[tk].add(base)
+
+real = df[~df["is_template"]].merge(
+    weak[["row_id", "Intent-L4", "label_model_confidence", "secondary_Intent-L4"]], on="row_id", how="left"
+).fillna({"Intent-L4": "", "secondary_Intent-L4": ""}).reset_index(drop=True)
+real["weak_l4"] = [next(iter(sorted(from_ticket[l4]))) if l4 in from_ticket and l1 != "TICKET" else l4
+                   for l4, l1 in zip(real["Intent-L4"], real[l1_col])]
+tick(f"real notes {len(real):,}  weakly labelled {(real['weak_l4'] != '').sum():,}  unlabelled {(real['weak_l4'] == '').sum():,}")
+
+# %%
+tmpl = df[df["is_template"]].merge(template_labels[["row_id", "Intent-L4"]], on="row_id")
+tmpl = (tmpl.groupby(["text_clean", l1_col, "Intent-L4"]).size().rename("copies").reset_index())
+tick(f"template rows collapsed to {len(tmpl):,} unique sentences (affix variants carry no extra information)")
+
+name_words = {l4: [w for w in l4.lower().split("_") if w != "ticket"] for l4 in taxonomy["Intent-L4"]}
+variant_map = defaultdict(set)
+for w, v in zip(variants["name_word"], variants["note_word"]):
+    variant_map[w].add(v)
+note_tokens = [set(re.findall(r"[a-z]+", t.lower())) for t in real["text_clean"]]
+token_df = defaultdict(int)
+for toks in note_tokens:
+    for t in toks:
+        token_df[t] += 1
+n_real = len(real)
+
+
+def word_idf(w):
+    forms = {w} | variant_map.get(w, set())
+    df_w = sum(token_df.get(f, 0) for f in forms)
+    return np.log((1 + n_real) / (1 + df_w)) + 1
+
+
+specificity = {l4: np.mean([word_idf(w) for w in ws]) if ws else 1.0 for l4, ws in name_words.items()}
+spec_max = max(specificity[l4] for l4 in real.loc[real["weak_l4"] != "", "weak_l4"].unique())
+spec_table = (pd.DataFrame({"Intent-L4": list(specificity), "name_word_idf": list(specificity.values())})
+              .assign(label_weight=lambda d: (d["name_word_idf"] / spec_max).clip(upper=1.0)))
+spec_weight = dict(zip(spec_table["Intent-L4"], spec_table["label_weight"]))
+labelled_spec = spec_table[spec_table["Intent-L4"].isin(real["weak_l4"])].sort_values("label_weight")
+print("least specific weak labels (down-weighted in training):")
+print(labelled_spec.head(8).round(3).to_string(index=False))
+spec_table.to_csv(outdir / "label_specificity.csv", index=False)
+
+# %%
+l1_values = sorted(df[l1_col].unique())
+gap = 1 - np.mean([(l1 in {x for l4, ms in matrix_l1.items() if l4_parent[l4] == l4_parent[k] for x in ms})
+                   for l1, k in zip(tmpl[l1_col], tmpl["Intent-L4"])])
+tick(f"routing-matrix error rate (template sentences): {gap:.1%}")
+
+
+def l1_prior(classes):
+    pri = {}
+    for l1 in l1_values:
+        allowed = np.array([(l1 in matrix_l1.get(c, set())) or (l1 in observed_l1.get(c, set())) for c in classes])
+        w = np.where(allowed, (1 - gap) / max(allowed.sum(), 1), gap / max((~allowed).sum(), 1))
+        w = w / w.sum() * len(classes)
+        if l1 != "TICKET":
+            w = np.where([c in ticket_only for c in classes], 0.0, w)
+        pri[l1] = w
+    return pri
+
+
+# %%
+all_text = pd.concat([real["text_clean"], tmpl["text_clean"]])
+word_vec = TfidfVectorizer(ngram_range=(1, 2), min_df=2, max_df=0.5, sublinear_tf=True, max_features=60_000).fit(all_text)
+char_vec = TfidfVectorizer(analyzer="char_wb", ngram_range=(2, 5), min_df=3, sublinear_tf=True, max_features=120_000).fit(all_text)
+lsa = TruncatedSVD(n_components=args.lsa_dims, random_state=args.seed).fit(word_vec.transform(all_text))
+l1_index = {v: i for i, v in enumerate(l1_values)}
+tick(f"features: {len(word_vec.vocabulary_):,} word n-grams, {len(char_vec.vocabulary_):,} char n-grams, "
+     f"LSA {args.lsa_dims} dims ({lsa.explained_variance_ratio_.sum():.1%} variance)")
+
+
+def l1_onehot(l1s):
+    m = np.zeros((len(l1s), len(l1_values)))
+    m[np.arange(len(l1s)), [l1_index[x] for x in l1s]] = 1.0
+    return m
+
+
+def featurize(texts, l1s):
+    sparse = hstack([word_vec.transform(texts), char_vec.transform(texts), csr_matrix(l1_onehot(l1s))]).tocsr()
+    dense = np.hstack([normalize(lsa.transform(word_vec.transform(texts))), l1_onehot(l1s)])
+    return sparse, dense
+
+
+# %%
+def make_models():
+    return {
+        "logistic_regression": LogisticRegression(max_iter=400, C=8.0),
+        "sgd_modified_huber": SGDClassifier(loss="modified_huber", alpha=2e-5, max_iter=60, tol=1e-4, random_state=args.seed),
+        "complement_nb": ComplementNB(alpha=0.3),
+        "neural_network_mlp": MLPClassifier(hidden_layer_sizes=(512, 256), alpha=1e-4, batch_size=256, learning_rate_init=1e-3,
+                                            max_iter=40, tol=1e-4, random_state=args.seed),
+    }
+
+
+def member_input(name, sparse, dense):
+    return dense if name == "neural_network_mlp" else sparse
+
+
+def fit_members(sparse, dense, y, w):
+    fitted = {}
+    for name, m in make_models().items():
+        X = member_input(name, sparse, dense)
+        if name == "neural_network_mlp":
+            reps = np.maximum(1, np.round(w / w.mean())).astype(int)
+            idx = np.repeat(np.arange(len(y)), reps)
+            m.fit(X[idx], y[idx])
+        else:
+            m.fit(X, y, sample_weight=w)
+        fitted[name] = m
+    return fitted
+
+
+def member_proba(fitted, sparse, dense, n_classes):
+    out = {}
+    for name, m in fitted.items():
+        p = np.full((sparse.shape[0], n_classes), 1e-9)
+        p[:, m.classes_] = np.clip(m.predict_proba(member_input(name, sparse, dense)), 1e-9, None)
+        out[name] = p / p.sum(1, keepdims=True)
+    return out
+
+
+def blend(probs, weights, temperature, prior_rows, prior_strength=1.0):
+    k = prior_rows.shape[1]
+    logp = sum(wt * np.log((1 - 1e-3) * probs[n] + 1e-3 / k) for n, wt in weights.items()) / temperature
+    hard = prior_rows == 0
+    logp += prior_strength * np.log(np.where(hard, 1.0, prior_rows))
+    logp[hard] = -np.inf
+    logp -= logp.max(1, keepdims=True)
+    p = np.exp(logp)
+    return p / p.sum(1, keepdims=True)
+
+
+# %%
+def build_training(real_lab, extra=None):
+    rows = [real_lab.assign(source="weak")]
+    if extra is not None and len(extra):
+        rows.append(extra.assign(source="pseudo"))
+    t = tmpl.rename(columns={"Intent-L4": "label"}).assign(source="template", group=lambda d: "t_" + d["text_clean"])
+    real_w = sum(r["weight"].sum() for r in rows)
+    t["weight"] = args.template_share * real_w * (t["copies"] / t["copies"].sum())
+    return pd.concat(rows + [t[["text_clean", l1_col, "label", "weight", "group", "source"]]], ignore_index=True)
+
+
+labelled = real[real["weak_l4"] != ""].copy()
+labelled["label"] = labelled["weak_l4"]
+labelled["weight"] = labelled["label_model_confidence"].astype(float) * labelled["label"].map(spec_weight).fillna(1.0)
+labelled["group"] = "r_" + labelled["row_id"].astype(str)
+counts = labelled["label"].value_counts()
+rare = counts[counts < args.min_class_count].index
+tick(f"weak-labelled training notes {len(labelled):,}; {len(rare)} L4 with < {args.min_class_count} notes kept for training only")
+
+train = build_training(labelled[["text_clean", l1_col, "label", "weight", "group", "row_id", "secondary_Intent-L4"]])
+classes = np.array(sorted(train["label"].unique()))
+cidx = {c: i for i, c in enumerate(classes)}
+K = len(classes)
+prior_by_l1 = l1_prior(classes)
+y = train["label"].map(cidx).to_numpy()
+w = train["weight"].to_numpy()
+S, D = featurize(train["text_clean"], train[l1_col])
+prior_rows = np.vstack([prior_by_l1[l1] for l1 in train[l1_col]])
+tick(f"training rows {len(train):,} ({(train['source'] == 'weak').sum():,} real, {(train['source'] == 'template').sum():,} template)  classes {K}")
+
+# %%
+strata = np.where(np.isin(train["label"], rare) | (train["source"] == "template"), -1, y)
+folds = list(StratifiedGroupKFold(n_splits=args.folds, shuffle=True, random_state=args.seed).split(S, strata, groups=train["group"]))
+
+
+def oof_members(S, D, y, w):
+    oof = {n: np.zeros((len(y), K)) for n in make_models()}
+    for f, (tr, te) in enumerate(folds):
+        fitted = fit_members(S[tr], D[tr], y[tr], w[tr])
+        for n, p in member_proba(fitted, S[te], D[te], K).items():
+            oof[n][te] = p
+        tick(f"fold {f + 1}/{len(folds)} done")
+    return oof
+
+
+oof = oof_members(S, D, y, w)
+is_real = (train["source"] == "weak").to_numpy()
+
+
+def nll(p, idx):
+    return -np.mean(np.log(np.clip(p[idx, y[idx]], 1e-12, None)))
+
+
+names = list(oof)
+real_idx_pre = np.flatnonzero(is_real)
+
+
+def unpack(params):
+    m = len(names)
+    return dict(zip(names, np.exp(params[:m]) / np.exp(params[:m]).sum())), float(np.exp(params[m])), float(np.exp(params[m + 1]))
+
+
+def objective(params):
+    wts, temp, beta = unpack(params)
+    return nll(blend(oof, wts, temp, prior_rows, beta), is_real)
+
+
+res = minimize(objective, np.zeros(len(names) + 2), method="Nelder-Mead", options={"maxiter": 4000, "xatol": 1e-4, "fatol": 1e-6})
+weights, temperature, prior_strength = unpack(res.x)
+p_oof = blend(oof, weights, temperature, prior_rows, prior_strength)
+no_prior = blend(oof, weights, temperature, prior_rows, 0.0)
+tick("ensemble weights " + ", ".join(f"{n}={v:.2f}" for n, v in weights.items())
+     + f"; temperature {temperature:.2f}; routing-matrix prior strength {prior_strength:.2f} (learned; 0 = matrix ignored)")
+tick(f"held-out L4 accuracy with matrix prior {np.mean(p_oof[real_idx_pre].argmax(1) == y[real_idx_pre]):.4f} "
+     f"vs without {np.mean(no_prior[real_idx_pre].argmax(1) == y[real_idx_pre]):.4f}")
+
+# %%
+def ece(p, yy, bins=15):
+    conf, pred = p.max(1), p.argmax(1)
+    edges = np.linspace(0, 1, bins + 1)
+    e = 0.0
+    for lo, hi in zip(edges[:-1], edges[1:]):
+        m = (conf > lo) & (conf <= hi)
+        if m.any():
+            e += m.mean() * abs((pred[m] == yy[m]).mean() - conf[m].mean())
+    return e
+
+
+def scores(p, idx):
+    pred = p[idx].argmax(1)
+    l2_true = [l4_parent[classes[i]] for i in y[idx]]
+    l2_pred = [l4_parent[classes[i]] for i in pred]
+    top3 = np.mean([y[i] in np.argsort(-p[i])[:3] for i in idx])
+    return {
+        "L4_accuracy": accuracy_score(y[idx], pred),
+        "L4_macro_F1": f1_score(y[idx], pred, average="macro", zero_division=0),
+        "L2_accuracy": accuracy_score(l2_true, l2_pred),
+        "L2_macro_F1": f1_score(l2_true, l2_pred, average="macro", zero_division=0),
+        "L4_top3": top3,
+        "ECE": ece(p[idx], y[idx]),
+    }
+
+
+real_idx = np.flatnonzero(is_real)
+comparison = pd.DataFrame(
+    [{"model": n, **scores(blend({n: oof[n]}, {n: 1.0}, 1.0, prior_rows, 0.0), real_idx)} for n in names]
+    + [{"model": "ensemble_calibrated", **scores(p_oof, real_idx)}]
+)
+print("\nheld-out real notes (grouped CV, scored against stage 3 labels):")
+print(comparison.round(4).to_string(index=False))
+comparison.to_csv(outdir / "model_comparison.csv", index=False)
+
+best_single = comparison.iloc[:-1].sort_values("L4_accuracy").iloc[-1]["model"]
+a = blend({best_single: oof[best_single]}, {best_single: 1.0}, 1.0, prior_rows, 0.0)[real_idx].argmax(1) == y[real_idx]
+b = p_oof[real_idx].argmax(1) == y[real_idx]
+n01, n10 = int((~a & b).sum()), int((a & ~b).sum())
+p_mcnemar = binomtest(n01, n01 + n10, 0.5).pvalue if n01 + n10 else 1.0
+tick(f"McNemar ensemble vs {best_single}: ensemble-only correct {n01}, single-only correct {n10}, p = {p_mcnemar:.2e}")
+
+# %%
+self_conf = p_oof[np.arange(len(y)), y]
+class_n = np.bincount(y[real_idx], minlength=K)
+thresh = np.array([self_conf[real_idx][y[real_idx] == k].mean() if class_n[k] else 1.0 for k in range(K)])
+model_pick = p_oof.argmax(1)
+trusted_alt = (class_n[model_pick] >= args.min_class_count) | np.isin(classes[model_pick], tmpl["Intent-L4"].unique())
+issue = (is_real & (model_pick != y) & (self_conf < thresh[y]) & (p_oof[np.arange(len(y)), model_pick] >= thresh[model_pick])
+         & trusted_alt)
+secondary = train["secondary_Intent-L4"].fillna("").map(cidx).fillna(-1).astype(int).to_numpy()
+relabel = issue & (secondary == model_pick)
+drop = issue & ~relabel
+issues = train.loc[issue, ["row_id", "text_clean", l1_col, "label", "secondary_Intent-L4"]].assign(
+    model_suggests=classes[model_pick[issue]], action=np.where(relabel[issue], "relabel_to_secondary", "dropped"))
+issues.to_csv(outdir / "label_issues.csv", index=False)
+print(f"\nconfident learning: {issue.sum():,} likely label errors among {is_real.sum():,} weak labels "
+      f"({issue.sum() / is_real.sum():.1%}); {relabel.sum():,} relabelled to their secondary intent, {drop.sum():,} dropped")
+print("labels most often flagged:")
+print(issues["label"].value_counts().head(10).to_string())
+
+clean = labelled.set_index("group")
+new_label = classes[model_pick[relabel]]
+clean.loc[train.loc[relabel, "group"].to_numpy(), "label"] = new_label
+clean = clean.drop(index=train.loc[drop, "group"].to_numpy()).reset_index()
+
+# %%
+order = np.argsort(-p_oof[real_idx].max(1))
+correct_sorted = (p_oof[real_idx].argmax(1) == y[real_idx])[order]
+running = np.cumsum(correct_sorted) / np.arange(1, len(order) + 1)
+ok = np.flatnonzero(running >= args.target_precision)
+pseudo_threshold = float(p_oof[real_idx].max(1)[order][ok.max()]) if len(ok) else 1.0
+tick(f"self-training threshold for {args.target_precision:.0%} held-out precision: {pseudo_threshold:.3f}")
+
+unl = real[real["weak_l4"] == ""].reset_index(drop=True)
+if unl.empty:
+    unl = real.iloc[:1].reset_index(drop=True)
+S_u, D_u = featurize(unl["text_clean"], unl[l1_col])
+prior_u = np.vstack([prior_by_l1[l1] for l1 in unl[l1_col]])
+clean_train = build_training(clean[["text_clean", l1_col, "label", "weight", "group", "row_id"]])
+teacher = fit_members(*featurize(clean_train["text_clean"], clean_train[l1_col]), clean_train["label"].map(cidx).to_numpy(),
+                      clean_train["weight"].to_numpy())
+p_teacher = blend(member_proba(teacher, S_u, D_u, K), weights, temperature, prior_u, prior_strength)
+keep = p_teacher.max(1) >= pseudo_threshold
+pseudo = unl.loc[keep, ["text_clean", l1_col, "row_id"]].assign(
+    label=classes[p_teacher[keep].argmax(1)], weight=p_teacher[keep].max(1), group="p_" + unl.loc[keep, "row_id"].astype(str))
+tick(f"teacher (cleaned labels only): {keep.sum():,} pseudo-labels at the calibrated threshold ({keep.mean():.1%} of unlabelled)")
+
+student_train = build_training(clean[["text_clean", l1_col, "label", "weight", "group", "row_id"]], pseudo)
+student = fit_members(*featurize(student_train["text_clean"], student_train[l1_col]), student_train["label"].map(cidx).to_numpy(),
+                      student_train["weight"].to_numpy())
+p_student = blend(member_proba(student, S_u, D_u, K), weights, temperature, prior_u, prior_strength)
+same = p_student.argmax(1) == p_teacher.argmax(1)
+agree_pseudo = same[keep].mean() if keep.any() else float("nan")
+agree_rest = same[~keep].mean() if (~keep).any() else float("nan")
+pd.DataFrame([{"pseudo_labels": int(keep.sum()), "share_of_unlabelled": keep.mean(), "threshold": pseudo_threshold,
+               "student_teacher_agreement_on_pseudo": agree_pseudo, "student_teacher_agreement_on_rest": agree_rest}]
+             ).to_csv(outdir / "self_training_log.csv", index=False)
+tick(f"student (cleaned + pseudo): agrees with teacher on {agree_pseudo:.1%} of pseudo-labelled and {agree_rest:.1%} of remaining notes")
+
+# %%
+final = student
+S_all, D_all = featurize(real["text_clean"], real[l1_col])
+prior_all = np.vstack([prior_by_l1[l1] for l1 in real[l1_col]])
+p_all = blend(member_proba(final, S_all, D_all, K), weights, temperature, prior_all, prior_strength)
+tick("final ensemble trained on cleaned weak labels + pseudo-labels + templates")
+
+# %%
+nonconf = 1 - p_oof[real_idx, y[real_idx]]
+n_cal = len(nonconf)
+qhat = np.quantile(nonconf, min(1.0, np.ceil((n_cal + 1) * (1 - args.conformal_alpha)) / n_cal), method="higher")
+pred_sets = p_all >= 1 - qhat
+set_size = pred_sets.sum(1)
+l2_sets = [{l4_parent[classes[k]] for k in np.flatnonzero(s)} for s in pred_sets]
+tick(f"conformal ({1 - args.conformal_alpha:.0%} coverage): set threshold {1 - qhat:.3f}; "
+     f"single-L4 sets {np.mean(set_size == 1):.1%}, single-L2 sets {np.mean([len(s) == 1 for s in l2_sets]):.1%}")
+
+pred = p_all.argmax(1)
+l4 = classes[pred]
+l4 = np.array([to_ticket.get(x, x) if l1 == "TICKET" else x for x, l1 in zip(l4, real[l1_col])])
+out = pd.DataFrame({
+    "row_id": real["row_id"],
+    text_col: real[text_col],
+    l1_col: real[l1_col],
+    "Intent-L2": [l4_parent[x] for x in l4],
+    "Intent-L4": l4,
+    "confidence": p_all.max(1).round(4),
+    "second_Intent-L4": classes[np.argsort(-p_all, 1)[:, 1]],
+    "conformal_set_size": set_size,
+    "needs_review": (set_size != 1) | ([len(s) != 1 for s in l2_sets]),
+    "stage3_Intent-L4": real["Intent-L4"],
+})
+has_stage3 = out["stage3_Intent-L4"] != ""
+out["agrees_with_stage3"] = np.where(has_stage3, np.where(out["Intent-L4"] == out["stage3_Intent-L4"], "yes", "no"), "")
+out.to_csv(outdir / "stage4_predictions.csv", index=False)
+
+# %%
+cov = pd.DataFrame({"min_confidence": np.round(np.arange(0.0, 1.0, 0.05), 2)})
+conf_r, corr_r = p_oof[real_idx].max(1), p_oof[real_idx].argmax(1) == y[real_idx]
+cov["share_of_notes"] = [np.mean(conf_r >= c) for c in cov["min_confidence"]]
+cov["heldout_L4_accuracy"] = [corr_r[conf_r >= c].mean() if (conf_r >= c).any() else np.nan for c in cov["min_confidence"]]
+cov.to_csv(outdir / "accuracy_vs_coverage.csv", index=False)
+print("\naccuracy vs coverage on held-out real notes:")
+print(cov.iloc[::2].round(3).to_string(index=False))
+
+pred_r, true_r = p_oof[real_idx].argmax(1), y[real_idx]
+per_l2 = (pd.DataFrame({"Intent-L2": [l4_parent[classes[i]] for i in true_r], "correct": pred_r == true_r})
+          .groupby("Intent-L2")["correct"].agg(heldout_notes="size", L4_accuracy="mean"))
+per_l2.to_csv(outdir / "heldout_accuracy_by_l2.csv")
+print("\nheld-out L4 accuracy by L2:")
+print(per_l2.round(3).to_string())
+
+print(f"\nall {len(out):,} real notes labelled; Intent-L1 untouched: {bool((out[l1_col].values == real[l1_col].values).all())}")
+print(f"agreement with stage 3 where stage 3 had a label: {(out['agrees_with_stage3'] == 'yes').sum() / max(has_stage3.sum(), 1):.1%}")
+moved = out[out["agrees_with_stage3"] == "no"].groupby(["stage3_Intent-L4", "Intent-L4"]).size().sort_values(ascending=False)
+print("most common changes from the stage 3 label:")
+print(moved.head(15).to_string())
+print(f"needs_review: {out['needs_review'].mean():.1%}   median confidence: {out['confidence'].median():.3f}")
+print("\nfinal L2 by L1:")
+print(pd.crosstab(out["Intent-L2"], out[l1_col], margins=True))
+print(f"\nGENERAL_SUPPORT share: {(out['Intent-L2'] == 'GENERAL_SUPPORT').mean():.1%}   distinct L4: {out['Intent-L4'].nunique()}")
+print("\ntop 20 L4:")
+print(out.groupby(["Intent-L2", "Intent-L4"]).size().sort_values(ascending=False).head(20).to_string())
+print(f"\nwritten to {outdir}")
+for f in sorted(outdir.glob("*.csv")):
+    print(f"  {f.name}")

@@ -1,0 +1,242 @@
+# %%
+import argparse
+import re
+from collections import defaultdict
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+from sklearn.decomposition import TruncatedSVD
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--stage1", default=r"C:\Datascience\nora_l2l4\stage1_profile")
+parser.add_argument("--outdir", default=r"C:\Datascience\nora_l2l4\stage2_taxonomy")
+args, _ = parser.parse_known_args()
+
+stage1 = Path(args.stage1)
+outdir = Path(args.outdir)
+outdir.mkdir(parents=True, exist_ok=True)
+
+L4_BY_L2 = {
+    "ACCOUNT": ["ACCOUNT_ACCESS_RECOVERY", "ACCOUNT_PROFILE_UPDATE", "ACCOUNT_SECURITY_VERIFICATION"],
+    "APPLICATION": ["APP_NOTIFICATION_SETTINGS", "MOBILE_APP_FUNCTION", "MOBILE_APP_LOGIN"],
+    "BILLING": ["AUTOPAY_MANAGEMENT", "BILLING_DISPUTE", "BILL_EXPLANATION", "PAYMENT_PROCESSING"],
+    "CALL_HANDLING": ["CALL_FORWARDING_CONFIGURATION", "INCOMING_CALL_FAILURE", "OUTGOING_CALL_FAILURE", "VOICEMAIL_CONFIGURATION"],
+    "DEVICE": ["DEVICE_COMPATIBILITY", "DEVICE_REPLACEMENT", "DEVICE_SETUP"],
+    "GENERAL_SUPPORT": ["GENERAL_SUPPORT"],
+    "INTERNET": ["INTERNET"],
+    "NETWORK": ["MOBILE_DATA_NO_CONNECTIVITY", "MOBILE_DATA_SLOW_SPEED", "NETWORK_COVERAGE", "NO_SIGNAL_REGISTRATION"],
+    "PROVISIONING": ["FEATURE_PROVISIONING", "LINE_PROVISIONING", "PLAN_PROVISIONING"],
+}
+
+ROUTING_MATRIX = {
+    ("RCA", "NETWORK"): "network_coverage, no_signal_registration, mobile_data_no_connectivity, mobile_data_slow_speed, roaming_issue, network_congestion, dropped_calls, intermittent_service",
+    ("RCA", "INTERNET"): "internet_connectivity, internet_slow_speed, vpn_connectivity, dns_issue, latency_issue, packet_loss, wireline_data_issue, broadband_outage",
+    ("RCA", "DEVICE"): "device_configuration, device_compatibility, device_lock, device_performance, device_replacement, sim_detection_issue, esim_issue, firmware_issue",
+    ("RCA", "APPLICATION"): "mobile_app_login, mobile_app_function, mobile_app_performance, mobile_app_installation, mobile_app_sync_issue, api_integration_issue",
+    ("RCA", "ACCOUNT"): "account_access, password_reset, pin_reset, authentication_failure, profile_update_issue, account_verification",
+    ("RCA", "BILLING"): "bill_explanation, billing_dispute, unexpected_charge, payment_failure, credit_adjustment, invoice_issue",
+    ("RCA", "PROVISIONING"): "line_provisioning, feature_provisioning, esim_activation, sim_activation, number_porting, service_activation, service_suspension",
+    ("RCA", "GENERAL_SUPPORT"): "general_inquiry, policy_question, process_guidance, unsupported_request",
+    ("MODIFY", "ACCOUNT"): "password_reset, pin_reset, profile_update, account_transfer, account_merge",
+    ("MODIFY", "BILLING"): "autopay_management, payment_method_update, billing_address_update, billing_preference_change",
+    ("MODIFY", "NETWORK"): "network_feature_change, roaming_enablement, coverage_optimization",
+    ("MODIFY", "INTERNET"): "data_plan_change, internet_feature_change, bandwidth_upgrade",
+    ("MODIFY", "DEVICE"): "device_unlock, device_swap, device_upgrade, esim_conversion",
+    ("MODIFY", "APPLICATION"): "app_settings_change, notification_configuration, user_preference_change",
+    ("MODIFY", "PROVISIONING"): "line_provisioning, feature_provisioning, service_activation, service_deactivation, sim_activation, esim_activation, number_porting, line_suspension, line_restoration",
+    ("MODIFY", "GENERAL_SUPPORT"): "service_request, customer_preference_update",
+    ("MODIFY", "CALL_HANDLING"): "call_transfer_request, queue_reroute, skill_group_transfer, agent_reassignment",
+    ("QUERY", "ACCOUNT"): "account_status, login_status, profile_information",
+    ("QUERY", "BILLING"): "bill_explanation, current_balance, payment_status, invoice_request, autopay_status",
+    ("QUERY", "NETWORK"): "outage_status, coverage_inquiry, roaming_status",
+    ("QUERY", "INTERNET"): "data_usage, data_balance, internet_status, speed_information",
+    ("QUERY", "DEVICE"): "device_status, warranty_status, device_compatibility, unlock_eligibility",
+    ("QUERY", "APPLICATION"): "app_feature_information, app_version_information",
+    ("QUERY", "GENERAL_SUPPORT"): "policy_question, process_question, general_inquiry",
+    ("CLARIFICATION_NEEDED", "NETWORK"): "network_coverage, no_signal_registration, mobile_data_no_connectivity, mobile_data_slow_speed, roaming_issue",
+    ("CLARIFICATION_NEEDED", "INTERNET"): "internet_connectivity, internet_slow_speed, latency_issue",
+    ("CLARIFICATION_NEEDED", "DEVICE"): "device_configuration, device_performance, device_compatibility",
+    ("CLARIFICATION_NEEDED", "APPLICATION"): "mobile_app_login, mobile_app_function, mobile_app_performance",
+    ("CLARIFICATION_NEEDED", "ACCOUNT"): "account_access, password_reset, pin_reset, authentication_failure",
+    ("CLARIFICATION_NEEDED", "BILLING"): "bill_explanation, payment_failure, billing_dispute",
+    ("CLARIFICATION_NEEDED", "PROVISIONING"): "line_provisioning, feature_provisioning, sim_activation, esim_activation",
+    ("CLARIFICATION_NEEDED", "GENERAL_SUPPORT"): "general_inquiry, policy_question",
+    ("CLARIFICATION_NEEDED", "CALL_HANDLING"): "misrouted_call, transfer_request, agent_escalation",
+    ("TICKET", "NETWORK"): "network_coverage_ticket, no_signal_ticket, roaming_ticket, data_issue_ticket",
+    ("TICKET", "INTERNET"): "internet_connectivity_ticket, slow_internet_ticket, latency_ticket",
+    ("TICKET", "DEVICE"): "device_repair_ticket, device_replacement_ticket, device_configuration_ticket",
+    ("TICKET", "APPLICATION"): "mobile_app_ticket, integration_ticket, application_defect_ticket",
+    ("TICKET", "ACCOUNT"): "account_access_ticket, authentication_ticket",
+    ("TICKET", "GENERAL_SUPPORT"): "case_followup, escalation_followup, service_request_followup",
+}
+ROUTING_MATRIX = {k: [x.strip().upper() for x in v.split(",")] for k, v in ROUTING_MATRIX.items()}
+
+# L2 placements confirmed on review, for data topics whose words do not exist in any taxonomy name
+REVIEWED_L2 = {
+    "gateway setup": "INTERNET",
+    "gateway offline": "INTERNET",
+    "gateway firmware update": "INTERNET",
+    "home wifi configuration": "INTERNET",
+}
+MATRIX_L4_BY_L2 = defaultdict(list)
+for (_, l2), l4s in ROUTING_MATRIX.items():
+    MATRIX_L4_BY_L2[l2].extend(x for x in l4s if x not in MATRIX_L4_BY_L2[l2])
+
+# %%
+df = pd.read_csv(stage1 / "stage1_clean.csv", dtype={"text_clean": str}, keep_default_na=False)
+roles = pd.read_csv(stage1 / "column_roles.csv").set_index("role")["column"]
+l1_col = roles["l1"]
+df["is_template"] = df["is_template"].astype(str).str.lower().eq("true")
+templates = df[df["is_template"]].copy()
+print(f"rows: {len(df):,}  template rows: {len(templates):,}")
+
+cores = templates["text_clean"].str.replace(r"[.!?]+$", "", regex=True).str.strip()
+templates["core"] = cores
+unique_cores = sorted(cores.unique())
+print(f"distinct template sentences: {len(unique_cores):,}")
+
+# %%
+frames_of_topic = defaultdict(set)
+topics_of_frame = defaultdict(set)
+splits = {}
+for core in unique_cores:
+    tok = core.split()
+    cands = []
+    for i in range(len(tok)):
+        for j in range(i + 1, len(tok) + 1):
+            frame = (" ".join(tok[:i]), " ".join(tok[j:]))
+            topic = " ".join(tok[i:j])
+            frames_of_topic[topic].add(frame)
+            topics_of_frame[frame].add(topic)
+            cands.append((frame, topic))
+    splits[core] = cands
+
+
+def best_split(core):
+    scored = [
+        (len(frames_of_topic[t]) * len(topics_of_frame[f]), len(t.split()), f, t)
+        for f, t in splits[core]
+        if len(frames_of_topic[t]) > 1 and len(topics_of_frame[f]) > 1
+    ]
+    if not scored:
+        return ("", ""), core
+    _, _, frame, topic = max(scored)
+    return frame, topic
+
+
+parsed = {c: best_split(c) for c in unique_cores}
+templates["frame"] = templates["core"].map(lambda c: " … ".join(parsed[c][0]).strip(" …") or "(none)")
+templates["topic"] = templates["core"].map(lambda c: parsed[c][1])
+
+frame_table = (
+    templates.groupby("frame")
+    .agg(rows=("row_id", "size"), topics=("topic", "nunique"), l1_values=(l1_col, lambda s: "|".join(sorted(s.unique()))))
+    .sort_values("rows", ascending=False).reset_index()
+)
+print(f"frames found: {len(frame_table)}  topics found: {templates['topic'].nunique()}")
+print(frame_table.to_string(index=False))
+frame_table.to_csv(outdir / "template_frames.csv", index=False)
+
+# %%
+def tokens(name):
+    return {w[:-1] if len(w) > 4 and w.endswith("s") else w for w in re.split(r"[_\s]+", name.lower()) if w}
+
+
+taxonomy = pd.DataFrame(
+    [(l2, l4, "canonical") for l2, l4s in L4_BY_L2.items() for l4 in l4s]
+    + [(l2, l4, "matrix") for l2, l4s in MATRIX_L4_BY_L2.items() for l4 in l4s],
+    columns=["Intent-L2", "Intent-L4", "source"],
+).drop_duplicates("Intent-L4")
+
+l4_names = taxonomy["Intent-L4"].tolist()
+l4_l2 = taxonomy["Intent-L2"].tolist()
+l4_tokens = [tokens(n) for n in l4_names]
+doc_freq = defaultdict(int)
+for toks in l4_tokens:
+    for w in toks:
+        doc_freq[w] += 1
+idf = lambda w: np.log((1 + len(l4_tokens)) / (1 + doc_freq.get(w, 0))) + 1
+
+real_text = df.loc[~df["is_template"], "text_clean"]
+word_vec = TfidfVectorizer(min_df=2, sublinear_tf=True, token_pattern=r"[a-z]{2,}")
+real_tfidf = word_vec.fit_transform(real_text)
+svd = TruncatedSVD(n_components=min(200, real_tfidf.shape[1] - 1), random_state=0).fit(real_tfidf)
+print(f"semantic space: {real_tfidf.shape[1]:,} words from {len(real_text):,} real notes, {svd.n_components} dims, "
+      f"{svd.explained_variance_ratio_.sum():.1%} variance kept")
+
+
+def embed(texts):
+    z = svd.transform(word_vec.transform(texts))
+    return z / np.maximum(np.linalg.norm(z, axis=1, keepdims=True), 1e-12)
+
+
+l2_names = sorted(taxonomy["Intent-L2"].unique())
+l2_docs = [" ".join([l2.replace("_", " ").lower()] + [n.replace("_", " ").lower() for n, p in zip(l4_names, l4_l2) if p == l2]) for l2 in l2_names]
+l2_emb = embed(l2_docs)
+
+
+def match_topic(topic):
+    t = tokens(topic)
+    overlap = np.array([sum(idf(w) for w in t & s) / sum(idf(w) for w in t | s) for s in l4_tokens])
+    same = [i for i, toks in enumerate(l4_tokens) if toks == t]
+    if same:
+        exact_idx = same[0]
+        return pd.Series({"Intent-L2": l4_l2[exact_idx], "Intent-L4": l4_names[exact_idx], "match": "exact",
+                          "nearest_l4": l4_names[exact_idx], "name_overlap": 1.0, "semantic_l2_cosine": np.nan})
+    semantic = (embed([topic]) @ l2_emb.T).ravel()
+    l2_score = {l2: semantic[i] + max(o for o, p in zip(overlap, l4_l2) if p == l2) for i, l2 in enumerate(l2_names)}
+    l2 = max(l2_score, key=l2_score.get)
+    in_l2 = [i for i, p in enumerate(l4_l2) if p == l2]
+    near = max(in_l2, key=lambda i: overlap[i])
+    evidence = l2_score[l2] > 0
+    return pd.Series({"Intent-L2": l2, "Intent-L4": re.sub(r"\s+", "_", topic.upper()),
+                      "match": "new_l4" if evidence else "new_l4_check_l2",
+                      "nearest_l4": l4_names[near], "name_overlap": round(float(overlap[near]), 3),
+                      "semantic_l2_cosine": round(float(semantic[l2_names.index(l2)]), 3)})
+
+
+topic_table = (
+    templates.groupby("topic")
+    .agg(rows=("row_id", "size"), frames=("frame", "nunique"), l1_values=(l1_col, lambda s: "|".join(sorted(s.unique()))))
+    .reset_index()
+)
+topic_table = pd.concat([topic_table, topic_table["topic"].apply(match_topic)], axis=1)
+topic_table["suggested_l2"] = topic_table["Intent-L2"]
+reviewed = topic_table["topic"].isin(REVIEWED_L2) & topic_table["match"].ne("exact")
+topic_table.loc[reviewed, "Intent-L2"] = topic_table.loc[reviewed, "topic"].map(REVIEWED_L2)
+topic_table.loc[reviewed, "match"] = "new_l4_reviewed"
+topic_table = topic_table.sort_values(["Intent-L2", "Intent-L4"]).reset_index(drop=True)
+print(topic_table["match"].value_counts().to_string())
+print(topic_table[["topic", "rows", "frames", "Intent-L2", "Intent-L4", "match", "suggested_l2", "nearest_l4", "name_overlap"]].to_string(index=False))
+topic_table.to_csv(outdir / "template_topics.csv", index=False)
+
+# %%
+new_l4 = topic_table.loc[topic_table["match"] != "exact", ["Intent-L2", "Intent-L4"]].assign(source="data")
+taxonomy_full = pd.concat([taxonomy, new_l4]).drop_duplicates("Intent-L4").sort_values(["Intent-L2", "Intent-L4"])
+seen_in_templates = set(topic_table["Intent-L4"])
+taxonomy_full["in_templates"] = taxonomy_full["Intent-L4"].isin(seen_in_templates)
+matrix_l1 = defaultdict(set)
+for (l1, l2), l4s in ROUTING_MATRIX.items():
+    for l4 in l4s:
+        matrix_l1[(l2, l4)].add(l1)
+taxonomy_full["matrix_l1"] = [ "|".join(sorted(matrix_l1.get((l2, l4), []))) for l2, l4 in zip(taxonomy_full["Intent-L2"], taxonomy_full["Intent-L4"])]
+print(taxonomy_full.groupby(["Intent-L2", "source"]).size().unstack(fill_value=0))
+print(f"total L2: {taxonomy_full['Intent-L2'].nunique()}  total L4: {len(taxonomy_full)}  L4 seen in templates: {taxonomy_full['in_templates'].sum()}")
+taxonomy_full.to_csv(outdir / "taxonomy.csv", index=False)
+
+# %%
+labels = templates.merge(topic_table[["topic", "Intent-L2", "Intent-L4"]], on="topic", how="left")
+labels[["row_id", "Intent-L2", "Intent-L4", "topic", "frame"]].to_csv(outdir / "stage2_template_labels.csv", index=False)
+print(pd.crosstab(labels["Intent-L2"], labels[l1_col], margins=True))
+matrix_pairs = set(ROUTING_MATRIX)
+labels["l1_l2_in_matrix"] = [(a, b) in matrix_pairs for a, b in zip(labels[l1_col], labels["Intent-L2"])]
+outside = labels.loc[~labels["l1_l2_in_matrix"]].groupby([l1_col, "Intent-L2"]).size().rename("template_rows").reset_index()
+print(f"\ntemplate rows whose L1+L2 pair is not in the routing matrix: {int(outside['template_rows'].sum()):,}")
+print(outside.to_string(index=False))
+outside.to_csv(outdir / "matrix_gaps.csv", index=False)
+print(f"\nwritten to {outdir}")
+for f in sorted(outdir.glob("*.csv")):
+    print(f"  {f.name}")

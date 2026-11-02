@@ -77,3 +77,5 @@ python -c "import torch; print('torch', torch.__version__, 'OK')"
 
 python -c "from importlib.metadata import version as v; print('sklearn', v('scikit-learn'), 'torch', v('torch')); from sklearn.cluster import HDBSCAN; print('CORE OK')"
 
+python .\stage7_l2l4_dataset_report.py --input "C:\Datascience\nora_l2l4\stage5_final\nora_l2l4_slm_ready.xlsx"
+

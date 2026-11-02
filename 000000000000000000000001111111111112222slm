@@ -1,0 +1,64 @@
+# %%
+import argparse
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--stage1", default=r"C:\Datascience\nora_l2l4\stage1_profile")
+parser.add_argument("--stage5", default=r"C:\Datascience\nora_l2l4\stage5_final")
+parser.add_argument("--test-share", type=float, default=0.2)
+parser.add_argument("--min-test-class", type=int, default=5)
+parser.add_argument("--seed", type=int, default=0)
+args, _ = parser.parse_known_args()
+
+stage1, stage5 = Path(args.stage1), Path(args.stage5)
+rng = np.random.default_rng(args.seed)
+
+# %%
+final = pd.read_excel(stage5 / "nora_l2l4_final.xlsx", dtype=str, keep_default_na=False)
+clean = pd.read_csv(stage1 / "stage1_clean.csv", keep_default_na=False)
+roles = pd.read_csv(stage1 / "column_roles.csv").set_index("role")["column"]
+text_col, l1_col = roles["text"], roles["l1"]
+clean = clean.sort_values("row_id").reset_index(drop=True)
+assert len(final) == len(clean) and (final[text_col].values == clean[text_col].astype(str).values).all()
+
+final["Source"] = np.where(clean["is_template"].astype(str).str.lower().eq("true"), "template", "real")
+print(f"rows in final file: {len(final):,}  real {(final['Source'] == 'real').sum():,}  template {(final['Source'] == 'template').sum():,}")
+
+# %%
+key = [text_col, l1_col, "Intent-L2", "Intent-L4"]
+conflicts = final.groupby(text_col)[["Intent-L2", "Intent-L4"]].nunique().max(axis=1)
+print(f"identical messages with different labels: {(conflicts > 1).sum()}")
+dedup = final.drop_duplicates(subset=key).reset_index(drop=True)
+print(f"after removing exact duplicates: {len(dedup):,} rows ({len(final) - len(dedup):,} removed)")
+print(dedup["Source"].value_counts().to_string())
+
+# %%
+dedup["Split"] = "train"
+real = dedup.index[dedup["Source"] == "real"]
+for l4, idx in dedup.loc[real].groupby("Intent-L4").groups.items():
+    idx = np.array(idx)
+    if len(idx) >= args.min_test_class:
+        n_test = int(round(len(idx) * args.test_share))
+        dedup.loc[rng.choice(idx, n_test, replace=False), "Split"] = "test"
+
+summary = pd.crosstab(dedup["Source"], dedup["Split"], margins=True)
+print("\nrows by source and split:")
+print(summary)
+test = dedup[dedup["Split"] == "test"]
+print(f"\ntest rows: {len(test):,} (real agent notes only)  L2 in test: {test['Intent-L2'].nunique()}  L4 in test: {test['Intent-L4'].nunique()}")
+print(f"L4 kept in train only (fewer than {args.min_test_class} real notes): "
+      f"{dedup.loc[real, 'Intent-L4'].value_counts().lt(args.min_test_class).sum()}")
+
+# %%
+out = dedup[[text_col, l1_col, "Intent-L2", "Intent-L4", "Source", "Split"]]
+path = stage5 / "nora_l2l4_slm_ready.xlsx"
+with pd.ExcelWriter(path, engine="openpyxl") as xw:
+    out.to_excel(xw, sheet_name="Intent", index=False)
+    ws = xw.sheets["Intent"]
+    ws.freeze_panes = "A2"
+    for col, width in zip("ABCDEF", (90, 24, 20, 36, 12, 10)):
+        ws.column_dimensions[col].width = width
+print(f"\nwritten: {path}  ({len(out):,} rows, columns {list(out.columns)})")

@@ -79,3 +79,42 @@ python -c "from importlib.metadata import version as v; print('sklearn', v('scik
 
 python .\stage7_l2l4_dataset_report.py --input "C:\Datascience\nora_l2l4\stage5_final\nora_l2l4_slm_ready.xlsx"
 
+
+######
+#########
+
+Hi Sendil,
+The L2/L4 labelling is complete for all 56,705 messages (Intent-L1 unchanged). Sharing two files:
+	1.	nora_l2l4_final.xlsx: User_Message, Intent-L1, Intent-L2, Intent-L4 for every message.
+	2.	nora_l2l4_validation.xlsx: validation results and statistical tests.
+Key design: L4 is predicted first, and L2 is derived from it
+Instead of predicting L2 and mapping it to a fixed L4, the model decides the specific intent (L4) from each message's words, and L2 is the group that L4 belongs to (bottom-up hierarchical classification). So L2 and L4 never contradict, and a wrong L2 can't force a wrong L4.
+How it was done
+	1.	Cleaning: separated 24,229 template-generated rows (592 base sentences) from 32,476 real agent notes. All accuracy is measured on real notes only.
+	2.	Taxonomy: 9 L2 and 149 L4 (existing labels kept for consistency, plus 13 new intents found in the data). Each L4 belongs to exactly one L2, and this parent link is used to derive L2. Template rows carry their own topic, so they got known labels.
+	3.	Training labels without human labelling (weak supervision):
+	•	a small logistic regression trained on template rows (distant supervision), voting only when at least 95% sure;
+	•	intent-name matching;
+	•	an agent-phrasing list ("pay bill" → PAYMENT_PROCESSING);
+	•	meaning similarity was tested and dropped.
+The Dawid–Skene model (Expectation–Maximisation) weighted each source by its reliability and combined them: 23,366 labelled real notes, 92.8% agreement.
+	4.	Label cleaning: confident learning (5-fold cross-validation) corrected or removed 1,249 noisy labels (5.3%).
+	5.	Model: an ensemble of logistic regression, SGD classifier and a neural network (MLP), running in parallel, with weights learned from held-out data (86% / 11% / 4%). Naive Bayes was tested and given zero weight. Self-training added about 2,000 high-confidence notes.
+How L4 → L2 works technically
+	•	Text → features (TF-IDF words, character n-grams for typos, LSA meaning features, L1 as a hint).
+	•	Each model gives a probability for every L4 (softmax); the probabilities are combined with the learned weights and calibrated.
+	•	L4 = the intent with the highest probability (TICKET messages use the ticket form).
+	•	L2 = that L4's parent group in the taxonomy. No separate L2 model.
+	•	Example: "cx wants to pay bill" → PAYMENT_PROCESSING (~90%) → BILLING.
+	•	L2 derived this way scored 89.1%, slightly better than a dedicated L2 model (88.5%, McNemar p = 0.005).
+Results (unseen messages, 5-fold cross-validation)
+	•	L2 accuracy: 89.1%
+	•	L4 accuracy: 84.2% (a fixed L2→L4 mapping can reach at most 28.3%, even with a perfect L2)
+	•	L4 accuracy on confident predictions (63% of messages): 96.0%; the remaining 11% are flagged for review
+Statistical checks
+	•	95% bootstrap confidence interval for L4: 83.7–84.6%
+	•	McNemar's test: improvement is significant (p < 0.001)
+	•	Shuffle test: scrambling the text within each L2 drops L4 to 17.6%, so L4 comes from the words, not the L2
+	•	The text adds ~2.5 bits of information about L4 beyond L2
+	•	Calibration error 0.027: confidence matches real accuracy
+

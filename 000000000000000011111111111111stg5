@@ -1,0 +1,306 @@
+# %%
+import argparse
+import time
+import warnings
+from pathlib import Path
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from scipy.sparse import csr_matrix, hstack
+from scipy.stats import binomtest
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.cluster import MiniBatchKMeans
+from sklearn.decomposition import TruncatedSVD
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import f1_score, precision_recall_fscore_support
+from sklearn.model_selection import StratifiedKFold
+from sklearn.svm import LinearSVC
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--stage1", default=r"C:\Datascience\nora_l2l4\stage1_profile")
+parser.add_argument("--stage2", default=r"C:\Datascience\nora_l2l4\stage2_taxonomy")
+parser.add_argument("--stage3", default=r"C:\Datascience\nora_l2l4\stage3_weak_labels")
+parser.add_argument("--stage4", default=r"C:\Datascience\nora_l2l4\stage4_model")
+parser.add_argument("--outdir", default=r"C:\Datascience\nora_l2l4\stage5_final")
+parser.add_argument("--folds", type=int, default=5)
+parser.add_argument("--bootstrap", type=int, default=1000)
+parser.add_argument("--audit-samples", type=int, default=15)
+parser.add_argument("--seed", type=int, default=0)
+args, _ = parser.parse_known_args()
+warnings.filterwarnings("ignore")
+
+stage1, stage2, stage3, stage4, outdir = map(Path, (args.stage1, args.stage2, args.stage3, args.stage4, args.outdir))
+outdir.mkdir(parents=True, exist_ok=True)
+rng = np.random.default_rng(args.seed)
+t0 = time.time()
+
+
+def tick(msg):
+    print(f"[{time.time() - t0:6.0f}s] {msg}")
+
+
+# %%
+df = pd.read_csv(stage1 / "stage1_clean.csv", keep_default_na=False)
+roles = pd.read_csv(stage1 / "column_roles.csv").set_index("role")["column"]
+text_col, l1_col = roles["text"], roles["l1"]
+df["is_template"] = df["is_template"].astype(str).str.lower().eq("true")
+df["text_clean"] = df["text_clean"].astype(str)
+
+taxonomy = pd.read_csv(stage2 / "taxonomy.csv", keep_default_na=False)
+l4_parent = dict(zip(taxonomy["Intent-L4"], taxonomy["Intent-L2"]))
+template_labels = pd.read_csv(stage2 / "stage2_template_labels.csv", keep_default_na=False)
+weak = pd.read_csv(stage3 / "stage3_weak_labels.csv", keep_default_na=False)
+ticket_map = pd.read_csv(stage3 / "ticket_name_map.csv", keep_default_na=False)
+to_ticket = dict(zip(ticket_map["Intent-L4"], ticket_map["Intent-L4_under_TICKET"]))
+pred4 = pd.read_csv(stage4 / "stage4_predictions.csv", keep_default_na=False)
+tick(f"rows {len(df):,}  real {(~df['is_template']).sum():,}  template {df['is_template'].sum():,}  stage 4 predictions {len(pred4):,}")
+
+# %%
+tmpl = df.loc[df["is_template"], ["row_id", l1_col]].merge(template_labels[["row_id", "Intent-L2", "Intent-L4"]], on="row_id", how="left")
+tmpl["Intent-L4"] = [to_ticket.get(l4, l4) if l1 == "TICKET" else l4 for l4, l1 in zip(tmpl["Intent-L4"], tmpl[l1_col])]
+real = pred4[["row_id", "Intent-L2", "Intent-L4"]]
+labels = pd.concat([tmpl[["row_id", "Intent-L2", "Intent-L4"]], real], ignore_index=True)
+final = df[["row_id", text_col, l1_col]].merge(labels, on="row_id", how="left").sort_values("row_id")
+assert len(final) == len(df) and final["row_id"].is_unique
+assert (final[l1_col].values == df.sort_values("row_id")[l1_col].values).all()
+missing = final["Intent-L4"].eq("") | final["Intent-L4"].isna()
+tick(f"final table: {len(final):,} rows, L2/L4 missing on {int(missing.sum())}, Intent-L1 identical to input: True")
+
+# %%
+lab = df[~df["is_template"]].merge(weak[["row_id", "Intent-L4", "label_model_confidence"]], on="row_id")
+lab = lab[lab["Intent-L4"] != ""].reset_index(drop=True)
+lab["Intent-L2"] = lab["Intent-L4"].map(l4_parent)
+classes = np.array(sorted(lab["Intent-L4"].unique()))
+cidx = {c: i for i, c in enumerate(classes)}
+y4 = lab["Intent-L4"].map(cidx).to_numpy()
+l2_names = np.array(sorted(lab["Intent-L2"].unique()))
+y2 = lab["Intent-L2"].map({c: i for i, c in enumerate(l2_names)}).to_numpy()
+parent_idx = np.array([np.flatnonzero(l2_names == l4_parent[c])[0] for c in classes])
+w = lab["label_model_confidence"].astype(float).to_numpy()
+tick(f"evaluation set: {len(lab):,} real notes with stage 3 labels, {len(classes)} L4, {len(l2_names)} L2")
+
+l1_values = sorted(df[l1_col].unique())
+l1_onehot = csr_matrix(np.eye(len(l1_values))[[l1_values.index(v) for v in lab[l1_col]]])
+all_text = df.loc[~df["is_template"], "text_clean"]
+word_vec = TfidfVectorizer(ngram_range=(1, 2), min_df=2, max_df=0.5, sublinear_tf=True, max_features=60_000).fit(all_text)
+char_vec = TfidfVectorizer(analyzer="char_wb", ngram_range=(2, 5), min_df=3, sublinear_tf=True, max_features=120_000).fit(all_text)
+X_word = word_vec.transform(lab["text_clean"])
+X_ours = hstack([X_word, char_vec.transform(lab["text_clean"]), l1_onehot]).tocsr()
+
+# %%
+counts = np.bincount(y4, minlength=len(classes))
+strata = np.where(counts[y4] < args.folds, -1, y4)
+folds = list(StratifiedKFold(n_splits=args.folds, shuffle=True, random_state=args.seed).split(X_ours, strata))
+p_ours = np.zeros((len(lab), len(classes)))
+pred_b2 = np.zeros(len(lab), dtype=int)
+pred_b4 = np.zeros(len(lab), dtype=int)
+pred_map_true = np.zeros(len(lab), dtype=int)
+p_map_true = np.zeros(len(lab))
+pred_shuffle = np.zeros(len(lab), dtype=int)
+fold_rows = []
+
+for f, (tr, te) in enumerate(folds, 1):
+    ours = LogisticRegression(max_iter=400, C=8.0).fit(X_ours[tr], y4[tr], sample_weight=w[tr])
+    p = np.full((len(te), len(classes)), 1e-9)
+    p[:, ours.classes_] = ours.predict_proba(X_ours[te])
+    p_ours[te] = p / p.sum(1, keepdims=True)
+
+    base = CalibratedClassifierCV(LinearSVC(C=1.0), cv=3).fit(X_word[tr], y2[tr])
+    pred_b2[te] = base.classes_[base.predict_proba(X_word[te]).argmax(1)]
+    l4_counts = pd.crosstab(y2[tr], y4[tr])
+    majority_l4 = l4_counts.idxmax(axis=1).to_dict()
+    pred_b4[te] = [majority_l4[k] for k in pred_b2[te]]
+    pred_map_true[te] = [majority_l4[k] for k in y2[te]]
+    cond = (l4_counts + 0.5).div((l4_counts + 0.5).sum(1), axis=0)
+    p_map_true[te] = [cond.at[a, b] if b in cond.columns else 1e-6 for a, b in zip(y2[te], y4[te])]
+
+    perm = np.empty(len(te), dtype=int)
+    for k in np.unique(y2[te]):
+        pos = np.flatnonzero(y2[te] == k)
+        perm[pos] = te[rng.permutation(pos)] if len(pos) > 1 else te[pos]
+    ps = np.full((len(te), len(classes)), 1e-9)
+    ps[:, ours.classes_] = ours.predict_proba(X_ours[perm])
+    pred_shuffle[te] = ps.argmax(1)
+
+    o4 = p_ours[te].argmax(1)
+    fold_rows.append({"fold": f, "heldout_notes": len(te),
+                      "proposed_L2_accuracy": np.mean(parent_idx[o4] == y2[te]), "proposed_L4_accuracy": np.mean(o4 == y4[te]),
+                      "baseline_L2_accuracy": np.mean(pred_b2[te] == y2[te]), "baseline_L4_accuracy": np.mean(pred_b4[te] == y4[te])})
+    tick(f"fold {f}/{len(folds)}: proposed L4 {fold_rows[-1]['proposed_L4_accuracy']:.3f}  baseline L4 {fold_rows[-1]['baseline_L4_accuracy']:.3f}")
+
+fold_table = pd.DataFrame(fold_rows)
+print(fold_table.round(4).to_string(index=False))
+
+# %%
+o4 = p_ours.argmax(1)
+o2 = parent_idx[o4]
+
+
+def boot_ci(correct):
+    idx = rng.integers(0, len(correct), size=(args.bootstrap, len(correct)))
+    m = correct[idx].mean(1)
+    return np.percentile(m, 2.5), np.percentile(m, 97.5)
+
+
+def mcnemar(a, b):
+    n01, n10 = int((~a & b).sum()), int((a & ~b).sum())
+    return n01, n10, (binomtest(n01, n01 + n10, 0.5).pvalue if n01 + n10 else 1.0)
+
+
+rows = []
+for name, pl2, pl4 in [("proposed", o2, o4), ("baseline_tfidf_svc_l2_then_l4_mapping", pred_b2, pred_b4)]:
+    c2, c4 = pl2 == y2, pl4 == y4
+    lo2, hi2 = boot_ci(c2)
+    lo4, hi4 = boot_ci(c4)
+    rows.append({"method": name, "L2_accuracy": c2.mean(), "L2_ci_low": lo2, "L2_ci_high": hi2,
+                 "L2_macro_F1": f1_score(y2, pl2, average="macro"), "L4_accuracy": c4.mean(), "L4_ci_low": lo4, "L4_ci_high": hi4,
+                 "L4_macro_F1": f1_score(y4, pl4, average="macro", labels=np.unique(y4)), "distinct_L4_predicted": len(np.unique(pl4))})
+head = pd.DataFrame(rows)
+mc = pd.DataFrame([dict(zip(["level", "proposed_only_correct", "baseline_only_correct", "p_value"], ["L2", *mcnemar(pred_b2 == y2, o2 == y2)])),
+                   dict(zip(["level", "proposed_only_correct", "baseline_only_correct", "p_value"], ["L4", *mcnemar(pred_b4 == y4, o4 == y4)]))])
+print("\nhead to head on identical held-out folds:")
+print(head.round(4).to_string(index=False))
+print(mc.to_string(index=False))
+
+# %%
+svd = TruncatedSVD(n_components=100, random_state=args.seed).fit_transform(X_word)
+km = MiniBatchKMeans(n_clusters=len(l2_names), random_state=args.seed, n_init=5).fit_predict(svd)
+purity = pd.crosstab(km, y2).max(1).sum() / len(y2)
+tick(f"k-means ({len(l2_names)} clusters) purity against L2: {purity:.3f}")
+
+# %%
+log2 = np.log2
+within = np.zeros(len(lab))
+for i in range(len(lab)):
+    m = parent_idx == y2[i]
+    within[i] = p_ours[i, y4[i]] / max(p_ours[i, m].sum(), 1e-12)
+ce_map = -np.mean(log2(np.clip(p_map_true, 1e-12, None)))
+ce_text = -np.mean(log2(np.clip(within, 1e-12, None)))
+anti = pd.DataFrame([
+    {"test": "L4 accuracy, proposed (text)", "value": np.mean(o4 == y4)},
+    {"test": "L4 accuracy, mapping from TRUE L2 (best possible mapping)", "value": np.mean(pred_map_true == y4)},
+    {"test": "L4 accuracy, mapping from predicted L2 (baseline)", "value": np.mean(pred_b4 == y4)},
+    {"test": "L4 accuracy, proposed with text shuffled within L2", "value": np.mean(pred_shuffle == y4)},
+    {"test": "uncertainty about L4 given L2 only (bits)", "value": ce_map},
+    {"test": "uncertainty about L4 given L2 and text (bits)", "value": ce_text},
+    {"test": "information the text adds about L4 beyond L2 (bits)", "value": ce_map - ce_text},
+])
+print("\nanti-mapping tests:")
+print(anti.round(4).to_string(index=False))
+
+spread = []
+for k, l2 in enumerate(l2_names):
+    m = y2 == k
+    pc = pd.Series(o4[m]).value_counts(normalize=True)
+    ent = -(pc * np.log2(pc)).sum()
+    spread.append({"Intent-L2": l2, "heldout_notes": int(m.sum()), "L4_used_proposed": len(pc), "L4_used_mapping": 1,
+                   "L4_entropy_bits_proposed": ent, "L4_entropy_bits_mapping": 0.0})
+spread = pd.DataFrame(spread)
+
+# %%
+prec, rec, f1, sup = precision_recall_fscore_support(y4, o4, labels=np.arange(len(classes)), zero_division=0)
+per_l4 = pd.DataFrame({"Intent-L2": [l4_parent[c] for c in classes], "Intent-L4": classes, "heldout_notes": sup,
+                       "precision": prec, "recall": rec, "F1": f1}).sort_values(["Intent-L2", "Intent-L4"])
+conf = pd.DataFrame({"true_Intent-L4": classes[y4], "predicted_Intent-L4": classes[o4]})
+conf = conf[conf["true_Intent-L4"] != conf["predicted_Intent-L4"]].value_counts().rename("notes").reset_index().head(25)
+
+# %%
+s3 = weak.loc[weak["Intent-L4"] != "", "Intent-L4"].value_counts().rename("stage3_notes")
+s4 = pred4["Intent-L4"].value_counts().rename("final_notes")
+expected = len(pred4) / max(s3.sum(), 1)
+new = pred4[pred4["stage3_Intent-L4"] == ""]
+growth = pd.concat([s3, s4], axis=1).fillna(0).astype(int)
+growth["growth_ratio"] = (growth["final_notes"] / growth["stage3_notes"].replace(0, np.nan)).round(2)
+growth["expected_ratio"] = round(expected, 2)
+growth["new_notes"] = new["Intent-L4"].value_counts().reindex(growth.index).fillna(0).astype(int)
+growth["new_notes_mean_confidence"] = new.groupby("Intent-L4")["confidence"].mean().reindex(growth.index).round(3)
+growth["new_notes_needs_review"] = new.groupby("Intent-L4")["needs_review"].apply(lambda s: s.astype(str).str.lower().eq("true").mean()).reindex(growth.index).round(3)
+growth = growth.rename_axis("Intent-L4").reset_index()
+growth.insert(0, "Intent-L2", growth["Intent-L4"].map(l4_parent))
+flagged = growth[(growth["growth_ratio"] > 2 * expected) & (growth["final_notes"] >= 100)].sort_values("final_notes", ascending=False)
+samples = pd.concat([new[new["Intent-L4"] == l4].sample(min(args.audit_samples, (new["Intent-L4"] == l4).sum()), random_state=args.seed)
+                     [[text_col, l1_col, "Intent-L4", "confidence"]] for l4 in flagged["Intent-L4"]], ignore_index=True) if len(flagged) else pd.DataFrame()
+print(f"\ngrowth audit: expected growth {expected:.2f}x; L4 growing more than twice that: {len(flagged)}")
+print(flagged[["Intent-L2", "Intent-L4", "stage3_notes", "final_notes", "growth_ratio", "new_notes_mean_confidence"]].to_string(index=False))
+
+# %%
+cov = pd.read_csv(stage4 / "accuracy_vs_coverage.csv")
+comp4 = pd.read_csv(stage4 / "model_comparison.csv")
+by_l2 = pd.read_csv(stage4 / "heldout_accuracy_by_l2.csv")
+ens = comp4[comp4["model"] == "ensemble_calibrated"].iloc[0]
+hi = cov[cov["min_confidence"].round(2) == 0.9].iloc[0]
+needs = pred4["needs_review"].astype(str).str.lower().eq("true").mean()
+summary = pd.DataFrame([
+    ("rows in output", len(final)), ("real agent notes", len(pred4)), ("template rows", int(df["is_template"].sum())),
+    ("ensemble held-out L2 accuracy", ens["L2_accuracy"]), ("ensemble held-out L4 accuracy", ens["L4_accuracy"]),
+    ("ensemble held-out L4 top-3 accuracy", ens["L4_top3"]), ("ensemble calibration error (ECE)", ens["ECE"]),
+    ("held-out L4 accuracy at confidence >= 0.9", hi["heldout_L4_accuracy"]), ("share of notes at confidence >= 0.9", hi["share_of_notes"]),
+    ("share of notes flagged needs_review", needs), ("GENERAL_SUPPORT share of real notes", (pred4["Intent-L2"] == "GENERAL_SUPPORT").mean()),
+    ("distinct L4 in output", final["Intent-L4"].nunique()), ("distinct L2 in output", final["Intent-L2"].nunique()),
+    ("baseline (TF-IDF SVC + mapping) L4 accuracy, same folds", head.iloc[1]["L4_accuracy"]),
+    ("proposed L4 accuracy, same folds", head.iloc[0]["L4_accuracy"]), ("McNemar p-value L4", mc.iloc[1]["p_value"]),
+    ("information text adds about L4 beyond L2 (bits)", ce_map - ce_text), ("k-means purity against L2", purity),
+], columns=["metric", "value"])
+print("\n" + summary.assign(value=summary["value"].map(lambda v: f"{v:,.0f}" if float(v).is_integer() and abs(v) >= 1 else f"{v:.4g}")).to_string(index=False))
+
+# %%
+final_path = outdir / "nora_l2l4_final.xlsx"
+out = final[[text_col, l1_col, "Intent-L2", "Intent-L4"]]
+with pd.ExcelWriter(final_path, engine="openpyxl") as xw:
+    out.to_excel(xw, sheet_name="Intent", index=False)
+    ws = xw.sheets["Intent"]
+    ws.freeze_panes = "A2"
+    for col, width in zip("ABCD", (90, 24, 20, 36)):
+        ws.column_dimensions[col].width = width
+tick(f"final Excel: {final_path.name}  ({len(out):,} rows, columns {list(out.columns)})")
+
+val_path = outdir / "nora_l2l4_validation.xlsx"
+with pd.ExcelWriter(val_path, engine="openpyxl") as xw:
+    for name, frame in [("Summary", summary), ("Folds", fold_table), ("Head_to_head", head), ("McNemar", mc), ("Anti_mapping", anti),
+                        ("L4_spread_by_L2", spread), ("Stage4_models", comp4), ("Accuracy_vs_coverage", cov), ("Accuracy_by_L2", by_l2),
+                        ("Per_L4", per_l4), ("Top_confusions", conf), ("Growth_audit", growth), ("Growth_samples", samples)]:
+        frame.to_excel(xw, sheet_name=name, index=False)
+tick(f"validation workbook: {val_path.name}")
+
+# %%
+fig, ax = plt.subplots(figsize=(7, 4.5))
+ax.plot(cov["share_of_notes"] * 100, cov["heldout_L4_accuracy"] * 100, marker="o", color="#2a6f97")
+for _, r in cov.iloc[::2].iterrows():
+    ax.annotate(f"≥{r['min_confidence']:.1f}", (r["share_of_notes"] * 100, r["heldout_L4_accuracy"] * 100), textcoords="offset points", xytext=(4, -10), fontsize=8)
+ax.set_xlabel("Share of real notes labelled (%)")
+ax.set_ylabel("Held-out L4 accuracy (%)")
+ax.set_title("Accuracy vs coverage")
+ax.invert_xaxis()
+ax.grid(alpha=0.3)
+fig.tight_layout()
+fig.savefig(outdir / "accuracy_vs_coverage.png", dpi=150)
+
+fig, ax = plt.subplots(figsize=(7, 4.5))
+x = np.arange(2)
+ax.bar(x - 0.18, head["L2_accuracy"] * 100, 0.36, label="L2", color="#7aa6c2")
+ax.bar(x + 0.18, head["L4_accuracy"] * 100, 0.36, label="L4", color="#2a6f97")
+ax.set_xticks(x, ["Proposed", "Baseline\n(TF-IDF SVC + L2→L4 map)"])
+ax.set_ylabel("Held-out accuracy (%)")
+ax.set_title("Same notes, same folds")
+ax.legend()
+ax.grid(axis="y", alpha=0.3)
+fig.tight_layout()
+fig.savefig(outdir / "head_to_head.png", dpi=150)
+
+fig, ax = plt.subplots(figsize=(7, 4.5))
+l2_share = pred4["Intent-L2"].value_counts(normalize=True).sort_values() * 100
+ax.barh(l2_share.index, l2_share.values, color="#2a6f97")
+ax.set_xlabel("Share of real notes (%)")
+ax.set_title("Final L2 distribution")
+ax.grid(axis="x", alpha=0.3)
+fig.tight_layout()
+fig.savefig(outdir / "l2_distribution.png", dpi=150)
+plt.close("all")
+
+print(f"\nwritten to {outdir}")
+for f in sorted(outdir.iterdir()):
+    print(f"  {f.name}")

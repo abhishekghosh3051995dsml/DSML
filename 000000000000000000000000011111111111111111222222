@@ -1,0 +1,171 @@
+# %%
+import argparse
+import io
+from contextlib import redirect_stdout
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--input", default=r"C:\Datascience\nora_l2l4\stage5_final\nora_l2l4_final.xlsx")
+parser.add_argument("--outdir", default=r"C:\Datascience\nora_l2l4\stage7_report")
+parser.add_argument("--rare", type=int, default=5)
+parser.add_argument("--top", type=int, default=30)
+args, _ = parser.parse_known_args()
+
+src = Path(args.input)
+outdir = Path(args.outdir)
+outdir.mkdir(parents=True, exist_ok=True)
+df = pd.read_excel(src, dtype=str, keep_default_na=False) if src.suffix.lower() in (".xlsx", ".xls") else \
+    pd.read_csv(src, dtype=str, keep_default_na=False)
+
+text_col = df.columns[df.apply(lambda s: s.str.len().mean()).argmax()]
+label_cols = [c for c in df.columns if c != text_col and c.lower().startswith("intent")]
+l1, l2, l4 = (sorted(label_cols) + [None] * 3)[:3]
+tables = {}
+checks = []
+
+
+def section(title):
+    print("\n" + "=" * 80 + f"\n{title}\n" + "=" * 80)
+
+
+def check(name, ok, detail):
+    checks.append({"check": name, "status": "PASS" if ok else "WARN", "detail": detail})
+
+
+buf = io.StringIO()
+with redirect_stdout(buf):
+    # %%
+    section("LOADING DATASET")
+    print(f"File    : {src.name}")
+    print(f"Rows    : {len(df):,}")
+    print(f"Columns : {len(df.columns)}")
+    print("Columns found:\n" + "\n".join(f"  - {c}" for c in df.columns))
+
+    # %%
+    section("MISSING VALUE ANALYSIS")
+    missing = df.apply(lambda s: s.str.strip().eq("").sum())
+    tables["Missing"] = pd.DataFrame({"column": missing.index, "missing": missing.values, "percent": (missing.values / len(df) * 100).round(2)})
+    for c, m in missing.items():
+        print(f"  {c:<20} {m:>8,} ({m / len(df):.2%})")
+    check("No missing values", missing.sum() == 0, f"{int(missing.sum())} blank cells")
+
+    # %%
+    section("DUPLICATE ANALYSIS")
+    dup_text = df[text_col].duplicated().sum()
+    dup_row = df.duplicated().sum()
+    print(f"Unique messages            : {df[text_col].nunique():,}")
+    print(f"Duplicate messages (text)  : {dup_text:,} ({dup_text / len(df):.2%})")
+    print(f"Duplicate rows (all cols)  : {dup_row:,}")
+    top_rep = df[text_col].value_counts().head(20)
+    print("\nTop 20 repeated messages:")
+    print(top_rep.to_string())
+    tables["Top_repeated"] = top_rep.rename_axis("message").reset_index(name="count")
+    check("Duplicate rate below 5%", dup_text / len(df) < 0.05, f"{dup_text / len(df):.2%} duplicate messages")
+
+    # %%
+    section("LABEL CONFLICT ANALYSIS")
+    conflict = df.groupby(text_col)[label_cols].nunique().max(axis=1)
+    n_conflict = int((conflict > 1).sum())
+    print(f"Identical messages with different labels: {n_conflict:,}")
+    if n_conflict:
+        tables["Conflicts"] = df[df[text_col].isin(conflict[conflict > 1].index)].sort_values(text_col)
+    check("No label conflicts", n_conflict == 0, f"{n_conflict} conflicting messages")
+
+    # %%
+    section("TEXT QUALITY")
+    words = df[text_col].str.split().str.len().fillna(0)
+    chars = df[text_col].str.len()
+    print(f"Average words : {words.mean():.2f}")
+    print(f"Median words  : {words.median():.2f}")
+    print(f"Min / max     : {int(words.min())} / {int(words.max())}")
+    print(f"Percentiles   : 5% {words.quantile(.05):.0f} | 25% {words.quantile(.25):.0f} | 75% {words.quantile(.75):.0f} | 95% {words.quantile(.95):.0f}")
+    print(f"Messages <= 2 words : {(words <= 2).sum():,} ({(words <= 2).mean():.2%})")
+    print(f"Messages > 200 words: {(words > 200).sum():,} ({(words > 200).mean():.2%})")
+    print(f"Average characters  : {chars.mean():.1f}")
+    check("Very short messages below 1%", (words <= 2).mean() < 0.01, f"{(words <= 2).mean():.2%} have <= 2 words")
+
+    # %%
+    for col in [c for c in (l1, l2) if c]:
+        section(f"{col} DISTRIBUTION")
+        vc = df[col].value_counts()
+        out = pd.DataFrame({col: vc.index, "count": vc.values, "percent": (vc.values / len(df) * 100).round(2)})
+        print(out.to_string(index=False))
+        print(f"Classes: {len(vc)}   largest/smallest ratio: {vc.max() / vc.min():.1f}x")
+        tables[f"{col}_dist"] = out
+
+    # %%
+    if l4:
+        section(f"TOP {args.top} {l4}")
+        vc4 = df[l4].value_counts()
+        top4 = df.groupby([l2, l4]).size().sort_values(ascending=False).head(args.top) if l2 else vc4.head(args.top)
+        print(top4.to_string())
+        tables[f"{l4}_dist"] = (df.groupby([l2, l4]).size().rename("count").reset_index().sort_values("count", ascending=False)
+                                if l2 else vc4.rename_axis(l4).reset_index(name="count"))
+
+        # %%
+        section("RARE CLASS ANALYSIS")
+        print(f"{l4} classes             : {len(vc4)}")
+        print(f"Classes < {args.rare} samples      : {(vc4 < args.rare).sum()}")
+        print(f"Classes < {2 * args.rare} samples     : {(vc4 < 2 * args.rare).sum()}")
+        print(f"Largest / smallest ratio : {vc4.max() / vc4.min():.0f}x")
+        print("\nSmallest 25 classes:")
+        print(vc4.sort_values().head(25).to_string())
+        check(f"No {l4} class below {args.rare} samples", (vc4 < args.rare).sum() == 0, f"{(vc4 < args.rare).sum()} rare classes")
+
+    # %%
+    if l2 and l4:
+        section("HIERARCHY ANALYSIS")
+        parents = df.groupby(l4)[l2].nunique()
+        bad = parents[parents > 1]
+        print(f"Unique L1-L2-L4 paths    : {df.groupby([l1, l2, l4]).ngroups:,}" if l1 else "")
+        print(f"Unique L2-L4 pairs       : {df.groupby([l2, l4]).ngroups:,}")
+        print(f"L4 under more than one L2: {len(bad)}")
+        per_l2 = df.groupby(l2)[l4].nunique().sort_values(ascending=False)
+        print("\nDistinct L4 per L2:")
+        print(per_l2.to_string())
+        tables["L4_per_L2"] = per_l2.rename("distinct_L4").reset_index()
+        check("Every L4 has exactly one L2", len(bad) == 0, f"{len(bad)} L4 with multiple parents")
+
+    # %%
+    if l1 and l2:
+        section("L1 -> L2 RELATIONSHIP")
+        ct = pd.crosstab(df[l2], df[l1], margins=True)
+        print(ct.to_string())
+        print("\nDistinct L2 per L1:")
+        print(df.groupby(l1)[l2].nunique().to_string())
+        tables["L1_x_L2"] = ct.reset_index()
+
+    # %%
+    for col, title in (("Source", "SOURCE (REAL vs TEMPLATE)"), ("Split", "TRAIN / TEST SPLIT")):
+        if col in df.columns:
+            section(title)
+            print(df[col].value_counts().to_string())
+    if "Split" in df.columns:
+        tr, te = df[df["Split"] == "train"], df[df["Split"] == "test"]
+        leak = len(set(tr[text_col]) & set(te[text_col]))
+        unseen = sorted(set(te[l4]) - set(tr[l4])) if l4 else []
+        print(f"\nMessages in both train and test : {leak}")
+        print(f"Test L4 classes never seen in train: {len(unseen)}")
+        if "Source" in df.columns:
+            print(f"Test rows that are templates      : {(te['Source'] == 'template').sum()}")
+        check("No train/test leakage", leak == 0, f"{leak} shared messages")
+        check("Every test class appears in train", not unseen, f"{len(unseen)} unseen classes")
+
+    # %%
+    section("QUALITY CHECKS")
+    chk = pd.DataFrame(checks)
+    print(chk.to_string(index=False))
+    print(f"\nPassed {(chk['status'] == 'PASS').sum()} of {len(chk)} checks")
+    tables["Checks"] = chk
+
+report = buf.getvalue()
+print(report)
+stem = src.stem
+(outdir / f"{stem}_report.txt").write_text(report, encoding="utf-8")
+with pd.ExcelWriter(outdir / f"{stem}_report.xlsx", engine="openpyxl") as xw:
+    for name, t in tables.items():
+        t.to_excel(xw, sheet_name=name[:31], index=False)
+print(f"written: {outdir / (stem + '_report.txt')}\nwritten: {outdir / (stem + '_report.xlsx')}")

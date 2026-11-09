@@ -1,0 +1,1091 @@
+{
+ "catch_all_l2": "GENERAL_SUPPORT",
+ "name_stop_words": [
+  "ticket"
+ ],
+ "taxonomy": {
+  "ACCOUNT": [
+   "ACCOUNT_ACCESS",
+   "ACCOUNT_ACCESS_RECOVERY",
+   "ACCOUNT_ACCESS_TICKET",
+   "ACCOUNT_MERGE",
+   "ACCOUNT_PROFILE_UPDATE",
+   "ACCOUNT_SECURITY_VERIFICATION",
+   "ACCOUNT_STATUS",
+   "ACCOUNT_TRANSFER",
+   "ACCOUNT_VERIFICATION",
+   "AUTHENTICATION_FAILURE",
+   "AUTHENTICATION_TICKET",
+   "LOGIN_STATUS",
+   "PASSWORD_RESET",
+   "PIN_RESET",
+   "PROFILE_INFORMATION",
+   "PROFILE_UPDATE",
+   "PROFILE_UPDATE_ISSUE",
+   "ACCOUNT_TYPE",
+   "ACCOUNT_HOLDER_REQUEST"
+  ],
+  "APPLICATION": [
+   "API_INTEGRATION_ISSUE",
+   "APPLICATION_DEFECT_TICKET",
+   "APP_FEATURE_INFORMATION",
+   "APP_NOTIFICATION_SETTINGS",
+   "APP_SETTINGS_CHANGE",
+   "APP_VERSION_INFORMATION",
+   "INTEGRATION_TICKET",
+   "MOBILE_APP_FUNCTION",
+   "MOBILE_APP_INSTALLATION",
+   "MOBILE_APP_LOGIN",
+   "MOBILE_APP_PERFORMANCE",
+   "MOBILE_APP_SYNC_ISSUE",
+   "MOBILE_APP_TICKET",
+   "NOTIFICATION_CONFIGURATION",
+   "USER_PREFERENCE_CHANGE"
+  ],
+  "BILLING": [
+   "AUTOPAY_MANAGEMENT",
+   "AUTOPAY_STATUS",
+   "BILLING_ADDRESS_UPDATE",
+   "BILLING_DISPUTE",
+   "BILLING_PREFERENCE_CHANGE",
+   "BILL_EXPLANATION",
+   "CREDIT_ADJUSTMENT",
+   "CURRENT_BALANCE",
+   "INVOICE_ISSUE",
+   "INVOICE_REQUEST",
+   "PAYMENT_FAILURE",
+   "PAYMENT_METHOD_UPDATE",
+   "PAYMENT_PROCESSING",
+   "PAYMENT_STATUS",
+   "UNEXPECTED_CHARGE"
+  ],
+  "CALL_HANDLING": [
+   "AGENT_ESCALATION",
+   "AGENT_REASSIGNMENT",
+   "CALL_FORWARDING_CONFIGURATION",
+   "CALL_TRANSFER_REQUEST",
+   "INCOMING_CALL_FAILURE",
+   "MISROUTED_CALL",
+   "OUTGOING_CALL_FAILURE",
+   "QUEUE_REROUTE",
+   "SKILL_GROUP_TRANSFER",
+   "TRANSFER_REQUEST",
+   "VOICEMAIL_CONFIGURATION"
+  ],
+  "DEVICE": [
+   "DEVICE_COMPATIBILITY",
+   "DEVICE_CONFIGURATION",
+   "DEVICE_CONFIGURATION_TICKET",
+   "DEVICE_LOCK",
+   "DEVICE_PERFORMANCE",
+   "DEVICE_REPAIR_TICKET",
+   "DEVICE_REPLACEMENT",
+   "DEVICE_REPLACEMENT_TICKET",
+   "DEVICE_SETUP",
+   "DEVICE_STATUS",
+   "DEVICE_SWAP",
+   "DEVICE_UNLOCK",
+   "DEVICE_UPGRADE",
+   "ESIM_CONVERSION",
+   "ESIM_ISSUE",
+   "FIRMWARE_ISSUE",
+   "SIM_DETECTION_ISSUE",
+   "UNLOCK_ELIGIBILITY",
+   "WARRANTY_STATUS",
+   "DEVICE_HARDWARE_ISSUE"
+  ],
+  "GENERAL_SUPPORT": [
+   "CASE_FOLLOWUP",
+   "CUSTOMER_PREFERENCE_UPDATE",
+   "ESCALATION_FOLLOWUP",
+   "GENERAL_INQUIRY",
+   "GENERAL_SUPPORT",
+   "POLICY_QUESTION",
+   "PROCESS_GUIDANCE",
+   "PROCESS_QUESTION",
+   "SERVICE_REQUEST",
+   "SERVICE_REQUEST_FOLLOWUP",
+   "UNSUPPORTED_REQUEST"
+  ],
+  "INTERNET": [
+   "BANDWIDTH_UPGRADE",
+   "BROADBAND_OUTAGE",
+   "BUSINESS_INTERNET_CONFIGURATION",
+   "BUSINESS_INTERNET_NO_CONNECTIVITY",
+   "BUSINESS_INTERNET_SLOW_SPEED",
+   "DATA_BALANCE",
+   "DATA_PLAN_CHANGE",
+   "DATA_USAGE",
+   "DNS_ISSUE",
+   "GATEWAY_FIRMWARE_UPDATE",
+   "GATEWAY_OFFLINE",
+   "GATEWAY_SETUP",
+   "HOME_INTERNET_NO_CONNECTIVITY",
+   "HOME_INTERNET_SLOW_SPEED",
+   "HOME_WIFI_CONFIGURATION",
+   "INTERNET",
+   "INTERNET_CONNECTIVITY",
+   "INTERNET_CONNECTIVITY_TICKET",
+   "INTERNET_FEATURE_CHANGE",
+   "INTERNET_SLOW_SPEED",
+   "INTERNET_STATUS",
+   "LATENCY_ISSUE",
+   "LATENCY_TICKET",
+   "PACKET_LOSS",
+   "SLOW_INTERNET_TICKET",
+   "SPEED_INFORMATION",
+   "VPN_CONNECTIVITY",
+   "WIRELINE_DATA_ISSUE"
+  ],
+  "NETWORK": [
+   "COVERAGE_INQUIRY",
+   "COVERAGE_OPTIMIZATION",
+   "DATA_ISSUE_TICKET",
+   "DROPPED_CALLS",
+   "INTERMITTENT_SERVICE",
+   "INTERNATIONAL_ROAMING_ENABLEMENT",
+   "MOBILE_DATA_NO_CONNECTIVITY",
+   "MOBILE_DATA_SLOW_SPEED",
+   "NETWORK_CONGESTION",
+   "NETWORK_COVERAGE",
+   "NETWORK_COVERAGE_TICKET",
+   "NETWORK_FEATURE_CHANGE",
+   "NO_SIGNAL_REGISTRATION",
+   "NO_SIGNAL_TICKET",
+   "OUTAGE_STATUS",
+   "ROAMING_DATA_PASS",
+   "ROAMING_ENABLEMENT",
+   "ROAMING_ISSUE",
+   "ROAMING_STATUS",
+   "ROAMING_TICKET"
+  ],
+  "PROVISIONING": [
+   "ESIM_ACTIVATION",
+   "FEATURE_PROVISIONING",
+   "LINE_ACTIVATION",
+   "LINE_PROVISIONING",
+   "LINE_RESTORATION",
+   "LINE_SUSPENSION",
+   "NUMBER_PORTING",
+   "PLAN_PROVISIONING",
+   "SERVICE_ACTIVATION",
+   "SERVICE_DEACTIVATION",
+   "SERVICE_SUSPENSION",
+   "SIM_ACTIVATION"
+  ],
+  "MESSAGING": [
+   "SMS_SEND_FAILURE",
+   "SMS_RECEIVE_FAILURE",
+   "RCS_CHAT_FEATURES",
+   "GROUP_MESSAGING",
+   "VERIFICATION_CODE_DELIVERY",
+   "MESSAGE_HISTORY",
+   "MESSAGING_ISSUE"
+  ]
+ },
+ "pattern_parts": {
+  "<NEG>": "(?:cannot|can not|can ?t|cant|unable to|not able to|couldn ?t|could not|won ?t|wont|isn ?t|doesn ?t|not|no longer)",
+  "<NET>": "(?:internet|wifi|wi fi|hsi|broadband)",
+  "<GW>": "(?:gateway|router|inseego|cell ?spot|extender|modem|hsi device)",
+  "<DEV>": "(?:phone|device|iphone|samsung|galaxy|pixel|watch|tablet|ipad|handset|flip)",
+  "<MSG>": "(?:texts?|text messages?|messages|sms|mms|pictures? messages?|pics?)",
+  "<CARE>": "(?:business|government|govt|gov|individual|consumer|tfb|b|prepaid|metro|apple ?care|international) ?care"
+ },
+ "lexicon": {
+  "CALL_FORWARDING_CONFIGURATION": {
+   "tier": 1,
+   "match": [
+    "\\bforward",
+    "\\bfwrd",
+    "\\bfwd\\b"
+   ],
+   "exclude": []
+  },
+  "VOICEMAIL_CONFIGURATION": {
+   "tier": 1,
+   "match": [
+    "\\bvoice ?mail",
+    "\\bvm\\b"
+   ],
+   "exclude": [
+    "(?:straight|going|go|routing|routed) to .{0,30}voice ?mail"
+   ]
+  },
+  "INCOMING_CALL_FAILURE": {
+   "tier": 1,
+   "match": [
+    "<NEG> (?:\\w+ )?(?:receiv\\w*|recv|get|getting) (?:any |incoming )?calls",
+    "incoming calls? .{0,25}(?:fail|not|dead air|voice ?mail)",
+    "(?:straight|going|go|routing|routed) to .{0,30}voice ?mail",
+    "\\bno ring",
+    "dead air"
+   ],
+   "exclude": []
+  },
+  "OUTGOING_CALL_FAILURE": {
+   "tier": 1,
+   "match": [
+    "<NEG> (?:\\w+ )?(?:make|making|place|placing) (?:any |outgoing )?calls",
+    "outgoing calls? .{0,25}(?:fail|not)"
+   ],
+   "exclude": []
+  },
+  "DROPPED_CALLS": {
+   "tier": 1,
+   "match": [
+    "\\bdrop\\w* calls?",
+    "calls? (?:keep |keeps |are |would )?drop",
+    "call disconnected",
+    "calls? .{0,15}disconnect"
+   ],
+   "exclude": []
+  },
+  "NO_SIGNAL_REGISTRATION": {
+   "tier": 1,
+   "match": [
+    "\\bno (?:signal|service|bars)\\b",
+    "\\bsos\\b",
+    "emergency calls? only",
+    "not register",
+    "service unavailable",
+    "(?:not|isn ?t) (?:getting|picking up) (?:any )?(?:cell |g )?(?:service|signal)"
+   ],
+   "exclude": []
+  },
+  "NETWORK_COVERAGE": {
+   "tier": 1,
+   "match": [
+    "\\bcoverage\\b",
+    "\\bone bar\\b",
+    "(?:weak|poor|bad|low) (?:signal|reception|coverage)"
+   ],
+   "exclude": [
+    "coverage (?:info|map|check|inquir)"
+   ]
+  },
+  "COVERAGE_INQUIRY": {
+   "tier": 1,
+   "match": [
+    "coverage (?:info|map|check|inquir)",
+    "check (?:the |an |coverage )?(?:in |for |at )?area",
+    "coverage (?:at|for|in) (?:a |an |the |specific )"
+   ],
+   "exclude": []
+  },
+  "OUTAGE_STATUS": {
+   "tier": 1,
+   "match": [
+    "\\boutage"
+   ],
+   "exclude": []
+  },
+  "MOBILE_DATA_NO_CONNECTIVITY": {
+   "tier": 1,
+   "match": [
+    "\\bno (?:mobile |cellular |cell )?data\\b",
+    "\\bdata (?:is |isn ?t |not |stopped )(?:not )?working",
+    "\\bhotspot",
+    "tethering"
+   ],
+   "exclude": []
+  },
+  "MOBILE_DATA_SLOW_SPEED": {
+   "tier": 1,
+   "match": [
+    "slow (?:mobile |cellular )?data\\b",
+    "\\bdata (?:speeds? |is )(?:slow|throttl)",
+    "throttl"
+   ],
+   "exclude": [
+    "<NET>|<GW>"
+   ]
+  },
+  "ROAMING_DATA_PASS": {
+   "tier": 1,
+   "match": [
+    "\\b(?:data|travel|day|international|intl|roaming) pass",
+    "\\bpass (?:for|while)"
+   ],
+   "exclude": []
+  },
+  "ROAMING_ISSUE": {
+   "tier": 1,
+   "match": [
+    "(?:slow|no |not working|issue|problem|unable).{0,30}(?:roaming|while (?:in|travel)|abroad)",
+    "(?:roaming|abroad|traveling).{0,25}(?:slow|no |not working|issue|problem|unable)",
+    "\\bin (?:canada|mexico|china|europe|colombia|columbia|japan|india|london|france|italy|spain|thailand|aruba|auruba)\\b.{0,20}(?:no |not |unable|issue)"
+   ],
+   "exclude": []
+  },
+  "INTERNATIONAL_ROAMING_ENABLEMENT": {
+   "tier": 1,
+   "match": [
+    "\\broaming\\b",
+    "\\btravel\\w*",
+    "\\binternational\\b",
+    "\\babroad\\b"
+   ],
+   "exclude": [
+    "\\bpass\\b"
+   ]
+  },
+  "LATENCY_ISSUE": {
+   "tier": 1,
+   "match": [
+    "\\blatency",
+    "\\bping\\b",
+    "\\blag",
+    "freez\\w* while gaming"
+   ],
+   "exclude": []
+  },
+  "HOME_INTERNET_SLOW_SPEED": {
+   "tier": 1,
+   "match": [
+    "home internet.{0,30}slow",
+    "slow.{0,30}home internet"
+   ],
+   "exclude": []
+  },
+  "BUSINESS_INTERNET_SLOW_SPEED": {
+   "tier": 1,
+   "match": [
+    "(?:business|tfb) internet.{0,30}slow",
+    "slow.{0,30}(?:business|tfb) internet"
+   ],
+   "exclude": []
+  },
+  "HOME_INTERNET_NO_CONNECTIVITY": {
+   "tier": 1,
+   "match": [
+    "home internet .{0,20}(?:not working|down|no connection|out)",
+    "no home internet"
+   ],
+   "exclude": []
+  },
+  "BUSINESS_INTERNET_NO_CONNECTIVITY": {
+   "tier": 1,
+   "match": [
+    "(?:business|tfb) internet .{0,20}(?:not working|down|no connection|out)",
+    "no (?:business|tfb) internet"
+   ],
+   "exclude": []
+  },
+  "INTERNET_SLOW_SPEED": {
+   "tier": 1,
+   "match": [
+    "slow .{0,25}<NET>",
+    "<NET>.{0,25}slow",
+    "slow speeds?",
+    "<GW>.{0,30}(?:slow|speeds?|bars)",
+    "(?:slow|speeds?).{0,30}<GW>",
+    "\\b(?:hint|hsi)\\b.{0,20}slow",
+    "bars on (?:the |his |her |their )?<GW>"
+   ],
+   "exclude": []
+  },
+  "INTERNET_CONNECTIVITY": {
+   "tier": 1,
+   "match": [
+    "\\bno <NET>\\b",
+    "<NET> (?:is |was )?(?:not working|down|out|keeps? (?:dropping|disconnect))",
+    "<NEG> (?:\\w+ ){0,3}connect\\w* (?:\\w+ ){0,4}<NET>",
+    "<NET> (?:service|connection) .{0,10}(?:not|issue)",
+    "issues? with (?:their |his |her |the )?(?:\\w+ )?<NET>",
+    "not getting (?:a )?<NET>",
+    "\\bintermittent",
+    "<GW>.{0,25}(?:no|not|lost) (?:\\w+ )?connect",
+    "(?:issue|problem|trouble|unable|difficult)\\w* (?:with )?(?:\\w+ ){0,2}connect\\w* (?:\\w+ ){0,3}<GW>",
+    "<GW>.{0,30}(?:keeps? )?(?:dropping|disconnect\\w*|losing)",
+    "hard ?wired .{0,30}(?:connection|disconnect|drop)"
+   ],
+   "exclude": []
+  },
+  "INTERNET_STATUS": {
+   "tier": 1,
+   "match": [
+    "(?:verify|check|confirm|make sure)\\w* .{0,30}(?:<GW>|<NET>).{0,20}(?:online|working|back up|\\bup\\b)",
+    "<NET> .{0,20}back up"
+   ],
+   "exclude": []
+  },
+  "GATEWAY_SETUP": {
+   "tier": 1,
+   "match": [
+    "set ?(?:ting)? ?up .{0,25}<GW>",
+    "<GW>.{0,25}set ?up",
+    "activat\\w* .{0,20}(?:<GW>|hsi)",
+    "(?:new|replacement|received) (?:\\w+ )?<GW>"
+   ],
+   "exclude": []
+  },
+  "GATEWAY_OFFLINE": {
+   "tier": 1,
+   "match": [
+    "<GW>.{0,40}(?:offline|not working|blinking|flashing|red light|no power|won ?t (?:turn|power)|not (?:going|powering)|unplugged|not providing)",
+    "<GW>.{0,40}(?:no lights?|lights? (?:off|out|red|yellow|blink\\w*)|yellow|led)",
+    "(?:yellow|red|white|orange) (?:signal )?(?:led|lights?)\\b"
+   ],
+   "exclude": [
+    "(?:verify|check|confirm|make sure)"
+   ]
+  },
+  "GATEWAY_FIRMWARE_UPDATE": {
+   "tier": 1,
+   "match": [
+    "firmware"
+   ],
+   "exclude": []
+  },
+  "HOME_WIFI_CONFIGURATION": {
+   "tier": 1,
+   "match": [
+    "\\bssid",
+    "wifi (?:name|password)",
+    "(?:change|update)\\w* .{0,20}(?:wifi|network) (?:name|password)",
+    "static ip",
+    "\\bip (?:address|assignment)",
+    "dynamic ip",
+    "port forward",
+    "bridge mode",
+    "\\bprinter",
+    "\\bmesh\\b",
+    "\\bextender",
+    "ethernet"
+   ],
+   "exclude": []
+  },
+  "DATA_USAGE": {
+   "tier": 1,
+   "match": [
+    "data usage",
+    "\\busage\\b"
+   ],
+   "exclude": []
+  },
+  "VPN_CONNECTIVITY": {
+   "tier": 1,
+   "match": [
+    "\\bvpn\\b"
+   ],
+   "exclude": []
+  },
+  "DEVICE_UNLOCK": {
+   "tier": 1,
+   "match": [
+    "\\bunlock"
+   ],
+   "exclude": []
+  },
+  "DEVICE_LOCK": {
+   "tier": 1,
+   "match": [
+    "\\bimei block",
+    "blacklist",
+    "\\bblocked\\b",
+    "\\bunblock",
+    "(?:device|phone) (?:is )?locked",
+    "locked (?:device|phone)",
+    "\\blost (?:or stolen|device|phone)",
+    "\\bstolen",
+    "find my"
+   ],
+   "exclude": [
+    "locked out"
+   ]
+  },
+  "DEVICE_PERFORMANCE": {
+   "tier": 1,
+   "match": [
+    "<NEG> (?:\\w+ )?(?:power\\w*|turn\\w*) on",
+    "shuts? (?:off|down)",
+    "powered off",
+    "restart",
+    "reboot",
+    "freez",
+    "overheat",
+    "battery",
+    "<NEG> (?:\\w+ )?charg",
+    "strange nois",
+    "\\brandomly"
+   ],
+   "exclude": [
+    "<GW>"
+   ]
+  },
+  "DEVICE_CONFIGURATION": {
+   "tier": 1,
+   "match": [
+    "bluetooth",
+    "\\bpair",
+    "\\bgps\\b",
+    "\\blocation\\b",
+    "configur",
+    "factory reset",
+    "software update",
+    "update (?:the )?(?:software|os|ios|android)",
+    "(?:change|changing|adjust)\\w* (?:a |the )?settings? on (?:the |his |her |their )?<DEV>"
+   ],
+   "exclude": [
+    "forward"
+   ]
+  },
+  "DEVICE_SETUP": {
+   "tier": 1,
+   "match": [
+    "set ?(?:ting)? ?up (?:a |the |his |her |their |new )*<DEV>",
+    "transfer (?:data|contacts|photos)",
+    "data transfer"
+   ],
+   "exclude": []
+  },
+  "DEVICE_REPLACEMENT": {
+   "tier": 1,
+   "match": [
+    "\\breplac",
+    "\\bbroken",
+    "\\bcracked",
+    "insurance",
+    "\\bclaim\\b",
+    "\\bdamaged"
+   ],
+   "exclude": [
+    "(?:new|replacement|received) (?:\\w+ )?<GW>"
+   ]
+  },
+  "DEVICE_UPGRADE": {
+   "tier": 1,
+   "match": [
+    "upgrade (?:his |her |their |my |a |the )?<DEV>",
+    "(?:buy|purchase|acquir\\w*|getting) (?:a |an )?(?:new )?<DEV>",
+    "new <DEV>"
+   ],
+   "exclude": []
+  },
+  "DEVICE_COMPATIBILITY": {
+   "tier": 1,
+   "match": [
+    "compatib",
+    "\\bbyod\\b",
+    "bring (?:their|his|her) own"
+   ],
+   "exclude": []
+  },
+  "SIM_DETECTION_ISSUE": {
+   "tier": 1,
+   "match": [
+    "\\bno sim",
+    "sim (?:not|isn ?t) (?:detected|recognized|reading)",
+    "invalid sim",
+    "sim card error"
+   ],
+   "exclude": []
+  },
+  "ESIM_ISSUE": {
+   "tier": 1,
+   "match": [
+    "e ?sim.{0,30}(?:not working|error|issue|fail|problem|emergency calls)"
+   ],
+   "exclude": []
+  },
+  "ESIM_ACTIVATION": {
+   "tier": 1,
+   "match": [
+    "activat\\w* .{0,20}e ?sim",
+    "e ?sim .{0,20}activ",
+    "\\bqr code"
+   ],
+   "exclude": []
+  },
+  "SIM_ACTIVATION": {
+   "tier": 1,
+   "match": [
+    "activat\\w* .{0,20}\\bp? ?sim\\b",
+    "\\bp? ?sim\\b.{0,20}activ",
+    "(?:new|replace\\w*) p?sim",
+    "sim card"
+   ],
+   "exclude": [
+    "e ?sim"
+   ]
+  },
+  "LINE_ACTIVATION": {
+   "tier": 1,
+   "match": [
+    "\\b(?:add|adding|open|opening|new) (?:a |an )?(?:new )?(?:voice |data |tablet |watch )?line",
+    "activat\\w* (?:\\w+ ){0,2}(?:line|watch|device|phone|tablet|ipad)\\b",
+    "line for data"
+   ],
+   "exclude": [
+    "e ?sim",
+    "\\bsim\\b"
+   ]
+  },
+  "SERVICE_DEACTIVATION": {
+   "tier": 1,
+   "match": [
+    "\\bcancel",
+    "deactivat",
+    "disconnect (?:the |his |her |their )?(?:service|line|account)",
+    "close (?:the |his |her |their )?account"
+   ],
+   "exclude": []
+  },
+  "LINE_SUSPENSION": {
+   "tier": 1,
+   "match": [
+    "\\bsuspen"
+   ],
+   "exclude": []
+  },
+  "LINE_RESTORATION": {
+   "tier": 1,
+   "match": [
+    "\\brestor",
+    "reactivat\\w* (?:the |his |her |their )?line",
+    "unsuspend",
+    "reconnect"
+   ],
+   "exclude": []
+  },
+  "NUMBER_PORTING": {
+   "tier": 1,
+   "match": [
+    "\\bport(?:ing|ed| in| out)?\\b",
+    "transfer pin",
+    "numbers? (?:transferred|moved)",
+    "keep (?:his |her |their |my )?number"
+   ],
+   "exclude": []
+  },
+  "PLAN_PROVISIONING": {
+   "tier": 1,
+   "match": [
+    "(?:change|changing|switch|upgrade|downgrade)\\w* .{0,20}\\bplan",
+    "wrong plan",
+    "plan (?:change|retiring)"
+   ],
+   "exclude": []
+  },
+  "FEATURE_PROVISIONING": {
+   "tier": 1,
+   "match": [
+    "\\b(?:add|adding|remove|removing|enable|disable)\\w* .{0,25}(?:feature|\\bsoc\\b|scam|hotspot|international (?:calling|features)|wifi calling)",
+    "scam (?:block|shield)"
+   ],
+   "exclude": []
+  },
+  "SERVICE_ACTIVATION": {
+   "tier": 1,
+   "match": [
+    "activat\\w* .{0,15}(?:service|internet)",
+    "(?:new|open|start) service"
+   ],
+   "exclude": []
+  },
+  "PASSWORD_RESET": {
+   "tier": 1,
+   "match": [
+    "\\bpassword"
+   ],
+   "exclude": [
+    "wifi",
+    "ssid",
+    "network name",
+    "<GW>"
+   ]
+  },
+  "PIN_RESET": {
+   "tier": 1,
+   "match": [
+    "\\bpin\\b"
+   ],
+   "exclude": [
+    "transfer pin"
+   ]
+  },
+  "MOBILE_APP_LOGIN": {
+   "tier": 1,
+   "match": [
+    "(?:log|sign) ?in.{0,20}(?:\\bapp\\b|t ?life)",
+    "(?:\\bapp\\b|t ?life).{0,20}(?:log|sign) ?in"
+   ],
+   "exclude": []
+  },
+  "ACCOUNT_ACCESS_RECOVERY": {
+   "tier": 1,
+   "match": [
+    "locked out",
+    "account hub",
+    "(?:log|sign) ?in\\b",
+    "\\blogin",
+    "access (?:to )?(?:the |his |her |their |my )?(?:online )?account",
+    "\\brecover",
+    "\\bt ?mobile id\\b",
+    "\\btmo id\\b",
+    "\\bmagenta id\\b"
+   ],
+   "exclude": []
+  },
+  "ACCOUNT_PROFILE_UPDATE": {
+   "tier": 1,
+   "match": [
+    "(?:update|change|updating|changing)\\w* .{0,20}(?:address|email|e mail|contact)",
+    "authorized user",
+    "\\bau\\b",
+    "(?:add|remove)\\w* .{0,10}(?:users?|manager)\\b"
+   ],
+   "exclude": [
+    "(?:wifi|network|ssid) name",
+    "wrong address"
+   ]
+  },
+  "ACCOUNT_TRANSFER": {
+   "tier": 1,
+   "match": [
+    "change of responsibility",
+    "\\bcor\\b",
+    "transfer (?:of )?(?:account )?ownership",
+    "(?:transfer|move)\\w* (?:the |his |her |their )?account",
+    "account (?:was |is )?(?:being )?transferred",
+    "sole prop\\w* .{0,20}transfer"
+   ],
+   "exclude": [
+    "transfer pin"
+   ]
+  },
+  "PAYMENT_FAILURE": {
+   "tier": 1,
+   "match": [
+    "<NEG> (?:\\w+ )?(?:pay\\b|make (?:a )?payment)",
+    "payment .{0,20}(?:fail|declin|not go|didn ?t go|reject)"
+   ],
+   "exclude": []
+  },
+  "PAYMENT_PROCESSING": {
+   "tier": 1,
+   "match": [
+    "\\bpay (?:the |their |his |her |my |a |off )?(?:bill|balance)",
+    "make (?:a )?payment",
+    "payment arrangement",
+    "\\bpay\\w* (?:with|by|using)",
+    "past due",
+    "\\bpayment\\b",
+    "\\bpay\\w* .{0,25}\\bbill\\b"
+   ],
+   "exclude": []
+  },
+  "AUTOPAY_MANAGEMENT": {
+   "tier": 1,
+   "match": [
+    "auto ?pay"
+   ],
+   "exclude": []
+  },
+  "BILLING_DISPUTE": {
+   "tier": 1,
+   "match": [
+    "dispute",
+    "overcharg",
+    "charged (?:twice|incorrectly|wrong|for)",
+    "refund",
+    "\\bcredit\\b",
+    "wrong charge"
+   ],
+   "exclude": []
+  },
+  "INVOICE_REQUEST": {
+   "tier": 1,
+   "match": [
+    "copy of (?:their |his |her |the )?bill",
+    "invoice"
+   ],
+   "exclude": []
+  },
+  "CASE_FOLLOWUP": {
+   "tier": 1,
+   "match": [
+    "ticket (?:status|update|number)",
+    "(?:update|status) (?:on|of) (?:his |her |their |the |a )?(?:ticket|case)",
+    "follow ?up",
+    "case (?:id|number|status)",
+    "existing (?:ticket|case)"
+   ],
+   "exclude": []
+  },
+  "ESCALATION_FOLLOWUP": {
+   "tier": 1,
+   "match": [
+    "escalat"
+   ],
+   "exclude": []
+  },
+  "MOBILE_APP_FUNCTION": {
+   "tier": 1,
+   "match": [
+    "\\bapp\\b",
+    "t ?life",
+    "syncup",
+    "sync up",
+    "\\bapplications?\\b"
+   ],
+   "exclude": []
+  },
+  "APP_NOTIFICATION_SETTINGS": {
+   "tier": 1,
+   "match": [
+    "notification (?:settings?)",
+    "(?:turn|stop|disable|enable)\\w* (?:off |on )?notification"
+   ],
+   "exclude": []
+  },
+  "BILL_EXPLANATION": {
+   "tier": 2,
+   "match": [
+    "\\bbill(?:ing)?\\b",
+    "(?:international|intl|roaming) (?:billing|charges)"
+   ],
+   "exclude": []
+  },
+  "MISROUTED_CALL": {
+   "tier": 2,
+   "match": [
+    "misrout",
+    "routed (?:to us |to me )?(?:by )?(?:mistake|wrong|incorrect)",
+    "wrong (?:department|queue|team)",
+    "no help needed",
+    "routed over",
+    "routed to (?:care|tfb|business|us)"
+   ],
+   "exclude": []
+  },
+  "TRANSFER_REQUEST": {
+   "tier": 2,
+   "match": [
+    "\\btransfer\\w* (?:the )?(?:call|cx|customer|care rep|caller|consumer|them|him|her|rep)\\b",
+    "\\btransfer\\w* to\\b",
+    "\\bover to\\b",
+    "needs? to (?:speak|talk) (?:to|with)",
+    "speak (?:to|with) (?:a |an )?(?:\\w+ )?(?:rep|agent|specialist|team|tech)",
+    "(?:spanish|government|gov|business|biz) (?:rep|care|support|team)",
+    "\\btransferred\\b",
+    "\\b<CARE>\\b",
+    "\\b(?:metro|prepaid)\\b",
+    "looking for (?:\\w+ )?care\\b",
+    "\\b(?:trasnf|tranf|trnasf|tansf|trasf|tranfs)\\w*"
+   ],
+   "exclude": [
+    "transfer pin",
+    "numbers? transferred",
+    "account (?:was |is )?(?:being )?transferred",
+    "data transfer",
+    "transfer (?:data|contacts|photos)"
+   ]
+  },
+  "SERVICE_REQUEST": {
+   "tier": 2,
+   "match": [
+    "\\bship\\w*",
+    "tracking",
+    "\\border\\b",
+    "wrong address",
+    "delivery"
+   ],
+   "exclude": []
+  },
+  "GENERAL_INQUIRY": {
+   "tier": 1,
+   "match": [
+    "hours of operation",
+    "store (?:hours|location)",
+    "\\bpromo",
+    "\\brebate",
+    "general question",
+    "\\bdeals?\\b",
+    "\\boffers?\\b"
+   ],
+   "exclude": []
+  },
+  "PROCESS_GUIDANCE": {
+   "tier": 3,
+   "match": [
+    "how (?:to|do|does)\\b",
+    "know how"
+   ],
+   "exclude": []
+  },
+  "UNSUPPORTED_REQUEST": {
+   "tier": 3,
+   "match": [
+    "third party",
+    "not (?:a )?t ?mobile (?:device|product|service)"
+   ],
+   "exclude": []
+  },
+  "ACCOUNT_VERIFICATION": {
+   "tier": 3,
+   "match": [
+    "verif\\w* .{0,15}account",
+    "account .{0,15}verif"
+   ],
+   "exclude": []
+  },
+  "SMS_SEND_FAILURE": {
+   "tier": 1,
+   "match": [
+    "<NEG> (?:\\w+ ){0,3}send(?:ing)? (?:\\w+ ){0,2}<MSG>",
+    "<MSG> .{0,20}(?:not (?:sending|going (?:out|through)|delivered|deliver)|fail\\w* to send|won ?t send)"
+   ],
+   "exclude": [
+    "error messages?",
+    "(?:getting|got|gets|receiv\\w*|shows?|showing) (?:a |an |the )?(?:error )?message (?:that|saying|says|stating)",
+    "voice ?mail",
+    "message (?:says|saying|stating|that)"
+   ]
+  },
+  "SMS_RECEIVE_FAILURE": {
+   "tier": 1,
+   "match": [
+    "<NEG> (?:\\w+ ){0,3}(?:receiv\\w*|recieve\\w*|get|getting) (?:any |all |their |his |her |some )?<MSG>",
+    "<MSG> .{0,20}(?:not (?:coming|received|arriving)|delayed)",
+    "(?:receiv\\w*|recieve\\w*|send\\w*|get\\w*) <MSG> but (?:not|can ?t|cannot|unable)"
+   ],
+   "exclude": [
+    "error messages?",
+    "(?:getting|got|gets|receiv\\w*|shows?|showing) (?:a |an |the )?(?:error )?message (?:that|saying|says|stating)",
+    "voice ?mail",
+    "message (?:says|saying|stating|that)"
+   ]
+  },
+  "RCS_CHAT_FEATURES": {
+   "tier": 1,
+   "match": [
+    "\\brcs\\b",
+    "\\bi ?messages?\\b",
+    "chat features?",
+    "\\bfacetime\\b"
+   ],
+   "exclude": []
+  },
+  "GROUP_MESSAGING": {
+   "tier": 1,
+   "match": [
+    "group (?:chat|messag\\w*|texts?|mms)"
+   ],
+   "exclude": []
+  },
+  "VERIFICATION_CODE_DELIVERY": {
+   "tier": 1,
+   "match": [
+    "\\botps?\\b",
+    "short ?codes?",
+    "verification (?:codes?|texts?)",
+    "\\b2fa\\b",
+    "two factor",
+    "one time (?:pass\\w*|codes?)",
+    "security codes?"
+   ],
+   "exclude": []
+  },
+  "MESSAGE_HISTORY": {
+   "tier": 1,
+   "match": [
+    "archived messages?",
+    "messages? (?:history|backup|deleted|disappear\\w*|missing)",
+    "(?:lost|deleted|missing) (?:\\w+ )?<MSG>"
+   ],
+   "exclude": [
+    "error messages?",
+    "(?:getting|got|gets|receiv\\w*|shows?|showing) (?:a |an |the )?(?:error )?message (?:that|saying|says|stating)",
+    "voice ?mail",
+    "message (?:says|saying|stating|that)"
+   ]
+  },
+  "MESSAGING_ISSUE": {
+   "tier": 2,
+   "match": [
+    "\\bsms\\b",
+    "\\bmms\\b",
+    "\\btext(?:s|ing)?\\b(?! ?(?:me|back))",
+    "\\bmessaging\\b"
+   ],
+   "exclude": [
+    "error messages?",
+    "(?:getting|got|gets|receiv\\w*|shows?|showing) (?:a |an |the )?(?:error )?message (?:that|saying|says|stating)",
+    "voice ?mail",
+    "message (?:says|saying|stating|that)",
+    "(?:send|sent|sending|texted) (?:a |the |them |him |her |cx |customer )?(?:text|link)",
+    "(?:via|by|through) text",
+    "text (?:link|me|back)"
+   ]
+  },
+  "DEVICE_HARDWARE_ISSUE": {
+   "tier": 1,
+   "match": [
+    "\\bscreen\\b",
+    "\\bdisplay (?:is |has )?(?:black|blank|dim|lines|flicker\\w*|broken|cracked)",
+    "touch ?screen",
+    "\\btouch\\b",
+    "\\bspeakers?\\b(?! phone)",
+    "\\bmicrophone\\b",
+    "\\bmic\\b",
+    "\\bcamera\\b",
+    "pop ?ups?",
+    "charging port",
+    "headphones?",
+    "\\bear ?piece\\b",
+    "\\bbuttons?\\b",
+    "\\bvibrat\\w*"
+   ],
+   "exclude": [
+    "spanish speak\\w*",
+    "\\bspeak(?:er)? (?:with|to)\\b",
+    "screen ?shot",
+    "screen shar\\w*",
+    "connect\\w* (?:\\w+ )?cameras?",
+    "security cameras?",
+    "in touch",
+    "touch ?base",
+    "screened",
+    "screen(?:ing)? (?:call|question)"
+   ]
+  },
+  "ACCOUNT_STATUS": {
+   "tier": 1,
+   "match": [
+    "account (?:is |was |got )?(?:suspended|closed|cancel\\w*|locked|inactive|status)",
+    "account overview"
+   ],
+   "exclude": []
+  },
+  "UNEXPECTED_CHARGE": {
+   "tier": 1,
+   "match": [
+    "(?:extra|unexpected|unknown|additional|random|unrecogni[sz]ed|new) (?:charges?|fees?)",
+    "charges? (?:he|she|they|customer|cx) (?:does|do|did)n? ?t (?:recogni|know|understand)",
+    "bill (?:went|has gone|increased|is higher|doubled|jumped)",
+    "higher (?:than (?:normal|usual) )?bill"
+   ],
+   "exclude": []
+  },
+  "ACCOUNT_TYPE": {
+   "tier": 3,
+   "match": [
+    "(?:government|business|individual|personal|consumer|corporate) account",
+    "account (?:type|information|info|details)",
+    "\\bcreat\\w* (?:an |a |new )?account"
+   ],
+   "exclude": []
+  },
+  "ACCOUNT_HOLDER_REQUEST": {
+   "tier": 3,
+   "match": [
+    "\\bpah\\b",
+    "primary account holder",
+    "account holder"
+   ],
+   "exclude": []
+  }
+ },
+ "allowed_l2_by_l1": {}
+}

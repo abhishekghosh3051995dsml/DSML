@@ -1,0 +1,1294 @@
+# %%
+import argparse
+import json
+import re
+import time
+from collections import defaultdict
+from pathlib import Path
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from scipy.optimize import minimize, minimize_scalar
+from scipy.sparse import csr_matrix, hstack
+from scipy.cluster.hierarchy import fcluster, linkage
+from scipy.spatial.distance import squareform
+from scipy.stats import binomtest
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.cluster import HDBSCAN, MiniBatchKMeans
+from sklearn.decomposition import PCA, TruncatedSVD
+from sklearn.manifold import TSNE
+from sklearn.neighbors import NearestNeighbors
+from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS, CountVectorizer, HashingVectorizer, TfidfVectorizer
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import confusion_matrix, f1_score, precision_recall_fscore_support, silhouette_score
+from sklearn.model_selection import GroupKFold, GroupShuffleSplit
+from sklearn.neural_network import MLPClassifier
+from sklearn.preprocessing import normalize
+from sklearn.svm import LinearSVC
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--input", default=str(Path.home() / "OneDrive - T-Mobile USA" / "Downloads" / "data.csv"))
+parser.add_argument("--sheet", default="")
+parser.add_argument("--text-column", default="")
+parser.add_argument("--l1-column", default="")
+parser.add_argument("--taxonomy", default=str(Path(__file__).resolve().with_name("intent_taxonomy.json")))
+parser.add_argument("--outdir", default=r"C:\Datascience\nora_intent_l2_v3")
+parser.add_argument("--reference-quantile", type=float, default=0.25)
+parser.add_argument("--near-dup-threshold", type=float, default=0.90)
+parser.add_argument("--phrase-min-df", type=float, default=0.001)
+parser.add_argument("--phrase-max-z", type=float, default=2.0)
+parser.add_argument("--phrase-min-ownership", type=float, default=0.5)
+parser.add_argument("--length-quantile", type=float, default=0.95)
+parser.add_argument("--word-prefix-ratio", type=float, default=0.75)
+parser.add_argument("--name-window", type=int, default=6)
+parser.add_argument("--class-prior", choices=["uniform", "learned"], default="uniform")
+parser.add_argument("--test-share", type=float, default=0.2)
+parser.add_argument("--target-precision", type=float, default=0.95)
+parser.add_argument("--coverage-accuracy", type=float, default=0.90)
+parser.add_argument("--lsa-dims", type=int, default=200)
+parser.add_argument("--hard-pairs", type=int, default=3)
+parser.add_argument("--hard-weight", type=float, default=1.5)
+parser.add_argument("--min-cluster-size", type=int, default=25)
+parser.add_argument("--cluster-dims", type=int, default=20)
+parser.add_argument("--max-cluster-notes", type=int, default=60_000)
+parser.add_argument("--neutral-entropy", type=float, default=0.85)
+parser.add_argument("--neutral-min-notes", type=int, default=30)
+parser.add_argument("--stability-runs", type=int, default=5)
+parser.add_argument("--min-stability", type=float, default=0.5)
+parser.add_argument("--known-coverage", type=float, default=0.5)
+parser.add_argument("--known-purity", type=float, default=0.8)
+parser.add_argument("--uncovered-coverage", type=float, default=0.3)
+parser.add_argument("--fit-quantile", type=float, default=0.10)
+parser.add_argument("--audit-size", type=int, default=100)
+parser.add_argument("--bootstrap", type=int, default=1000)
+parser.add_argument("--seed", type=int, default=0)
+parser.add_argument("--l2-column-name", default="")
+parser.add_argument("--l1-name-pattern", default=r"l1|level.?1")
+parser.add_argument("--prefix-max-chars", type=int, default=40)
+parser.add_argument("--id-min-length", type=int, default=5)
+parser.add_argument("--chunk-size", type=int, default=2000)
+parser.add_argument("--shingle-size", type=int, default=5)
+parser.add_argument("--phrase-ngram", default="3,6")
+parser.add_argument("--attached-cooccurrence", type=float, default=0.9)
+parser.add_argument("--baseline-draws", type=int, default=20)
+parser.add_argument("--min-df", type=int, default=2)
+parser.add_argument("--char-min-df", type=int, default=3)
+parser.add_argument("--max-df", type=float, default=0.5)
+parser.add_argument("--char-ngram", default="2,5")
+parser.add_argument("--word-max-features", type=int, default=80_000)
+parser.add_argument("--char-max-features", type=int, default=120_000)
+parser.add_argument("--folds", type=int, default=5)
+parser.add_argument("--calibration-folds", type=int, default=3)
+parser.add_argument("--validation-share", type=float, default=0.2)
+parser.add_argument("--lr-c", type=float, default=4.0)
+parser.add_argument("--lr-max-iter", type=int, default=1000)
+parser.add_argument("--svm-c", type=float, default=1.0)
+parser.add_argument("--nbsvm-c", type=float, default=0.5)
+parser.add_argument("--nb-alpha", type=float, default=1.0)
+parser.add_argument("--net-dim", type=int, default=48)
+parser.add_argument("--net-epochs", type=int, default=6)
+parser.add_argument("--net-lr", type=float, default=0.02)
+parser.add_argument("--net-batch", type=int, default=256)
+parser.add_argument("--net-hash-bits", type=int, default=17)
+parser.add_argument("--mlp-hidden", type=int, default=256)
+parser.add_argument("--mlp-max-iter", type=int, default=60)
+parser.add_argument("--ds-strength", type=float, default=100.0)
+parser.add_argument("--ds-max-iter", type=int, default=200)
+parser.add_argument("--min-source-overlap", type=int, default=20)
+parser.add_argument("--source-accuracy-bounds", default="0.55,0.99")
+parser.add_argument("--min-labelled-per-class", type=int, default=10)
+parser.add_argument("--kmeans-multiples", default="1,2,3,4")
+parser.add_argument("--silhouette-sample", type=int, default=5000)
+parser.add_argument("--content-lsa-dims", type=int, default=150)
+parser.add_argument("--merge-probability", type=float, default=0.5)
+parser.add_argument("--confidence-grid", type=int, default=15)
+parser.add_argument("--ece-bins", type=int, default=10)
+parser.add_argument("--confirm-sources", type=int, default=2)
+parser.add_argument("--audit-labels", default="")
+parser.add_argument("--plot-sample", type=int, default=12_000)
+parser.add_argument("--tsne-perplexity", type=float, default=40)
+parser.add_argument("--label-top", type=int, default=25)
+args, _ = parser.parse_known_args()
+PH_NGRAM, CHAR_NGRAM = tuple(map(int, args.phrase_ngram.split(","))), tuple(map(int, args.char_ngram.split(",")))
+ACC_LO, ACC_HI = map(float, args.source_accuracy_bounds.split(","))
+PLACEHOLDERS = {"email": " email ", "url": " url ", "idnum": " idnum ", "num": " num "}
+
+outdir = Path(args.outdir)
+dirs = {k: outdir / k for k in ("prepared", "validation")}
+for d in dirs.values():
+    d.mkdir(parents=True, exist_ok=True)
+rng = np.random.default_rng(args.seed)
+np.random.seed(args.seed)
+_t0 = time.time()
+
+
+def tick(msg):
+    print(f"[{time.time() - _t0:7.1f}s] {msg}", flush=True)
+
+
+def softmax(z):
+    z = z - z.max(1, keepdims=True)
+    e = np.exp(z)
+    return e / e.sum(1, keepdims=True)
+
+
+def nll(P, y):
+    return -np.mean(np.log(np.clip(P[np.arange(len(y)), y], 1e-12, 1)))
+
+
+def ece(P, y, bins=args.ece_bins):
+    conf, ok = P.max(1), P.argmax(1) == y
+    edges = np.linspace(0, 1, bins + 1)
+    return sum(abs(ok[m].mean() - conf[m].mean()) * m.mean()
+               for lo, hi in zip(edges[:-1], edges[1:]) for m in [(conf > lo) & (conf <= hi)] if m.any())
+
+
+def coverage_bar(P, y, target):
+    conf = P.max(1)
+    order = np.argsort(-conf)
+    run = np.cumsum((P.argmax(1) == y)[order]) / np.arange(1, len(y) + 1)
+    ok = np.flatnonzero(run >= target)
+    return ((ok.max() + 1) / len(y), float(conf[order][ok.max()])) if len(ok) else (0.0, 1.0 + 1e-9)
+
+
+# %%
+def read_table(path, sheet):
+    path = Path(path)
+    if path.suffix.lower() in (".xlsx", ".xlsm", ".xls"):
+        book = pd.read_excel(path, sheet_name=sheet or None, dtype=str, keep_default_na=False)
+        if isinstance(book, dict):
+            book = max((b for b in book.values() if b.shape[1] >= 2), key=len)
+        return book
+    for enc in ("utf-8-sig", "utf-8", "cp1252", "latin-1"):
+        try:
+            return pd.read_csv(path, dtype=str, keep_default_na=False, encoding=enc)
+        except UnicodeDecodeError:
+            continue
+    raise ValueError(f"cannot decode {path}")
+
+
+raw = read_table(args.input, args.sheet)
+raw = raw.loc[:, [c for c in raw.columns if not str(c).startswith("Unnamed") and raw[c].str.strip().ne("").any()]]
+profile = pd.DataFrame({"mean_length": raw.apply(lambda s: s.str.len().mean()), "distinct_values": raw.nunique(),
+                        "blank_cells": raw.apply(lambda s: s.str.strip().eq("").sum())})
+text_col = args.text_column or profile["mean_length"].idxmax()
+cand = profile.drop(index=text_col).query("distinct_values > 1")
+hinted = [c for c in cand.index if re.search(args.l1_name_pattern, str(c), re.I)]
+l1_col = args.l1_column or (hinted[0] if hinted else cand["distinct_values"].idxmin())
+l2_col = args.l2_column_name or (re.sub(r"1", "2", l1_col, count=1) if "1" in l1_col else f"{l1_col}_L2")
+df = raw[[text_col, l1_col]].copy()
+df.insert(0, "row_id", np.arange(len(df)))
+tick(f"input {Path(args.input).name}: rows {len(df):,}  text column '{text_col}'  L1 column '{l1_col}'  output column '{l2_col}'")
+print(profile.to_string())
+print(df[l1_col].value_counts().to_string())
+
+cfg = json.loads(Path(args.taxonomy).read_text(encoding="utf-8"))
+TAXONOMY = {l2: list(l4s) for l2, l4s in cfg["taxonomy"].items()}
+L4_PARENT = {l4: l2 for l2, l4s in TAXONOMY.items() for l4 in l4s}
+L2_NAMES = sorted(TAXONOMY)
+L2_INDEX = {n: i for i, n in enumerate(L2_NAMES)}
+K = len(L2_NAMES)
+CATCH_ALL = cfg.get("catch_all_l2", "")
+NAME_STOP = set(cfg.get("name_stop_words", []))
+PARTS = cfg.get("pattern_parts", {})
+LEXICON = {l4: v for l4, v in cfg.get("lexicon", {}).items() if l4 in L4_PARENT}
+ALLOWED = {l1: set(v) for l1, v in cfg.get("allowed_l2_by_l1", {}).items()}
+orphans = sorted(set(cfg.get("lexicon", {})) - set(L4_PARENT))
+tick(f"taxonomy {Path(args.taxonomy).name}: L2 {K}  lexicon rules {len(LEXICON)}"
+     + (f"  (ignored {len(orphans)} rules with no parent L2)" if orphans else ""))
+
+audit_files = [Path(f) for f in args.audit_labels.split(";") if f.strip()] if args.audit_labels else sorted(dirs["validation"].glob("audit_sample*.csv"))
+gold_parts, gold_dropped = [], 0
+for f in audit_files:
+    try:
+        a = pd.read_csv(f, keep_default_na=False, dtype=str)
+    except (OSError, ValueError):
+        continue
+    if not {"row_id", "correct_L2"} <= set(a.columns):
+        continue
+    a = a[a["correct_L2"].str.strip() != ""].copy()
+    a["row_id"] = pd.to_numeric(a["row_id"], errors="coerce")
+    a = a[a["row_id"].between(0, len(df) - 1)]
+    a["row_id"] = a["row_id"].astype(int)
+    if text_col in a.columns:
+        same = a[text_col].str.strip().to_numpy() == df[text_col].iloc[a["row_id"]].str.strip().to_numpy()
+        gold_dropped += int((~same).sum())
+        a = a[same]
+    gold_parts.append(a.assign(correct_L2=a["correct_L2"].str.strip().str.upper(), audit_file=f.name))
+gold = pd.concat(gold_parts).drop_duplicates("row_id", keep="last") if gold_parts else pd.DataFrame(columns=["row_id", "correct_L2", "stratum", "audit_file"])
+gold_ids = set(gold["row_id"])
+tick(f"human audit labels: {len(gold):,} rows from {len(gold_parts)} file(s)" + (f"; {gold_dropped} ignored because the note text no longer matches" if gold_dropped else "")
+     + ("; these notes are kept out of training and used only for evaluation" if len(gold) else ""))
+
+# %%
+def normalise(text):
+    text = re.sub(r"['\u2019`]", "", text.lower())
+    text = re.sub(r"\S+@\S+", PLACEHOLDERS["email"], text)
+    text = re.sub(r"(https?://|www\.)\S+", PLACEHOLDERS["url"], text)
+    text = re.sub(r"\b(?=\w*\d)\w{%d,}\b" % args.id_min_length, PLACEHOLDERS["idnum"], text)
+    text = re.sub(r"\d+", PLACEHOLDERS["num"], text)
+    text = re.sub(r"[^\w\s:.!?&/-]", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+df["text_norm"] = df[text_col].map(normalise)
+df["n_tokens_raw"] = df["text_norm"].str.split().str.len()
+
+
+def interchangeable(affix, rest):
+    frame = pd.DataFrame({"affix": affix, "rest": rest})
+    variants = frame.groupby("rest")["affix"].nunique()
+    s = (frame[frame["affix"] != ""].assign(shared=lambda d: d["rest"].map(variants) > 1)
+         .groupby("affix").agg(rows=("rest", "size"), distinct_rest=("rest", "nunique"), shared_share=("shared", "mean")))
+    return set(s.index[(s["shared_share"] > 0.5) & (s["distinct_rest"] > 1)])
+
+
+prefix_re = re.compile(r"^([^:.!?]{1,%d}):\s+" % args.prefix_max_chars)
+prefix = df["text_norm"].str.extract(prefix_re, expand=False).fillna("")
+body = df["text_norm"].str.replace(prefix_re, "", n=1, regex=True)
+template_prefixes = interchangeable(prefix, body)
+sentences = body.str.split(r"(?<=[.!?])\s+", regex=True)
+last = pd.Series(np.where(sentences.str.len() > 1, sentences.str[-1], ""), index=df.index)
+core_part = pd.Series([b[: len(b) - len(s)].strip() if s else b for b, s in zip(body, last)], index=df.index)
+template_suffixes = interchangeable(last, core_part)
+has_affix = prefix.isin(template_prefixes) | last.isin(template_suffixes)
+base = pd.Series(np.where(prefix.isin(template_prefixes), body, df["text_norm"]), index=df.index)
+core = pd.Series([b[: len(b) - len(l)].strip() if l in template_suffixes and b.endswith(l) else b
+                  for b, l in zip(base, last)], index=df.index).str.replace(r"[.!?]+$", "", regex=True).str.strip()
+df["is_template"] = has_affix | core.isin(set(core[has_affix]))
+df["template_core"] = np.where(df["is_template"], core, "")
+tick(f"template rows {df['is_template'].sum():,}  real notes {(~df['is_template']).sum():,}  template cores {df.loc[df['is_template'], 'template_core'].nunique():,}")
+
+real_idx = np.flatnonzero(~df["is_template"].to_numpy())
+real_text = df.loc[real_idx, "text_norm"]
+shingles = TfidfVectorizer(analyzer="char_wb", ngram_range=(args.shingle_size, args.shingle_size), min_df=args.min_df, sublinear_tf=True).fit_transform(real_text)
+parent = np.arange(len(real_idx))
+
+
+def find(i):
+    while parent[i] != i:
+        parent[i] = parent[parent[i]]
+        i = parent[i]
+    return i
+
+
+for start in range(0, shingles.shape[0], args.chunk_size):
+    sims = (shingles[start:start + args.chunk_size] @ shingles.T).tocoo()
+    keep = (sims.data >= args.near_dup_threshold) & (sims.row + start < sims.col)
+    for a, b in zip(sims.row[keep] + start, sims.col[keep]):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+roots = np.array([find(i) for i in range(len(real_idx))])
+df["near_dup_group"] = -1
+df.loc[real_idx, "near_dup_group"] = roots
+near_sizes = pd.Series(roots).value_counts()
+tick(f"near-duplicate real notes (cosine >= {args.near_dup_threshold}): {int(near_sizes[near_sizes > 1].sum()):,} in {int((near_sizes > 1).sum()):,} groups")
+
+# %%
+lsa_vec = TfidfVectorizer(min_df=args.char_min_df, max_df=args.max_df, sublinear_tf=True, token_pattern=r"[a-z]{2,}")
+X_real = lsa_vec.fit_transform(real_text)
+vocab = lsa_vec.vocabulary_
+phrase_vec = CountVectorizer(ngram_range=PH_NGRAM, min_df=max(args.min_labelled_per_class // 2, int(args.phrase_min_df * len(real_idx))), token_pattern=r"[a-z]{2,}", binary=True)
+try:
+    P_ph = phrase_vec.fit_transform(real_text).tocsc()
+    phrases = phrase_vec.get_feature_names_out()
+except ValueError:
+    P_ph, phrases = None, []
+X_norm = normalize(X_real)
+X_bin = (X_real > 0).astype(np.int32).tocsr()
+word_df_lsa = pd.Series(np.asarray(X_bin.sum(axis=0)).ravel(), index=lsa_vec.get_feature_names_out())
+baseline_cache = {}
+
+
+def resultant(rows, cols):
+    sub = X_norm[rows]
+    if len(cols):
+        mask = np.ones(sub.shape[1])
+        mask[cols] = 0
+        sub = csr_matrix(sub.multiply(mask[None, :]))
+    return float(np.linalg.norm(np.asarray(normalize(sub).mean(axis=0)).ravel()))
+
+
+def random_baseline(n):
+    key = int(np.round(np.log2(max(n, 2)) * 2))
+    if key not in baseline_cache:
+        draws = [resultant(rng.choice(len(real_idx), size=min(n, len(real_idx)), replace=False), []) for _ in range(args.baseline_draws)]
+        baseline_cache[key] = (np.mean(draws), np.std(draws) + 1e-9)
+    return baseline_cache[key]
+
+
+ph_rows = []
+for j, ph in enumerate(phrases):
+    members = P_ph[:, j].nonzero()[0]
+    co = np.asarray(X_bin[members].sum(axis=0)).ravel()
+    attached = np.flatnonzero((co >= args.attached_cooccurrence * len(members)) & (co >= args.phrase_min_ownership * word_df_lsa.values))
+    obs = resultant(members, sorted(set(attached) | {vocab[w] for w in ph.split() if w in vocab}))
+    mu, sd = random_baseline(len(members))
+    rarest = min(ph.split(), key=lambda w: word_df_lsa.get(w, np.inf))
+    ph_rows.append((ph, len(members), obs, (obs - mu) / sd, rarest, len(members) / word_df_lsa.get(rarest, len(members))))
+phrase_table = pd.DataFrame(ph_rows, columns=["phrase", "notes", "cohesion", "cohesion_z", "rarest_word", "ownership"])
+phrase_table["boilerplate"] = (phrase_table["cohesion_z"] <= args.phrase_max_z) & (phrase_table["ownership"] >= args.phrase_min_ownership)
+boiler_tokens = [p.split() for p in sorted(phrase_table.loc[phrase_table["boilerplate"], "phrase"], key=len, reverse=True)]
+by_first = defaultdict(list)
+for toks in boiler_tokens:
+    by_first[toks[0]].append(toks)
+
+
+def strip_boilerplate(text):
+    toks = text.split()
+    keep = np.ones(len(toks), dtype=bool)
+    for i, t in enumerate(toks):
+        for ph in by_first.get(t, ()):
+            if toks[i:i + len(ph)] == ph:
+                keep[i:i + len(ph)] = False
+    out = [t for t, k in zip(toks, keep) if k]
+    return " ".join(out) if len(out) >= 2 else text
+
+
+df["text_model"] = df["text_norm"]
+df.loc[real_idx, "text_model"] = real_text.map(strip_boilerplate).values
+max_tokens = int(np.ceil(df.loc[real_idx, "text_model"].str.split().str.len().quantile(args.length_quantile))) if len(real_idx) else 0
+df["truncated"] = (~df["is_template"]) & (df["text_model"].str.split().str.len() > max_tokens)
+df.loc[df["truncated"], "text_model"] = df.loc[df["truncated"], "text_model"].str.split().str[:max_tokens].str.join(" ")
+df["n_tokens_model"] = df["text_model"].str.split().str.len()
+tick(f"candidate phrases {len(phrase_table):,}  boilerplate {len(boiler_tokens):,}  token cap {max_tokens}  truncated {int(df['truncated'].sum()):,}")
+
+# %%
+real_df = df.loc[real_idx]
+cleaning = pd.DataFrame({
+    "measure": ["mean tokens", "median tokens", f"P{int(args.length_quantile * 100)} tokens"],
+    "before": [real_df["n_tokens_raw"].mean(), real_df["n_tokens_raw"].median(), real_df["n_tokens_raw"].quantile(args.length_quantile)],
+    "after": [real_df["n_tokens_model"].mean(), real_df["n_tokens_model"].median(), real_df["n_tokens_model"].quantile(args.length_quantile)]}).round(2)
+by_source = df.assign(source=np.where(df["is_template"], "template", "real")).groupby([l1_col, "source"]).agg(
+    rows=("row_id", "size"), unique_text=("text_norm", "nunique")).reset_index()
+print(by_source.to_string(index=False))
+df[["row_id", text_col, l1_col, "is_template", "template_core", "near_dup_group", "text_norm", "text_model", "n_tokens_raw", "n_tokens_model", "truncated"]] \
+    .to_csv(dirs["prepared"] / "prepared_notes.csv", index=False)
+
+# %%
+def lcp(a, b):
+    n = 0
+    for x, y in zip(a, b):
+        if x != y:
+            break
+        n += 1
+    return n
+
+
+SHORT_TAILS = {"e", "s", "es", "d", "ed", "ing", "on", "y", "ies", "ied"}
+INFLECTIONS = {"s", "es", "d", "ed", "ing", "ings", "er", "ers", "ment", "ments", "ion", "ions", "ation", "ations", "al", "ly", "ity", "ivity", "ive"}
+STEM_TAILS = SHORT_TAILS | INFLECTIONS | {"ication", "ications", "ying", "ement", "ements", "ered", "ering", "ration", "sion", "ded"}
+
+
+def word_matches(v, w):
+    if v == w:
+        return True
+    shorter, longer = sorted((v, w), key=len)
+    common = lcp(shorter, longer)
+    if common == len(shorter):
+        return longer[common:] in INFLECTIONS
+    for c in range(common, max(3, common - 3), -1):
+        if v[c:] in STEM_TAILS and w[c:] in STEM_TAILS:
+            return True
+    return common >= args.word_prefix_ratio * len(shorter) and shorter[common:] in SHORT_TAILS
+
+
+real = df[~df["is_template"]].reset_index(drop=True)
+tmpl = df[df["is_template"]].reset_index(drop=True)
+name_words = {l4: [w for w in l4.lower().split("_") if w not in NAME_STOP] for l4 in L4_PARENT}
+all_name_words = {w for ws in name_words.values() for w in ws}
+vocab_all = {t for s in df["text_model"] for t in re.findall(r"[a-z]+", s)}
+variant_of = defaultdict(set)
+for v in vocab_all:
+    for w in all_name_words:
+        if v[:2] == w[:2] and word_matches(v, w):
+            variant_of[v].add(w)
+name_df = defaultdict(int)
+for s in real["text_model"]:
+    for w in {w for t in set(re.findall(r"[a-z]+", s)) for w in variant_of.get(t, ())}:
+        name_df[w] += 1
+idf = {w: np.log((1 + len(real)) / (1 + name_df.get(w, 0))) + 1 for w in all_name_words}
+
+
+def name_vote(text):
+    toks = re.findall(r"[a-z]+", text)
+    where = defaultdict(list)
+    for i, t in enumerate(toks):
+        for w in variant_of.get(t, ()):
+            where[w].append(i)
+    best, best_key = None, 0.0
+    for l4, ws in name_words.items():
+        if not ws or not all(w in where for w in ws):
+            continue
+        pos = sorted(min(where[w]) for w in ws)
+        if pos[-1] - pos[0] > args.name_window:
+            continue
+        key = sum(idf[w] for w in ws)
+        if key > best_key:
+            best, best_key = l4, key
+    return best
+
+
+def expand(p):
+    for k, v in PARTS.items():
+        p = p.replace(k, v)
+    return re.compile(p)
+
+
+lexicon = [(l4, r.get("tier", 1), [expand(p) for p in r.get("match", [])], [expand(p) for p in r.get("exclude", [])]) for l4, r in LEXICON.items()]
+
+
+def lexicon_vote(text):
+    hits = []
+    for l4, tier, pos, neg in lexicon:
+        if any(n.search(text) for n in neg):
+            continue
+        found = [m for p in pos for m in [p.search(text)] if m]
+        if found:
+            m = min(found, key=lambda m: (m.start(), -(m.end() - m.start())))
+            hits.append((tier, m.start(), -(m.end() - m.start()), l4))
+    return min(hits)[3] if hits else None
+
+
+# %%
+cores = tmpl["template_core"].astype(str)
+frames_of, topics_of, splits = defaultdict(set), defaultdict(set), {}
+for c in sorted(cores.unique()):
+    tok = c.split()
+    cand_split = []
+    for i in range(len(tok)):
+        for j in range(i + 1, len(tok) + 1):
+            frame, topic = (" ".join(tok[:i]), " ".join(tok[j:])), " ".join(tok[i:j])
+            frames_of[topic].add(frame)
+            topics_of[frame].add(topic)
+            cand_split.append((frame, topic))
+    splits[c] = cand_split
+
+
+def best_topic(c):
+    scored = [(len(frames_of[t]) * len(topics_of[f]), len(t.split()), t) for f, t in splits[c] if len(frames_of[t]) > 1 and len(topics_of[f]) > 1]
+    return max(scored)[2] if scored else c
+
+
+def topic_to_l4(text):
+    words = {w for t in re.findall(r"[a-z]+", text) for w in variant_of.get(t, {t})}
+    l2_score, l4_score = defaultdict(float), {}
+    for l4, ws in name_words.items():
+        if ws:
+            f = len(set(ws) & words) / len(ws)
+            l2_score[L4_PARENT[l4]] += f
+            l4_score[l4] = (f, sum(idf.get(w, 0) for w in set(ws) & words))
+    if not l2_score or max(l2_score.values()) == 0:
+        return None
+    l2 = max(l2_score, key=l2_score.get)
+    return max((l4 for l4 in TAXONOMY[l2]), key=lambda l4: l4_score.get(l4, (0, 0)))
+
+
+tmpl["topic"] = cores.map({c: best_topic(c) for c in cores.unique()}) if len(tmpl) else pd.Series(dtype=str)
+topic_map = {t: topic_to_l4(t) for t in tmpl["topic"].unique()} if len(tmpl) else {}
+tmpl["rule_l4"] = tmpl["topic"].map(topic_map) if len(tmpl) else pd.Series(dtype=object)
+tmpl_ok = tmpl[tmpl["rule_l4"].notna()].copy()
+tmpl_ok["rule_l2"] = tmpl_ok["rule_l4"].map(L4_PARENT)
+tick(f"template topics {len(topic_map)}  mapped to taxonomy {sum(v is not None for v in topic_map.values())}")
+
+# %%
+word_vec = TfidfVectorizer(ngram_range=(1, 2), min_df=args.min_df, max_df=args.max_df, sublinear_tf=True, max_features=args.word_max_features).fit(df["text_model"])
+votes_l4 = {"agent_phrasing": real["text_model"].map(lexicon_vote), "name_matching": real["text_model"].map(name_vote)}
+template_acc = None
+if tmpl_ok["rule_l4"].nunique() >= 2 and tmpl_ok["template_core"].nunique() >= args.folds:
+    X_t = word_vec.transform(tmpl_ok["text_model"])
+    y_t = tmpl_ok["rule_l4"].to_numpy()
+    classes_t = np.unique(y_t)
+    oof_t = np.zeros((len(tmpl_ok), len(classes_t)))
+    for tr, te in GroupKFold(n_splits=min(args.folds, tmpl_ok["template_core"].nunique())).split(X_t, y_t, groups=tmpl_ok["template_core"]):
+        if len(np.unique(y_t[tr])) < 2:
+            continue
+        m = LogisticRegression(max_iter=args.lr_max_iter, C=args.lr_c).fit(X_t[tr], y_t[tr])
+        oof_t[np.ix_(te, np.searchsorted(classes_t, m.classes_))] = m.predict_proba(X_t[te])
+    oof_l2 = np.array([L4_PARENT[classes_t[i]] for i in oof_t.argmax(1)])
+    correct = oof_l2 == tmpl_ok["rule_l2"].to_numpy()
+    order = np.argsort(-oof_t.max(1))
+    run = np.cumsum(correct[order]) / np.arange(1, len(correct) + 1)
+    ok = np.flatnonzero(run >= args.target_precision)
+    thr_t = float(oof_t.max(1)[order][ok.max()]) if len(ok) else 1.0 + 1e-9
+    template_acc = float(correct[oof_t.max(1) >= thr_t].mean()) if (oof_t.max(1) >= thr_t).any() else None
+    tclf = LogisticRegression(max_iter=args.lr_max_iter, C=args.lr_c).fit(X_t, y_t)
+    p_t = tclf.predict_proba(word_vec.transform(real["text_model"]))
+    votes_l4["template_classifier"] = pd.Series(np.where(p_t.max(1) >= thr_t, tclf.classes_[p_t.argmax(1)], None), dtype=object)
+rule_rows = []
+won = votes_l4["agent_phrasing"].value_counts()
+for l4, tier, pos, neg in lexicon:
+    hit = real["text_model"].map(lambda t: not any(n.search(t) for n in neg) and any(p_.search(t) for p_ in pos))
+    rule_rows.append({"L2": L4_PARENT[l4], "rule": l4, "tier": tier, "notes_matched": int(hit.sum()), "notes_decided": int(won.get(l4, 0))})
+rule_report = pd.DataFrame(rule_rows).sort_values(["L2", "notes_decided"], ascending=[True, False])
+l2_rule_cov = rule_report.groupby("L2")[["notes_matched", "notes_decided"]].sum().reindex(L2_NAMES, fill_value=0)
+print("\nnotes decided by the phrasing rules, per L2:")
+print(l2_rule_cov.to_string())
+silent = rule_report.loc[rule_report["notes_matched"] == 0, "rule"].tolist()
+if silent:
+    print(f"rules in the taxonomy that matched no note ({len(silent)}): " + ", ".join(silent))
+source_names = list(votes_l4)
+V4 = np.column_stack([[v if isinstance(v, str) else None for v in votes_l4[n]] for n in source_names]).astype(object)
+ABSTAIN = -1
+L = np.vectorize(lambda v: L2_INDEX[L4_PARENT[v]] if v else ABSTAIN, otypes=[int])(V4)
+both = (L != ABSTAIN).sum(1) > 1
+agree = np.array([len({v for v in r if v != ABSTAIN}) == 1 for r in L[both]])
+tick("label source coverage: " + ", ".join(f"{n} {np.mean(L[:, j] != ABSTAIN):.1%}" for j, n in enumerate(source_names))
+     + f"; agreement where several vote {agree.mean() if len(agree) else float('nan'):.1%}")
+
+
+def pairwise_agreement(j):
+    rates = []
+    for k in range(L.shape[1]):
+        on = (L[:, j] != ABSTAIN) & (L[:, k] != ABSTAIN)
+        if k != j and on.sum() >= args.min_source_overlap:
+            rates.append(np.mean(L[on, j] == L[on, k]))
+    return np.mean(rates) if rates else np.nan
+
+
+def dawid_skene(L, acc0, strength=args.ds_strength, iters=args.ds_max_iter):
+    n, m = L.shape
+    acc, prior = acc0.copy(), np.full(K, 1.0 / K)
+    for _ in range(iters):
+        logq = np.tile(np.log(prior), (n, 1))
+        for j in range(m):
+            on = L[:, j] != ABSTAIN
+            wrong = np.log((1 - acc[j]) / (K - 1))
+            logq[on] += wrong
+            logq[on, L[on, j]] += np.log(acc[j]) - wrong
+        q = np.exp(logq - logq.max(1, keepdims=True))
+        q /= q.sum(1, keepdims=True)
+        new = np.array([(q[L[:, j] != ABSTAIN, L[L[:, j] != ABSTAIN, j]].sum() + strength * acc0[j])
+                        / ((L[:, j] != ABSTAIN).sum() + strength) for j in range(m)]).clip(1e-3, 1 - 1e-3)
+        if args.class_prior == "learned":
+            prior = q.mean(0).clip(1e-4)
+        done = np.abs(new - acc).max() < 1e-6
+        acc = new
+        if done:
+            break
+    return q, acc
+
+
+acc0 = np.array([template_acc if (n == "template_classifier" and template_acc) else pairwise_agreement(j) for j, n in enumerate(source_names)], dtype=float)
+acc0 = np.clip(np.where(np.isnan(acc0), np.nanmean(acc0) if np.isfinite(acc0).any() else (ACC_LO + ACC_HI) / 2, acc0), ACC_LO, ACC_HI)
+covered = (L != ABSTAIN).any(1)
+real["weak_l2"] = -1
+real["sources_agreeing"] = 0
+ds_acc = acc0
+if covered.any():
+    q, ds_acc = dawid_skene(L[covered], acc0)
+    real.loc[covered, "weak_l2"] = q.argmax(1)
+    real["sources_agreeing"] = (L == real["weak_l2"].to_numpy()[:, None]).sum(1) * covered
+real["rule_l2"] = [L2_NAMES[k] if k >= 0 else "" for k in real["weak_l2"]]
+rank_src = np.argsort(-np.asarray(ds_acc))
+real["rule_topic"] = [next((V4[i, j] for j in rank_src if k >= 0 and V4[i, j] and L4_PARENT[V4[i, j]] == L2_NAMES[k]), "")
+                      for i, k in enumerate(real["weak_l2"].to_numpy())]
+source_table = pd.DataFrame({"label_source": source_names, "coverage": (L != ABSTAIN).mean(0), "estimated_accuracy": ds_acc})
+tick(f"statistical labels: {covered.sum():,} of {len(real):,} real notes ({covered.mean():.1%}); "
+     + ", ".join(f"{n} accuracy {a:.3f}" for n, a in zip(source_names, ds_acc)))
+
+# %%
+real["group"] = np.where(real["near_dup_group"] >= 0, real["near_dup_group"], -real["row_id"] - 1)
+lab = real[(real["weak_l2"] >= 0) & ~real["row_id"].isin(gold_ids)].reset_index(drop=True)
+if len(lab) < args.min_labelled_per_class * K or lab["weak_l2"].nunique() < 2:
+    raise SystemExit(f"only {len(lab)} real notes received a statistical label: check the taxonomy file against this data")
+dev_idx, te_idx = next(GroupShuffleSplit(n_splits=1, test_size=args.test_share, random_state=args.seed).split(lab, groups=lab["group"]))
+dev = lab.iloc[dev_idx].reset_index(drop=True)
+tr_idx, ca_idx = next(GroupShuffleSplit(n_splits=1, test_size=args.test_share, random_state=args.seed + 1).split(dev, groups=dev["group"]))
+train, cal, test = dev.iloc[tr_idx].reset_index(drop=True), dev.iloc[ca_idx].reset_index(drop=True), lab.iloc[te_idx].reset_index(drop=True)
+y_tr, y_ca, y_te = (d["weak_l2"].to_numpy() for d in (train, cal, test))
+trusted_te = test["sources_agreeing"].to_numpy() >= args.confirm_sources
+tick(f"split by near-duplicate group: train {len(train):,}  calibration {len(cal):,}  held-out test {len(test):,} "
+     f"({trusted_te.sum():,} confirmed by {args.confirm_sources}+ sources)  unlabelled {(real['weak_l2'] < 0).sum():,}")
+
+char_vec = TfidfVectorizer(analyzer="char_wb", ngram_range=CHAR_NGRAM, min_df=args.char_min_df, sublinear_tf=True, max_features=args.char_max_features).fit(real["text_model"])
+lsa = TruncatedSVD(n_components=min(args.lsa_dims, len(word_vec.vocabulary_) - 1), random_state=args.seed).fit(word_vec.transform(real["text_model"]))
+l1_values = sorted(df[l1_col].unique())
+
+
+def l1_onehot(s):
+    return csr_matrix(np.eye(len(l1_values))[[l1_values.index(v) for v in s]])
+
+
+def X_word(d):
+    return word_vec.transform(d["text_model"])
+
+
+def X_full(d):
+    return hstack([word_vec.transform(d["text_model"]), char_vec.transform(d["text_model"]), l1_onehot(d[l1_col])]).tocsr()
+
+
+def X_dense(d):
+    return np.hstack([normalize(lsa.transform(word_vec.transform(d["text_model"]))), l1_onehot(d[l1_col]).toarray()])
+
+
+# %%
+class NBSVM:
+    def __init__(self, C=args.nbsvm_c, alpha=args.nb_alpha):
+        self.C, self.alpha, self.T = C, alpha, 1.0
+
+    def fit(self, X, y, w=None):
+        Xb = (X > 0).astype(np.float64)
+        self.classes_ = np.unique(y)
+        self.r_, self.models_ = [], []
+        for c in self.classes_:
+            p = self.alpha + np.asarray(Xb[y == c].sum(0)).ravel()
+            q = self.alpha + np.asarray(Xb[y != c].sum(0)).ravel()
+            r = np.log((p / p.sum()) / (q / q.sum()))
+            self.r_.append(r)
+            self.models_.append(LinearSVC(C=self.C).fit(X.multiply(r).tocsr(), (y == c).astype(int), sample_weight=w))
+        return self
+
+    def decision(self, X):
+        return np.column_stack([m.decision_function(X.multiply(r).tocsr()) for m, r in zip(self.models_, self.r_)])
+
+    def calibrate(self, X, y):
+        seen = np.isin(y, self.classes_)
+        if seen.any():
+            d = self.decision(X[np.flatnonzero(seen)])
+            yi = np.searchsorted(self.classes_, y[seen])
+            self.T = float(np.exp(minimize_scalar(lambda t: nll(softmax(d / np.exp(t)), yi), bounds=(-4, 4), method="bounded").x))
+        return self
+
+    def predict_proba(self, X):
+        return softmax(self.decision(X) / self.T)
+
+
+class ShallowTextNet:
+    def __init__(self, dim=args.net_dim, epochs=args.net_epochs, lr=args.net_lr, batch=args.net_batch, n_features=2 ** args.net_hash_bits, seed=args.seed):
+        self.dim, self.epochs, self.lr, self.batch, self.seed = dim, epochs, lr, batch, seed
+        self.hasher = HashingVectorizer(analyzer=self._grams, n_features=n_features, alternate_sign=False, norm="l1")
+
+    @staticmethod
+    def _grams(text):
+        toks = text.split()
+        out = toks + [a + " " + b for a, b in zip(toks, toks[1:])]
+        for t in toks:
+            w = f"<{t}>"
+            out += [w[i:i + n] for n in (3, 4, 5) for i in range(len(w) - n + 1)]
+        return out
+
+    def fit(self, texts, y, w=None):
+        r = np.random.default_rng(self.seed)
+        X = self.hasher.transform(texts).tocsr()
+        self.classes_ = np.unique(y)
+        yi = np.searchsorted(self.classes_, y)
+        w = np.ones(len(yi)) if w is None else np.asarray(w, float)
+        self.E = r.normal(0, 0.1, (X.shape[1], self.dim))
+        self.W = r.normal(0, 0.1, (self.dim, len(self.classes_)))
+        self.b = np.zeros(len(self.classes_))
+        params = [self.E, self.W, self.b]
+        m1, m2 = [np.zeros_like(p) for p in params], [np.zeros_like(p) for p in params]
+        step = 0
+        for _ in range(self.epochs):
+            for s in np.array_split(r.permutation(len(yi)), max(1, len(yi) // self.batch)):
+                Xb, yb, wb = X[s], yi[s], w[s] / w[s].sum()
+                h = np.asarray(Xb @ self.E)
+                g = softmax(h @ self.W + self.b)
+                g[np.arange(len(yb)), yb] -= 1
+                g *= wb[:, None]
+                grads = [None, h.T @ g, g.sum(0)]
+                rows = np.unique(Xb.indices)
+                gE = np.asarray(Xb[:, rows].T @ (g @ self.W.T))
+                step += 1
+                for i, (pa, gr) in enumerate(zip(params, grads)):
+                    if i == 0:
+                        m1[0][rows] = 0.9 * m1[0][rows] + 0.1 * gE
+                        m2[0][rows] = 0.999 * m2[0][rows] + 0.001 * gE ** 2
+                        pa[rows] -= self.lr * (m1[0][rows] / (1 - 0.9 ** step)) / (np.sqrt(m2[0][rows] / (1 - 0.999 ** step)) + 1e-8)
+                    else:
+                        m1[i] = 0.9 * m1[i] + 0.1 * gr
+                        m2[i] = 0.999 * m2[i] + 0.001 * gr ** 2
+                        pa -= self.lr * (m1[i] / (1 - 0.9 ** step)) / (np.sqrt(m2[i] / (1 - 0.999 ** step)) + 1e-8)
+        return self
+
+    def predict_proba(self, texts):
+        return softmax(np.asarray(self.hasher.transform(texts) @ self.E) @ self.W + self.b)
+
+
+def full_proba(model, P, n=K):
+    out = np.full((P.shape[0], n), 1e-9)
+    out[:, model.classes_] = P
+    return out / out.sum(1, keepdims=True)
+
+
+def member_models(d, y, w):
+    Xf, Xd = X_full(d), X_dense(d)
+    fi, vi = next(GroupShuffleSplit(n_splits=1, test_size=args.validation_share, random_state=args.seed + 2).split(d, groups=d["group"]))
+    fi = fi[w[fi] > 0]
+    models = {"nbsvm": NBSVM().fit(Xf[fi], y[fi], w[fi]).calibrate(Xf[vi], y[vi]),
+              "logistic_regression": LogisticRegression(max_iter=args.lr_max_iter, C=args.lr_c).fit(Xf[fi], y[fi], sample_weight=w[fi]),
+              "shallow_text_network": ShallowTextNet(seed=args.seed).fit(d["text_model"].iloc[fi].tolist(), y[fi], w[fi]),
+              "mlp": MLPClassifier(hidden_layer_sizes=(args.mlp_hidden,), max_iter=args.mlp_max_iter, early_stopping=True, random_state=args.seed).fit(Xd[fi], y[fi])}
+    return models, fit_weights(member_proba(models, d.iloc[vi]), y[vi])
+
+
+def member_proba(models, d):
+    Xf, Xd = X_full(d), X_dense(d)
+    return {"nbsvm": full_proba(models["nbsvm"], models["nbsvm"].predict_proba(Xf)),
+            "logistic_regression": full_proba(models["logistic_regression"], models["logistic_regression"].predict_proba(Xf)),
+            "shallow_text_network": full_proba(models["shallow_text_network"], models["shallow_text_network"].predict_proba(d["text_model"].tolist())),
+            "mlp": full_proba(models["mlp"], models["mlp"].predict_proba(Xd))}
+
+
+def blend(P, weights):
+    return softmax(sum(wt * np.log(P[n]) for n, wt in weights.items() if n != "_T") / weights["_T"])
+
+
+def fit_weights(P, y):
+    names = list(P)
+
+    def unpack(x):
+        return dict(zip(names, np.exp(x[:-1]) / np.exp(x[:-1]).sum()), _T=float(np.exp(x[-1])))
+    return unpack(minimize(lambda x: nll(blend(P, unpack(x)), y), np.zeros(len(names) + 1), method="Nelder-Mead", options={"maxiter": 3000}).x)
+
+
+def constrain(P, l1s):
+    if not ALLOWED:
+        return P
+    mask = np.array([[1.0 if (l1 not in ALLOWED or n in ALLOWED[l1]) else 0.0 for n in L2_NAMES] for l1 in l1s])
+    out = P * np.where(mask.sum(1, keepdims=True) > 0, mask, 1.0)
+    return out / out.sum(1, keepdims=True)
+
+
+# %%
+COV = f"coverage_at_{int(args.coverage_accuracy * 100)}pct_accuracy"
+COV2 = f"coverage_at_{int(args.target_precision * 100)}pct_accuracy"
+
+
+def evaluate(name, P, y, prev=None, trusted=None):
+    pred = P.argmax(1)
+    row = {"model": name, "accuracy": np.mean(pred == y), "macro_F1": f1_score(y, pred, average="macro"),
+           COV: coverage_bar(P, y, args.coverage_accuracy)[0], COV2: coverage_bar(P, y, args.target_precision)[0],
+           f"{CATCH_ALL}_share": np.mean(pred == L2_INDEX.get(CATCH_ALL, -1)), "ECE": ece(P, y)}
+    if trusted is not None and trusted.any():
+        row["accuracy_on_confirmed_labels"] = np.mean(pred[trusted] == y[trusted])
+    if prev is not None:
+        a, b = prev.argmax(1) == y, pred == y
+        n01, n10 = int((~a & b).sum()), int((a & ~b).sum())
+        row.update(gained=n01, lost=n10, mcnemar_p=binomtest(n01, n01 + n10, 0.5).pvalue if n01 + n10 else 1.0)
+    return row
+
+
+steps, predictors = [], {}
+
+
+def register(key, title, predict, note=""):
+    predictors[key] = predict
+    P_ca, P_te = constrain(predict(cal), cal[l1_col]), constrain(predict(test), test[l1_col])
+    steps.append({"key": key, "P_ca": P_ca, "P_te": P_te,
+                  "row": {**evaluate(title, P_te, y_te, steps[-1]["P_te"] if steps else None, trusted_te), "note": note}})
+    r = steps[-1]["row"]
+    tick(f"{title}: accuracy {r['accuracy']:.3f}  macro-F1 {r['macro_F1']:.3f}  {COV} {r[COV]:.3f}" + (f"  McNemar p {r['mcnemar_p']:.2g}" if "mcnemar_p" in r else ""))
+
+
+lsa_tr = normalize(lsa.transform(X_word(train)))
+best_k, best_s, best_km = None, -1, None
+for kk in sorted({m_ * K for m_ in map(int, args.kmeans_multiples.split(","))}):
+    km = MiniBatchKMeans(n_clusters=kk, random_state=args.seed, n_init=3).fit(lsa_tr)
+    s = silhouette_score(lsa_tr, km.labels_, sample_size=min(args.silhouette_sample, len(train)), random_state=args.seed)
+    if s > best_s:
+        best_k, best_s, best_km = kk, s, km
+y_km = pd.Series(y_tr).groupby(best_km.labels_).agg(lambda s: s.value_counts().idxmax()).reindex(best_km.labels_).to_numpy()
+base = CalibratedClassifierCV(LinearSVC(C=args.svm_c), cv=args.calibration_folds).fit(X_word(train), y_km)
+register("baseline", "Baseline: TF-IDF + k-means labels + calibrated LinearSVC", lambda d: full_proba(base, base.predict_proba(X_word(d))),
+         f"k={best_k}, silhouette {best_s:.3f}, cluster purity {np.mean(y_km == y_tr):.3f}")
+svc = CalibratedClassifierCV(LinearSVC(C=args.svm_c), cv=args.calibration_folds).fit(X_word(train), y_tr)
+register("weak_labels", "+ statistical training labels (weak supervision + Dawid-Skene)", lambda d: full_proba(svc, svc.predict_proba(X_word(d))))
+fi, vi = next(GroupShuffleSplit(n_splits=1, test_size=args.validation_share, random_state=args.seed + 2).split(train, groups=train["group"]))
+Xw_tr, Xf_tr = X_word(train), X_full(train)
+nb = NBSVM().fit(Xw_tr[fi], y_tr[fi]).calibrate(Xw_tr[vi], y_tr[vi])
+register("nbsvm", "+ NB-SVM feature weighting", lambda d: full_proba(nb, nb.predict_proba(X_word(d))))
+nbf = NBSVM().fit(Xf_tr[fi], y_tr[fi]).calibrate(Xf_tr[vi], y_tr[vi])
+register("features", "+ character n-grams and L1 context", lambda d: full_proba(nbf, nbf.predict_proba(X_full(d))))
+models_e, weights_e = member_models(train, y_tr, np.ones(len(train)))
+member_rows = [evaluate(f"member: {n}", P, y_te, trusted=trusted_te) for n, P in member_proba(models_e, test).items()]
+register("ensemble", "+ calibrated ensemble (NB-SVM, logistic regression, shallow text network, MLP)", lambda d: blend(member_proba(models_e, d), weights_e),
+         ", ".join(f"{n} {v:.2f}" for n, v in weights_e.items() if n != "_T"))
+
+oof = np.zeros((len(train), K))
+for tr, te in GroupKFold(n_splits=min(args.folds, train["group"].nunique())).split(train, y_tr, groups=train["group"]):
+    m = LogisticRegression(max_iter=args.lr_max_iter, C=args.lr_c).fit(Xf_tr[tr], y_tr[tr])
+    oof[np.ix_(te, m.classes_)] = m.predict_proba(Xf_tr[te])
+self_conf = oof[np.arange(len(y_tr)), y_tr]
+class_thr = np.array([self_conf[y_tr == c].mean() if (y_tr == c).any() else 1.0 for c in range(K)])
+pick = oof.argmax(1)
+issue = (pick != y_tr) & (self_conf < class_thr[y_tr]) & (oof[np.arange(len(y_tr)), pick] >= class_thr[pick]) & (train["sources_agreeing"].to_numpy() < args.confirm_sources)
+cm = pd.crosstab(y_tr, pick).reindex(index=range(K), columns=range(K), fill_value=0).to_numpy().copy()
+np.fill_diagonal(cm, 0)
+pairs = []
+for i in np.argsort(-(cm + cm.T), axis=None):
+    p_ = tuple(sorted(np.unravel_index(i, cm.shape)))
+    if p_[0] != p_[1] and p_ not in pairs and (cm + cm.T)[p_] > 0:
+        pairs.append(p_)
+    if len(pairs) == args.hard_pairs:
+        break
+hard = np.isin(y_tr, [c for p_ in pairs for c in p_]) & (train["sources_agreeing"].to_numpy() >= args.confirm_sources)
+w_clean = np.where(issue, 0.0, np.where(hard, args.hard_weight, 1.0))
+models_c, weights_c = member_models(train, y_tr, w_clean)
+register("cleaned", "+ confident learning and hard-example weighting", lambda d: blend(member_proba(models_c, d), weights_c),
+         f"{issue.sum():,} suspect labels removed; hard pairs: " + "; ".join(f"{L2_NAMES[a]} vs {L2_NAMES[b]}" for a, b in pairs))
+
+sel = max(steps[1:], key=lambda s: (coverage_bar(s["P_ca"], y_ca, args.coverage_accuracy)[0], np.mean(s["P_ca"].argmax(1) == y_ca)))
+final_l2 = predictors[sel["key"]]
+ablation = pd.DataFrame([s["row"] for s in steps])
+print("\nL2 on held-out real notes (never used for training or selection), scored against statistical labels:")
+print(ablation.drop(columns=["note"]).round(4).to_string(index=False))
+tick(f"L2 production configuration (chosen on calibration set): {sel['key']}")
+
+# %%
+P_cal, P_test = sel["P_ca"], sel["P_te"]
+conf_thr = coverage_bar(P_cal, y_ca, args.coverage_accuracy)[1]
+P_real = constrain(final_l2(real), real[l1_col])
+real["pred_l2"] = [L2_NAMES[i] for i in P_real.argmax(1)]
+real["l2_confidence"] = P_real.max(1)
+real["below_confidence_bar"] = real["l2_confidence"] < conf_thr
+tick(f"L2 for {len(real):,} real notes; confidence bar for {args.coverage_accuracy:.0%} accuracy = {conf_thr:.3f}; below it {real['below_confidence_bar'].mean():.1%}")
+
+# %%
+lab_mask = (real["rule_l2"] != "").to_numpy()
+cvb = CountVectorizer(token_pattern=r"[a-z][a-z0-9]+", binary=True, min_df=args.min_df)
+B = cvb.fit_transform(real["text_model"]).tocsc()
+vocab_b = cvb.get_feature_names_out()
+Y = np.zeros((len(real), K))
+Y[np.flatnonzero(lab_mask), [L2_INDEX[v] for v in real.loc[lab_mask, "rule_l2"]]] = 1
+by_class = np.asarray(B[np.flatnonzero(lab_mask)].T @ Y[lab_mask])
+rate = by_class / np.maximum(Y.sum(0), 1)
+pr = rate / np.maximum(rate.sum(1, keepdims=True), 1e-12)
+entropy = -(pr * np.log(np.where(pr > 0, pr, 1))).sum(1) / np.log(K)
+neutral = (by_class.sum(1) >= args.neutral_min_notes) & (entropy >= args.neutral_entropy)
+phrasing_words = set(vocab_b[neutral]) | set(ENGLISH_STOP_WORDS) | {v.strip() for v in PLACEHOLDERS.values()}
+word_roles = pd.DataFrame({"word": vocab_b, "notes": np.asarray(B.sum(0)).ravel(), "spread_across_L2": entropy, "phrasing_word": neutral})
+real["content"] = real["text_model"].map(lambda t: " ".join(w for w in re.findall(r"[a-z][a-z0-9]+", t) if w not in phrasing_words))
+has_content = real["content"].str.len() > 0
+tick(f"phrasing words removed for category analysis: {neutral.sum():,} (e.g. "
+     + ", ".join(word_roles[word_roles["phrasing_word"]].nlargest(10, "notes")["word"]) + ")")
+
+work = real[has_content]
+if len(work) > args.max_cluster_notes:
+    work = work.sample(args.max_cluster_notes, random_state=args.seed)
+tf_c = TfidfVectorizer(ngram_range=(1, 2), min_df=args.char_min_df, sublinear_tf=True).fit(work["content"])
+Xc = tf_c.transform(work["content"])
+emb = normalize(TruncatedSVD(n_components=min(args.content_lsa_dims, Xc.shape[1] - 1), random_state=args.seed).fit_transform(Xc))
+Zc = normalize(PCA(n_components=min(args.cluster_dims, emb.shape[1]), random_state=args.seed).fit_transform(emb))
+
+
+def cluster(M):
+    return HDBSCAN(min_cluster_size=args.min_cluster_size, min_samples=max(5, args.min_cluster_size // 3), copy=True).fit(M).labels_
+
+
+clab = cluster(Zc)
+boots = []
+for r_ in range(args.stability_runs):
+    s = rng.choice(len(Zc), size=int(0.8 * len(Zc)), replace=False)
+    boots.append((s, cluster(Zc[s])))
+tick(f"category analysis: {clab.max() + 1:,} clusters on {len(work):,} real notes (no L2 assumed); {args.stability_runs} stability runs done")
+
+cc = CountVectorizer(ngram_range=(1, 2), min_df=args.char_min_df, token_pattern=r"[a-z][a-z0-9]+")
+Cc = cc.fit_transform(work["content"])
+terms = cc.get_feature_names_out()
+wl = work["rule_l2"].to_numpy()
+cl_ids = sorted(set(clab) - {-1})
+tfm = np.vstack([np.asarray(Cc[wl == n].sum(0)).ravel() for n in L2_NAMES] + [np.asarray(Cc[clab == c].sum(0)).ravel() for c in cl_ids])
+Wc = normalize(tfm / np.maximum(tfm.sum(1, keepdims=True), 1) * np.log(1 + tfm.sum(1).mean() / np.maximum(tfm.sum(0), 1)))
+fit = Wc[K:] @ Wc[:K].T
+crow = []
+for i, c in enumerate(cl_ids):
+    m = np.flatnonzero(clab == c)
+    mset = set(m)
+    jac = [max((len(mset & set(s[bl == b])) / len(mset | set(s[bl == b])) for b in set(bl[np.isin(s, m)]) - {-1}), default=0.0) for s, bl in boots]
+    rl = pd.Series(wl[m])
+    rl = rl[rl != ""]
+    top = [terms[j] for j in np.argsort(-Wc[K + i])[:12] if Wc[K + i, j] > 0]
+    bigr = [t for t in top[:5] if " " in t]
+    crow.append({"cluster": int(c), "notes": len(m), "share_of_real_notes": len(m) / len(real), "stability": float(np.mean(jac)),
+                 "rule_coverage": len(rl) / len(m), "rule_L2": rl.value_counts().index[0] if len(rl) else "",
+                 "rule_purity": float(rl.value_counts(normalize=True).iloc[0]) if len(rl) else 0.0,
+                 "best_vocabulary_L2": L2_NAMES[int(fit[i].argmax())], "vocabulary_fit": float(fit[i].max()),
+                 "model_L2": work["pred_l2"].iloc[m].value_counts().index[0],
+                 "proposed_name": (bigr[0] if bigr else "_".join(top[:2])).upper().replace(" ", "_"), "top_terms": ", ".join(top[:10]),
+                 "examples": " | ".join(work[text_col].iloc[m[:5]].astype(str))})
+clusters = pd.DataFrame(crow)
+if len(clusters):
+    known = (clusters["rule_coverage"] >= args.known_coverage) & (clusters["rule_purity"] >= args.known_purity)
+    fit_bar = float(clusters.loc[known, "vocabulary_fit"].quantile(args.fit_quantile)) if known.any() else 0.0
+
+    def verdict(r):
+        if r.stability < args.min_stability:
+            return "unstable"
+        if r.rule_coverage >= args.known_coverage and r.rule_purity >= args.known_purity:
+            return f"split candidate inside {CATCH_ALL}" if r.rule_L2 == CATCH_ALL else "known L2 confirmed"
+        if r.rule_coverage >= args.known_coverage:
+            return "boundary between L2s"
+        if r.rule_coverage < args.uncovered_coverage and r.vocabulary_fit < fit_bar:
+            return "new category candidate"
+        return "uncovered part of an existing L2"
+
+    clusters["verdict"] = clusters.apply(verdict, axis=1)
+    rank = {"new category candidate": 0, f"split candidate inside {CATCH_ALL}": 1, "uncovered part of an existing L2": 2,
+            "boundary between L2s": 3, "known L2 confirmed": 4, "unstable": 5}
+    clusters = clusters.sort_values(["verdict", "notes"], key=lambda s: s.map(rank) if s.name == "verdict" else -s).reset_index(drop=True)
+    verdicts = clusters.groupby("verdict").agg(clusters=("cluster", "size"), notes=("notes", "sum")).reindex(list(rank)).dropna().reset_index()
+    verdicts = pd.concat([verdicts, pd.DataFrame([{"verdict": "not clustered", "clusters": 0, "notes": int((clab < 0).sum())},
+                                                  {"verdict": "no issue words", "clusters": 0, "notes": int((~has_content).sum())}])], ignore_index=True)
+    verdicts["share_of_real_notes"] = verdicts["notes"] / len(real)
+    print("\nreal notes by cluster verdict:")
+    print(verdicts.round(4).to_string(index=False))
+    show = clusters[clusters["verdict"].isin(["new category candidate", f"split candidate inside {CATCH_ALL}", "uncovered part of an existing L2"])]
+    print(f"\nclusters outside or between the known L2: {len(show)}")
+    print(show[["verdict", "proposed_name", "notes", "stability", "rule_coverage", "rule_L2", "best_vocabulary_L2", "vocabulary_fit", "top_terms"]]
+          .round(3).to_string(index=False, max_colwidth=60))
+else:
+    verdicts = pd.DataFrame()
+    print("\nno clusters found")
+
+real["Intent_L2_final"] = real["pred_l2"]
+mapping, promoted, bars = pd.Series(dtype=object), pd.DataFrame(), {}
+if len(clusters):
+    chars = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 4), sublinear_tf=True).fit(work["content"])
+    cent = {c: np.asarray(chars.transform(work["content"].iloc[np.flatnonzero(clab == c)]).mean(0)).ravel() for c in clusters["cluster"]}
+
+    def similarity(ids):
+        rows = [cl_ids.index(c) for c in ids]
+        C = normalize(np.vstack([cent[c] for c in ids]))
+        return np.maximum(Wc[K:][rows] @ Wc[K:][rows].T, C @ C.T)
+
+    known_c = clusters[clusters["verdict"] == "known L2 confirmed"]
+    bars["stability bar (from known-L2 clusters)"] = float(known_c["stability"].quantile(args.reference_quantile)) if len(known_c) else args.min_stability
+    bars["merge bar (separates same-topic from different-topic clusters)"] = 1.0
+    if len(known_c) > 2:
+        S = similarity(known_c["cluster"].tolist())
+        topic = [work["rule_topic"].iloc[np.flatnonzero(clab == c)].replace("", np.nan).mode() for c in known_c["cluster"]]
+        topic = np.array([t.iloc[0] if len(t) else f"none{i}" for i, t in enumerate(topic)], dtype=object)
+        same = topic[:, None] == topic[None, :]
+        iu = np.triu_indices(len(S), 1)
+        sv, lv = S[iu], same[iu]
+        if lv.any() and (~lv).any():
+            order = np.argsort(-sv)
+            prec = np.cumsum(lv[order]) / np.arange(1, len(sv) + 1)
+            ok = np.flatnonzero(prec >= args.merge_probability)
+            bars["merge bar (separates same-topic from different-topic clusters)"] = float(sv[order][ok.max()]) if len(ok) else 1.0
+    promoted = clusters[clusters["verdict"].isin(["new category candidate", f"split candidate inside {CATCH_ALL}"])
+                        & (clusters["stability"] >= bars["stability bar (from known-L2 clusters)"]) & clusters["proposed_name"].str.len().gt(0)].copy()
+    promoted["final_L2"] = promoted["proposed_name"]
+    if len(promoted) > 1:
+        S = similarity(promoted["cluster"].tolist())
+        D = np.clip(1 - S, 0, None)
+        np.fill_diagonal(D, 0)
+        grp = fcluster(linkage(squareform(D, checks=False), method="average"),
+                       t=1 - bars["merge bar (separates same-topic from different-topic clusters)"], criterion="distance")
+        grp = pd.Series(grp, index=promoted.index)
+        lead = promoted.groupby(grp)["notes"].idxmax()
+        promoted["final_L2"] = grp.map(lambda g: promoted.loc[lead[g], "proposed_name"])
+    clusters["promoted_as"] = clusters["cluster"].map(promoted.set_index("cluster")["final_L2"]).fillna("")
+    members = pd.DataFrame({"row_id": work["row_id"].to_numpy(), "cluster": clab})
+    mapping = members.merge(promoted[["cluster", "final_L2"]], on="cluster").set_index("row_id")["final_L2"]
+    print("\n" + "\n".join(f"{k}: {v:.3f}" for k, v in bars.items()))
+    print(f"clusters promoted to new L2: {len(promoted)} -> {promoted['final_L2'].nunique()} new L2 after merging")
+
+expanded_eval, expanded_per_class = pd.DataFrame(), pd.DataFrame()
+gate_table = pd.DataFrame()
+
+
+def expanded_labels(mp):
+    t = real["row_id"].map(mp).fillna(real["rule_l2"]).to_numpy(dtype=object)
+    keep = (t != "") & ~real["row_id"].isin(gold_ids).to_numpy()
+    return real[keep].assign(target=t[keep]).reset_index(drop=True)
+
+
+if len(mapping):
+    lab2 = expanded_labels(mapping)
+    y_cv, X_cv = lab2["target"].to_numpy(), X_full(lab2)
+    pred_cv = np.empty(len(lab2), dtype=object)
+    for tr, te in GroupKFold(n_splits=min(args.folds, lab2["group"].nunique())).split(lab2, y_cv, groups=lab2["group"]):
+        pred_cv[te] = NBSVM().fit(X_cv[tr], y_cv[tr]).decision(X_cv[te]).argmax(1)
+        pred_cv[te] = np.unique(y_cv[tr])[pred_cv[te].astype(int)]
+    names_cv = np.unique(y_cv)
+    pg, rg, fg, sg = precision_recall_fscore_support(y_cv, pred_cv.astype(str), labels=names_cv, zero_division=0)
+    gate_table = pd.DataFrame({"L2": names_cv, "new": ~np.isin(names_cv, L2_NAMES), "notes": sg, "precision": pg, "recall": rg, "F1": fg})
+    bars["quality bar (lowest cross-validated F1 among known L2)"] = float(gate_table.loc[~gate_table["new"], "F1"].min())
+    gate_table["kept"] = ~gate_table["new"] | (gate_table["F1"] >= bars["quality bar (lowest cross-validated F1 among known L2)"])
+    print(f"\nquality bar (lowest cross-validated F1 among known L2): {bars['quality bar (lowest cross-validated F1 among known L2)']:.3f}")
+    print(gate_table[gate_table["new"]].round(3).to_string(index=False))
+    keep_names = set(gate_table.loc[gate_table["new"] & gate_table["kept"], "L2"])
+    mapping = mapping[mapping.isin(keep_names)]
+    if len(promoted):
+        clusters["promoted_as"] = clusters["promoted_as"].where(clusters["promoted_as"].isin(keep_names), "")
+
+if len(mapping):
+    new_names = sorted(set(mapping) - set(L2_NAMES))
+    lab2 = expanded_labels(mapping)
+    d_i, t_i = next(GroupShuffleSplit(n_splits=1, test_size=args.test_share, random_state=args.seed).split(lab2, groups=lab2["group"]))
+    dev2 = lab2.iloc[d_i].reset_index(drop=True)
+    f_i, c_i = next(GroupShuffleSplit(n_splits=1, test_size=args.test_share, random_state=args.seed + 1).split(dev2, groups=dev2["group"]))
+    tr2, ca2, te2 = dev2.iloc[f_i], dev2.iloc[c_i], lab2.iloc[t_i]
+    exp_model = NBSVM().fit(X_full(tr2), tr2["target"].to_numpy()).calibrate(X_full(ca2), ca2["target"].to_numpy())
+    p_te2 = exp_model.predict_proba(X_full(te2))
+    pred2, y2 = exp_model.classes_[p_te2.argmax(1)], te2["target"].to_numpy()
+    expanded_eval = pd.DataFrame([{"L2_classes": len(exp_model.classes_), "new_L2": len(new_names), "heldout_notes": len(te2),
+                                   "accuracy": np.mean(pred2 == y2), "macro_F1": f1_score(y2, pred2, average="macro")}])
+    pr2, rc2, f12, sp2 = precision_recall_fscore_support(y2, pred2, labels=exp_model.classes_, zero_division=0)
+    expanded_per_class = pd.DataFrame({"L2": exp_model.classes_, "new": np.isin(exp_model.classes_, new_names), "heldout_notes": sp2,
+                                       "precision": pr2, "recall": rc2, "F1": f12})
+    p_all = exp_model.predict_proba(X_full(real))
+    real["Intent_L2_final"] = exp_model.classes_[p_all.argmax(1)]
+    real["l2_confidence"] = p_all.max(1)
+    hit = real["row_id"].isin(mapping.index)
+    real.loc[hit, "Intent_L2_final"] = real.loc[hit, "row_id"].map(mapping).values
+    if ALLOWED:
+        bad = np.array([l1 in ALLOWED and l2 in L2_NAMES and l2 not in ALLOWED[l1] for l1, l2 in zip(real[l1_col], real["Intent_L2_final"])])
+        real.loc[bad, "Intent_L2_final"] = real.loc[bad, "pred_l2"]
+    tick(f"L2 expanded with {len(new_names)} new classes ({', '.join(new_names)}) "
+         f"retrained on {len(tr2):,} notes; held-out accuracy {expanded_eval['accuracy'].iloc[0]:.3f}, macro-F1 {expanded_eval['macro_F1'].iloc[0]:.3f}")
+    print(expanded_per_class[expanded_per_class["new"]].round(3).to_string(index=False))
+    print(f"real notes in new L2 classes: {real['Intent_L2_final'].isin(new_names).sum():,} "
+          f"(cluster members {hit.sum():,}, extended by the model to {(real['Intent_L2_final'].isin(new_names) & ~hit).sum():,} more)")
+
+# %%
+real["Intent_L2_final"] = real["Intent_L2_final"].astype(object)
+tmpl["Intent_L2_final"] = ""
+if len(tmpl):
+    ok_t = tmpl["rule_l4"].notna() & np.array([l1 not in ALLOWED or L4_PARENT.get(l4) in ALLOWED[l1]
+                                               for l1, l4 in zip(tmpl[l1_col], tmpl["rule_l4"])], dtype=bool)
+    tmpl.loc[ok_t, "Intent_L2_final"] = tmpl.loc[ok_t, "rule_l4"].map(L4_PARENT)
+    if (~ok_t).any():
+        rest = tmpl[~ok_t]
+        tmpl.loc[~ok_t, "Intent_L2_final"] = [L2_NAMES[i] for i in constrain(final_l2(rest), rest[l1_col]).argmax(1)]
+
+# %%
+final = pd.concat([real[["row_id", "Intent_L2_final"]], tmpl[["row_id", "Intent_L2_final"]]])
+final = df[["row_id", text_col, l1_col]].merge(final, on="row_id", how="left").sort_values("row_id")
+assert len(final) == len(raw) and (final[l1_col].to_numpy() == raw[l1_col].to_numpy()).all() and final["Intent_L2_final"].fillna("").ne("").all()
+final = final.rename(columns={"Intent_L2_final": l2_col})
+deliverable = outdir / f"{Path(args.input).stem}_l2.xlsx"
+with pd.ExcelWriter(deliverable, engine="openpyxl") as xw:
+    final[[text_col, l1_col, l2_col]].to_excel(xw, sheet_name="Intent", index=False)
+    xw.sheets["Intent"].freeze_panes = "A2"
+
+real["needs_review"] = real["below_confidence_bar"] | ~has_content
+strata = {"held-out test": real["row_id"].isin(test["row_id"]) & ~real["needs_review"],
+          "no rule fired, model confident": (real["weak_l2"] < 0) & ~real["needs_review"], "flagged for review": real["needs_review"]}
+strata = {k: m & ~real["row_id"].isin(gold_ids) for k, m in strata.items()}
+audit = pd.concat([real[m].sample(min(args.audit_size, int(m.sum())), random_state=args.seed).assign(stratum=k) for k, m in strata.items() if m.any()])
+filled = {f.name for f in audit_files if f.name in set(gold["audit_file"])}
+audit_name = f"audit_sample_round{len(list(dirs['validation'].glob('audit_sample*.csv'))) + 1}.csv" if filled else "audit_sample.csv"
+audit.rename(columns={"Intent_L2_final": l2_col}).assign(correct_L2="") \
+    [["row_id", "stratum", text_col, l1_col, "rule_l2", l2_col, "l2_confidence", "correct_L2"]] \
+    .sample(frac=1, random_state=args.seed).to_csv(dirs["validation"] / audit_name, index=False)
+real.rename(columns={"Intent_L2_final": l2_col})[
+    ["row_id", text_col, l1_col, "rule_l2", "sources_agreeing", l2_col, "l2_confidence", "needs_review"]] \
+    .to_csv(dirs["validation"] / "predictions_real_notes.csv", index=False)
+
+# %%
+pred_te = P_test.argmax(1)
+prec, rec, f1v, sup = precision_recall_fscore_support(y_te, pred_te, labels=range(K), zero_division=0)
+per_l2 = pd.DataFrame({"L2": L2_NAMES, "heldout_notes": sup, "precision": prec, "recall": rec, "F1": f1v})
+confusion = pd.DataFrame(confusion_matrix(y_te, pred_te, labels=range(K)), index=L2_NAMES, columns=L2_NAMES).reset_index().rename(columns={"index": "true \\ predicted"})
+acc_conf = pd.DataFrame({"min_confidence": np.unique(np.round(np.quantile(P_test.max(1), np.linspace(0, 1, args.confidence_grid, endpoint=False)), 3))})
+acc_conf["share_of_notes"] = [np.mean(P_test.max(1) >= c) for c in acc_conf["min_confidence"]]
+acc_conf["accuracy"] = [np.mean(pred_te[P_test.max(1) >= c] == y_te[P_test.max(1) >= c]) if (P_test.max(1) >= c).any() else np.nan for c in acc_conf["min_confidence"]]
+rb = np.random.default_rng(args.seed)
+boot = [np.mean(pred_te[s] == y_te[s]) for s in (rb.integers(0, len(y_te), len(y_te)) for _ in range(args.bootstrap))]
+def wilson(k, n, z=1.96):
+    if n == 0:
+        return np.nan, np.nan
+    p_, d = k / n, 1 + z ** 2 / n
+    c_ = (p_ + z ** 2 / (2 * n)) / d
+    h = z * np.sqrt(p_ * (1 - p_) / n + z ** 2 / (4 * n ** 2)) / d
+    return c_ - h, c_ + h
+
+
+human, human_errors = pd.DataFrame(), pd.DataFrame()
+if len(gold):
+    g = gold[[c for c in ("row_id", "correct_L2", "stratum") if c in gold.columns]].merge(final[["row_id", text_col, l1_col, l2_col]], on="row_id", how="inner")
+    g["correct"] = g[l2_col].str.upper() == g["correct_L2"]
+    groups_g = [("all audited notes", g)] + ([(k, d) for k, d in g.groupby("stratum")] if "stratum" in g.columns else [])
+    human = pd.DataFrame([{"group": k, "notes": len(d), "correct": int(d["correct"].sum()), "accuracy": d["correct"].mean(),
+                           "ci95_low": wilson(int(d["correct"].sum()), len(d))[0], "ci95_high": wilson(int(d["correct"].sum()), len(d))[1]} for k, d in groups_g])
+    human_errors = g[~g["correct"]][["row_id", text_col, l1_col, l2_col, "correct_L2"] + (["stratum"] if "stratum" in g.columns else [])]
+    unknown = sorted(set(g["correct_L2"]) - set(final[l2_col].str.upper()) - set(L2_NAMES))
+    print("\naccuracy against human audit labels:")
+    print(human.round(3).to_string(index=False))
+    if len(human_errors):
+        print("most frequent disagreements (predicted -> human):")
+        print(human_errors.groupby([l2_col, "correct_L2"]).size().sort_values(ascending=False).head(10).to_string())
+    if unknown:
+        print(f"audit labels not among the output L2 classes: {', '.join(unknown)}")
+
+fr = sel["row"]
+summary = pd.DataFrame([
+    ("rows", len(final)), ("real notes", len(real)), ("template rows", len(tmpl)), ("real notes with statistical labels", len(lab)),
+    ("held-out test notes", len(test)), ("L2 production configuration", sel["key"]),
+    ("L2 accuracy, baseline", ablation.iloc[0]["accuracy"]), ("L2 accuracy, final", fr["accuracy"]),
+    ("L2 accuracy 95% CI low", np.percentile(boot, 2.5)), ("L2 accuracy 95% CI high", np.percentile(boot, 97.5)),
+    ("L2 macro-F1, final", fr["macro_F1"]), (f"L2 {COV}, baseline", ablation.iloc[0][COV]), (f"L2 {COV}, final", fr[COV]),
+    ("L2 accuracy, final with new L2", expanded_eval["accuracy"].iloc[0] if len(expanded_eval) else fr["accuracy"]),
+    ("L2 macro-F1, final with new L2", expanded_eval["macro_F1"].iloc[0] if len(expanded_eval) else fr["macro_F1"]),
+] + ([("L2 accuracy against human audit", human["accuracy"].iloc[0]), ("human-audited notes", len(gold))] if len(human) else []) + [
+    ("real notes flagged for review", real["needs_review"].mean()),
+    ("L2 classes in output", final[l2_col].nunique()),
+    ("new L2 added from the data", int((~final[l2_col].isin(L2_NAMES)).groupby(final[l2_col]).any().sum())),
+], columns=["metric", "value"])
+print("\n" + summary.to_string(index=False))
+dist = final[l2_col].value_counts().rename_axis(l2_col).reset_index(name="rows")
+with pd.ExcelWriter(dirs["validation"] / "validation.xlsx", engine="openpyxl") as xw:
+    for name, frame in [("Summary", summary), ("Data_profile", profile.reset_index().rename(columns={"index": "column"})),
+                        ("Rows_by_L1_source", by_source), ("Cleaning", cleaning), ("Label_sources", source_table),
+                        ("L2_steps", ablation), ("L2_ensemble_members", pd.DataFrame(member_rows)), ("L2_per_class", per_l2),
+                        ("L2_confusion", confusion), ("L2_accuracy_vs_confidence", acc_conf), ("Category_verdicts", verdicts),
+                        ("Category_clusters", clusters), ("Data_driven_bars", pd.DataFrame(list(bars.items()), columns=["bar", "value"])), ("New_L2_quality_gate", gate_table), ("Expanded_L2_evaluation", expanded_eval), ("Expanded_L2_per_class", expanded_per_class), ("Phrasing_words", word_roles[word_roles["phrasing_word"]].sort_values("notes", ascending=False)),
+                        ("Boilerplate_phrases", phrase_table.sort_values("cohesion_z")), ("Taxonomy_rule_hits", rule_report),
+                        ("Human_audit", human), ("Human_audit_disagreements", human_errors), ("L2_distribution", dist)]:
+        frame.to_excel(xw, sheet_name=name[:31], index=False)
+
+# %%
+fig, ax = plt.subplots(figsize=(7, 4))
+pd.crosstab(df[l1_col], df["is_template"].map({True: "template", False: "real"})).plot.barh(stacked=True, ax=ax, color=["#2a6f97", "#a9c6de"])
+ax.set_xlabel("Rows")
+ax.set_ylabel("")
+ax.set_title("Rows by L1 and source")
+fig.tight_layout()
+fig.savefig(dirs["validation"] / "rows_by_l1_source.png", dpi=150)
+
+fig, ax = plt.subplots(figsize=(10, 5))
+labels = [re.sub(r"\s*[(:].*", "", m).replace("+ ", "+").replace("Baseline", "Baseline (existing method)") for m in ablation["model"]]
+vals = (ablation[COV] * 100).to_numpy()
+ax.barh(labels[::-1], vals[::-1], color=["#2a6f97"] * (len(vals) - 1) + ["#9aa5b1"])
+for i, v in enumerate(vals[::-1]):
+    ax.text(v + 1, i, f"{v:.1f}%", va="center", fontsize=9)
+ax.set_xlim(0, 110)
+ax.set_xlabel(f"Share of held-out notes labelled at >= {args.coverage_accuracy:.0%} accuracy (%)")
+ax.set_title("L2 coverage by step (cumulative)")
+fig.tight_layout()
+fig.savefig(dirs["validation"] / "l2_coverage_by_step.png", dpi=150)
+
+fig, ax = plt.subplots(figsize=(7, 4.5))
+ax.plot(acc_conf["share_of_notes"] * 100, acc_conf["accuracy"] * 100, marker="o", color="#2a6f97")
+ax.invert_xaxis()
+ax.set_xlabel("Share of notes labelled (%)")
+ax.set_ylabel("Held-out L2 accuracy (%)")
+ax.set_title("L2 accuracy vs coverage")
+ax.grid(alpha=.3)
+fig.tight_layout()
+fig.savefig(dirs["validation"] / "l2_accuracy_vs_coverage.png", dpi=150)
+
+if len(verdicts):
+    fig, ax = plt.subplots(figsize=(9, 4.5))
+    v = verdicts.sort_values("notes")
+    ax.barh(v["verdict"], v["share_of_real_notes"] * 100, color="#2a6f97")
+    for i, x in enumerate(v["share_of_real_notes"] * 100):
+        ax.text(x + 0.3, i, f"{x:.1f}%", va="center", fontsize=9)
+    ax.set_xlabel("Share of real notes (%)")
+    ax.set_title("Real notes by cluster verdict")
+    fig.tight_layout()
+    fig.savefig(dirs["validation"] / "category_verdicts.png", dpi=150)
+if len(clusters):
+    tick("cluster map: projecting notes to 2D (t-SNE)")
+    pick = np.random.default_rng(args.seed).choice(len(work), size=min(args.plot_sample, len(work)), replace=False)
+    xy = TSNE(n_components=2, perplexity=min(args.tsne_perplexity, max(5, (len(pick) - 1) / 3)), init="pca",
+              random_state=args.seed).fit_transform(Zc[pick])
+    l2_map = real.set_index("row_id")["Intent_L2_final"]
+    verdict_of = clusters.set_index("cluster")["verdict"]
+    name_of = clusters.set_index("cluster")["proposed_name"]
+    promoted_of = clusters.set_index("cluster")["promoted_as"] if "promoted_as" in clusters else pd.Series(dtype=object)
+    cmap = pd.DataFrame({"row_id": work["row_id"].to_numpy()[pick], "x": xy[:, 0], "y": xy[:, 1], "cluster": clab[pick]})
+    cmap["L2"] = cmap["row_id"].map(l2_map).fillna("")
+    cmap["verdict"] = cmap["cluster"].map(verdict_of).fillna("not clustered")
+    cmap["cluster_name"] = cmap["cluster"].map(name_of).fillna("")
+    cmap["new_L2"] = cmap["cluster"].map(promoted_of).fillna("")
+    cmap["text"] = work[text_col].to_numpy()[pick]
+    cmap.to_csv(dirs["validation"] / "cluster_map_points.csv", index=False)
+
+    radius = 0.03 * float(np.ptp(cmap[["x", "y"]].to_numpy(), axis=0).max())
+
+    def anchor(sub):
+        pts = sub[["x", "y"]].to_numpy()
+        if len(pts) < 3:
+            return pts.mean(0)
+        counts = np.array([len(n_) for n_ in NearestNeighbors(radius=radius).fit(pts).radius_neighbors(pts, return_distance=False)])
+        best = counts == counts.max()
+        return pts[best].mean(0)
+
+    def legend_out(ax):
+        ax.legend(loc="center left", bbox_to_anchor=(1.01, 0.5), fontsize=8, markerscale=3, frameon=False)
+
+    def tidy(ax, title):
+        ax.set_xticks([])
+        ax.set_yticks([])
+        ax.set_title(title)
+        for sp in ax.spines.values():
+            sp.set_visible(False)
+
+    l2_order = cmap["L2"].value_counts().index.tolist()
+    palette = plt.get_cmap("tab20")(np.linspace(0, 1, max(len(l2_order), 2)))
+    fig, ax = plt.subplots(figsize=(13, 9))
+    for i, name in enumerate(l2_order):
+        m = cmap["L2"] == name
+        ax.scatter(cmap.loc[m, "x"], cmap.loc[m, "y"], s=4, alpha=0.6, color=palette[i],
+                   label=f"{name}{' (new)' if name not in L2_NAMES else ''} ({int(m.sum()):,})")
+    for name in l2_order:
+        m = cmap["L2"] == name
+        ax_, ay_ = anchor(cmap[m])
+        ax.text(ax_, ay_, name, fontsize=8, weight="bold", ha="center",
+                bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="none", alpha=0.7))
+    legend_out(ax)
+    tidy(ax, f"Real notes by final L2 ({len(cmap):,} sampled notes, t-SNE of issue words)")
+    fig.tight_layout()
+    fig.savefig(dirs["validation"] / "cluster_map_by_l2.png", dpi=150)
+
+    vcolors = {"new category candidate": "#d62728", f"split candidate inside {CATCH_ALL}": "#ff7f0e", "uncovered part of an existing L2": "#1f77b4",
+               "boundary between L2s": "#9467bd", "known L2 confirmed": "#2ca02c", "unstable": "#bcbd22", "not clustered": "#d9d9d9"}
+    fig, ax = plt.subplots(figsize=(13, 9))
+    for v in ["not clustered", "unstable", "known L2 confirmed", "boundary between L2s", "uncovered part of an existing L2",
+              f"split candidate inside {CATCH_ALL}", "new category candidate"]:
+        m = cmap["verdict"] == v
+        if m.any():
+            ax.scatter(cmap.loc[m, "x"], cmap.loc[m, "y"], s=3 if v == "not clustered" else 5, alpha=0.35 if v == "not clustered" else 0.7,
+                       color=vcolors[v], label=f"{v} ({int(m.sum()):,})")
+    show_c = clusters[clusters["verdict"].isin(["new category candidate", f"split candidate inside {CATCH_ALL}", "uncovered part of an existing L2"])]
+    show_c = show_c.nlargest(args.label_top, "notes")
+    for c, nm in zip(show_c["cluster"], show_c["proposed_name"]):
+        m = cmap["cluster"] == c
+        if m.any() and nm:
+            star = " *" if promoted_of.get(c, "") else ""
+            ax_, ay_ = anchor(cmap[m])
+            ax.text(ax_, ay_, nm + star, fontsize=7, ha="center",
+                    bbox=dict(boxstyle="round,pad=0.15", fc="white", ec=vcolors[verdict_of[c]], alpha=0.85))
+    legend_out(ax)
+    tidy(ax, "Clusters found without assuming the known L2 (* = added as a new L2)")
+    fig.tight_layout()
+    fig.savefig(dirs["validation"] / "cluster_map_by_verdict.png", dpi=150)
+
+    newc = cmap[cmap["new_L2"] != ""]
+    if len(newc):
+        fig, ax = plt.subplots(figsize=(13, 9))
+        ax.scatter(cmap["x"], cmap["y"], s=3, alpha=0.25, color="#d9d9d9", label="all other notes")
+        npal = plt.get_cmap("tab10")(np.linspace(0, 1, max(newc["new_L2"].nunique(), 2)))
+        for i, (nm, g_) in enumerate(newc.groupby("new_L2")):
+            ax.scatter(g_["x"], g_["y"], s=12, alpha=0.9, color=npal[i], label=f"{nm} ({len(g_):,})")
+            ax_, ay_ = anchor(g_)
+            ax.text(ax_, ay_, nm, fontsize=9, weight="bold", ha="center",
+                    bbox=dict(boxstyle="round,pad=0.2", fc="white", ec=npal[i], alpha=0.9))
+        legend_out(ax)
+        tidy(ax, "New L2 added from the data, against all other notes")
+        fig.tight_layout()
+        fig.savefig(dirs["validation"] / "cluster_map_new_l2.png", dpi=150)
+
+    sizes = clusters[clusters["verdict"] != "unstable"].nlargest(args.label_top, "notes").iloc[::-1]
+    fig, ax = plt.subplots(figsize=(10, max(4, 0.3 * len(sizes))))
+    ax.barh([n or f"cluster {c}" for n, c in zip(sizes["proposed_name"], sizes["cluster"])], sizes["notes"],
+            color=[vcolors.get(v, "#999999") for v in sizes["verdict"]])
+    ax.set_xlabel("Notes")
+    ax.set_title(f"Largest {len(sizes)} stable clusters, coloured by verdict")
+    fig.tight_layout()
+    fig.savefig(dirs["validation"] / "cluster_sizes.png", dpi=150)
+plt.close("all")
+
+tick(f"deliverable: {deliverable}")
+for d in [outdir] + list(dirs.values()):
+    for f in sorted(p for p in d.iterdir() if p.is_file()):
+        print(f"  {f.relative_to(outdir)}")

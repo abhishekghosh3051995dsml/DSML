@@ -1,0 +1,2142 @@
+{
+  "version": "5.0",
+  "description": "NORA intent taxonomy for T-Mobile business care contacts. L2 = TM Forum eTOM process area applied to a service family; L4 = the specific customer need. Rules are regular expressions on normalised text (lower case, apostrophes removed, digits replaced by 'num'). Tier 1 = specific evidence, 2 = moderate, 3 = domain-level fallback and care transfers, 4 = ticket follow-ups and rep-assisted contacts (they lose to any stated topic), 5 = generic request words, 6 = last resort. The earliest, most specific match wins.",
+  "naming_convention": {
+    "case": "UPPER_SNAKE_CASE, English, no abbreviations except industry terms (SIM, ESIM, IMEI, SMS, RCS, LAN, IP, IOT)",
+    "l2": "eTOM level-2/3 process name (or its business object) + the service family it applies to, e.g. Service Problem Management + mobile voice -> MOBILE_VOICE_SERVICE_PROBLEM",
+    "l4": "<OBJECT>_<CONDITION or ACTION>, e.g. INCOMING_CALL_FAILURE, NUMBER_PORT_OUT, ESIM_ACTIVATION",
+    "process_ids": "eTOM IDs are quoted from Frameworx 13.0 (1.1.1.x customer, 1.1.2.x service); current eTOM renumbers these as 1.3.x (customer) and 1.4.x (service), e.g. 1.1.1.12 -> 1.3.11, 1.1.2.3 -> 1.4.6"
+  },
+  "sources": {
+    "ETOM_R13_CRM": {
+      "title": "TM Forum Frameworx 13.0, eTOM mapping 1.1.1 Customer Relationship Management (process IDs 1.1.1.x)",
+      "url": "https://tmforum.org/wp-content/uploads/2015/02/Fx13.0_eTOMMapping_1.1.1CustomerRelationshipManagement.pdf"
+    },
+    "ETOM_R13_SMO": {
+      "title": "TM Forum Frameworx 13.0, eTOM mapping 1.1.2 Service Management & Operations (process IDs 1.1.2.x)",
+      "url": "https://www.tmforum.org/wp-content/uploads/2015/02/Fx13.0_eTOMMapping_1.1.2ServiceManagement.pdf"
+    },
+    "ETOM_R16_CUSTOMER": {
+      "title": "TM Forum Frameworx R16.5, eTOM Customer domain level 2 processes",
+      "url": "https://www.tmforum.org/Browsable_HTML_Frameworx_R16.5/main/diagram2257c682a0de11e4b023002590713bc0.htm"
+    },
+    "ETOM_R16_BIH": {
+      "title": "eTOM R16.5: Bill Inquiry Handling 1.3.11 (original 1.1.1.12)",
+      "url": "https://www.tmforum.org/Browsable_HTML_Frameworx_R16.5/main/etomprocess36.htm"
+    },
+    "ETOM_R16_SPM": {
+      "title": "eTOM R16.5: Diagnose Service Problem 1.4.6.2 (original 1.1.2.3.2)",
+      "url": "https://www.tmforum.org/Browsable_HTML_Frameworx_R16.5/main/etomprocess73.htm"
+    },
+    "ETOM_PH_137": {
+      "title": "TM Forum Assurance process journey, eTOM 1.3.7 Problem Handling",
+      "url": "https://www.tmforum.org/wp-content/uploads/2014/08/Fx17_STC_AssuranceProcessJourney_eTOM_1_3_7_ProblemHandling_V3RF.pdf"
+    },
+    "ETOM_CSM": {
+      "title": "eTOM Customer Support Management (1.3.1) and its sub-processes",
+      "url": "https://tmforum.org/MODA/EARoot/EA5/EA1/EA2/EA7199.htm"
+    },
+    "TMF621": {
+      "title": "TMF621 Trouble Ticket Management API",
+      "url": "https://tmforum.org/oda/open-apis/directory/trouble-ticket-management-api-TMF621/v5.0.0"
+    },
+    "TMF640": {
+      "title": "TMF640 Service Activation and Configuration API",
+      "url": "https://tmforum.org/oda/open-apis/directory/service-activation-management-api-TMF640/v4.0.0"
+    },
+    "TMF656": {
+      "title": "TMF656 Service Problem Management API",
+      "url": "https://www.tmforum.org/oda/open-apis/directory/TMF656"
+    },
+    "TMF666": {
+      "title": "TMF666 Account Management API",
+      "url": "https://www.tmforum.org/open-digital-architecture/open-apis/account-management-api-TMF666/v5.0"
+    },
+    "TMF670": {
+      "title": "TMF670 Payment Methods API",
+      "url": "https://www.tmforum.org/resources/standard/tmf670-payment-methods-api-rest-specification-r17-5-0"
+    },
+    "TMF683": {
+      "title": "TMF683 Party Interaction Management API",
+      "url": "https://www.tmforum.org/oda/open-apis/directory/TMF683"
+    },
+    "TMF684": {
+      "title": "TMF684 Shipment Tracking API",
+      "url": "https://tmforum.org/resources/standard/tmf684-shipment-tracking-api-rest-specification-r18-0-0"
+    },
+    "TMF678": {
+      "title": "TMF678 Customer Bill Management API",
+      "url": "https://www.tmforum.org/wp-content/uploads/2021/09/678-API-Certification-Report-Summary-INSPUR-Sep2021.docx"
+    },
+    "TMF_API_LIST_SN": {
+      "title": "TM Forum Open API list as implemented by ServiceNow (TMF620, 621, 622, 632, 637, 639, 641, 642, 645, 648, 653)",
+      "url": "https://www.servicenow.com/docs/r/telecom-media-technology/telecommunications-media-and-technology-core/tmt-api-reference.html"
+    },
+    "TMF_API_LIST_SF": {
+      "title": "TM Forum Open API mappings as implemented by Salesforce (TMF620, 621, 622, 629, 637, 648, 651)",
+      "url": "https://developer.salesforce.com/docs/industries/communications/guide/resource_mappings.html"
+    },
+    "TMF_API_LIST_RS": {
+      "title": "Open-source TM Forum API library index (TMF635, 671, 672, 676, 679, 700); third-party listing",
+      "url": "https://docs.rs/tmflib/latest/tmflib/"
+    },
+    "TR290": {
+      "title": "TR290 Intent Common Model: reviewed and not used, it defines network/service intents for autonomous networks, not customer contact reasons",
+      "url": "https://www.tmforum.org/resources/standard/intent-common-model-v3-6-0-tr290"
+    }
+  },
+  "catch_all_l2": "GENERAL_SUPPORT",
+  "name_stop_words": [
+    "inquiry",
+    "required",
+    "request",
+    "contact"
+  ],
+  "l2_definitions": {
+    "CUSTOMER_INTERACTION_MANAGEMENT": {
+      "description": "Handling of the contact itself: transfers, misroutes, language, callbacks, dropped contacts",
+      "etom_processes": [
+        "1.1.1.2 Customer Interface Management",
+        "1.1.1.2.1 Manage Contact",
+        "1.1.1.2.4 Mediate & Orchestrate Customer Interactions",
+        "1.1.1.18 Customer Interaction Management"
+      ],
+      "open_apis": [
+        "TMF683 Party Interaction Management"
+      ],
+      "sources": [
+        "ETOM_R13_CRM",
+        "ETOM_R16_CUSTOMER",
+        "TMF683"
+      ]
+    },
+    "CUSTOMER_AUTHENTICATION": {
+      "description": "Signing in, PINs and identity checks for the account holder",
+      "etom_processes": [
+        "1.1.1.18.8 Authenticate User"
+      ],
+      "open_apis": [
+        "TMF672 User Roles and Permissions",
+        "TMF632 Party Management"
+      ],
+      "sources": [
+        "ETOM_R13_CRM",
+        "TMF_API_LIST_RS",
+        "TMF_API_LIST_SN"
+      ]
+    },
+    "CUSTOMER_INFORMATION_MANAGEMENT": {
+      "description": "Customer data: names, addresses, contacts, authorized users",
+      "etom_processes": [
+        "1.1.1.17 Customer Information Management",
+        "1.1.1.17.2 Update Customer Data"
+      ],
+      "open_apis": [
+        "TMF629 Customer Management",
+        "TMF632 Party Management"
+      ],
+      "sources": [
+        "ETOM_R13_CRM",
+        "TMF_API_LIST_SF",
+        "TMF_API_LIST_SN"
+      ]
+    },
+    "CUSTOMER_RELATIONSHIP_LIFECYCLE": {
+      "description": "Open, transfer ownership of, suspend, reinstate or close the customer relationship",
+      "etom_processes": [
+        "1.1.1.16 Customer Management",
+        "1.1.1.16.2 Establish Customer Relationship",
+        "1.1.1.16.3 Re-establish Customer Relationship",
+        "1.1.1.16.4 Terminate Customer Relationship"
+      ],
+      "open_apis": [
+        "TMF629 Customer Management",
+        "TMF666 Account Management"
+      ],
+      "sources": [
+        "ETOM_R13_CRM",
+        "TMF_API_LIST_SF",
+        "TMF666"
+      ]
+    },
+    "BILL_INQUIRY_HANDLING": {
+      "description": "Questions and complaints about a bill, its charges or usage",
+      "etom_processes": [
+        "1.1.1.12 Bill Inquiry Handling (current eTOM 1.3.11)",
+        "1.1.1.12.2 Assess Customer Bill Inquiry"
+      ],
+      "open_apis": [
+        "TMF678 Customer Bill Management",
+        "TMF635 Usage Management"
+      ],
+      "sources": [
+        "ETOM_R13_CRM",
+        "ETOM_R16_BIH",
+        "TMF678",
+        "TMF_API_LIST_RS"
+      ]
+    },
+    "BILL_INVOICE_MANAGEMENT": {
+      "description": "Producing and delivering the bill, and adjustments applied to it",
+      "etom_processes": [
+        "1.1.1.10 Bill Invoice Management",
+        "1.1.1.10.1 Apply Pricing, Discounting, Adjustments & Rebates",
+        "1.1.1.10.3 Produce & Distribute Bill"
+      ],
+      "open_apis": [
+        "TMF678 Customer Bill Management"
+      ],
+      "sources": [
+        "ETOM_R13_CRM",
+        "TMF678"
+      ]
+    },
+    "BILL_PAYMENTS_RECEIVABLES": {
+      "description": "Payments, payment methods, AutoPay and debt collection",
+      "etom_processes": [
+        "1.1.1.11 Bill Payments & Receivables Management",
+        "1.1.1.11.2 Manage Customer Payments",
+        "1.1.1.11.3 Manage Customer Debt Collection"
+      ],
+      "open_apis": [
+        "TMF676 Payment Management",
+        "TMF670 Payment Methods"
+      ],
+      "sources": [
+        "ETOM_R13_CRM",
+        "TMF670",
+        "TMF_API_LIST_RS"
+      ]
+    },
+    "PROMOTION_LOYALTY_MANAGEMENT": {
+      "description": "Promotions, rebates, trade-in credits and loyalty rewards",
+      "etom_processes": [
+        "1.1.1.9 Retention & Loyalty",
+        "1.1.1.10.1 Apply Pricing, Discounting, Adjustments & Rebates"
+      ],
+      "open_apis": [
+        "TMF671 Promotion Management"
+      ],
+      "sources": [
+        "ETOM_R13_CRM",
+        "TMF_API_LIST_RS"
+      ]
+    },
+    "PRODUCT_SERVICE_QUALIFICATION": {
+      "description": "Can this be offered here: coverage at an address, product availability and pricing",
+      "etom_processes": [
+        "1.1.1.5.1 Determine Customer Order Feasibility",
+        "1.1.1.4 Selling"
+      ],
+      "open_apis": [
+        "TMF645 Service Qualification",
+        "TMF679 Product Qualification",
+        "TMF648 Quote"
+      ],
+      "sources": [
+        "ETOM_R13_CRM",
+        "TMF_API_LIST_SN",
+        "TMF_API_LIST_RS"
+      ]
+    },
+    "PRODUCT_ORDER_MANAGEMENT": {
+      "description": "Ordering changes to the product: plans, features, add-on passes, new lines",
+      "etom_processes": [
+        "1.1.1.5 Order Handling",
+        "1.1.1.5.6 Issue Customer Orders"
+      ],
+      "open_apis": [
+        "TMF622 Product Ordering",
+        "TMF620 Product Catalog"
+      ],
+      "sources": [
+        "ETOM_R13_CRM",
+        "TMF_API_LIST_SN",
+        "TMF_API_LIST_SF"
+      ]
+    },
+    "ORDER_FULFILMENT": {
+      "description": "Device purchases, upgrades, shipping and delivery of orders",
+      "etom_processes": [
+        "1.1.1.5.4 Track & Manage Customer Order Handling",
+        "1.1.1.5.5 Complete Customer Order"
+      ],
+      "open_apis": [
+        "TMF622 Product Ordering",
+        "TMF684 Shipment Tracking",
+        "TMF700 Shipping Order"
+      ],
+      "sources": [
+        "ETOM_R13_CRM",
+        "TMF684",
+        "TMF_API_LIST_RS"
+      ]
+    },
+    "TROUBLE_TICKET_MANAGEMENT": {
+      "description": "Status, follow-up and escalation of an existing ticket or case",
+      "etom_processes": [
+        "1.1.1.6 Problem Handling (current eTOM 1.3.7)",
+        "1.1.1.6.3 Track & Manage Customer Problem"
+      ],
+      "open_apis": [
+        "TMF621 Trouble Ticket Management"
+      ],
+      "sources": [
+        "ETOM_R13_CRM",
+        "ETOM_PH_137",
+        "TMF621"
+      ]
+    },
+    "MOBILE_SERVICE_ACTIVATION": {
+      "description": "Activating, suspending, restoring and deactivating mobile lines, SIMs and eSIMs",
+      "etom_processes": [
+        "1.1.2.2 Service Configuration & Activation",
+        "1.1.2.2.4 Implement, Configure & Activate Service"
+      ],
+      "open_apis": [
+        "TMF640 Service Activation and Configuration",
+        "TMF641 Service Order Management"
+      ],
+      "sources": [
+        "ETOM_R13_SMO",
+        "TMF640",
+        "TMF_API_LIST_SN"
+      ]
+    },
+    "NUMBER_MANAGEMENT": {
+      "description": "Porting numbers in and out, number changes and number / IMEI records",
+      "etom_processes": [
+        "1.1.2.2.2 Allocate Specific Service Parameters to Services"
+      ],
+      "open_apis": [
+        "TMF640 Service Activation and Configuration",
+        "TMF639 Resource Inventory Management"
+      ],
+      "sources": [
+        "ETOM_R13_SMO",
+        "TMF640",
+        "TMF_API_LIST_SN"
+      ]
+    },
+    "NETWORK_COVERAGE_QUALITY": {
+      "description": "Mobile coverage and signal quality: no service, weak signal, outages",
+      "etom_processes": [
+        "1.1.2.4 Service Quality Management",
+        "1.1.2.4.5 Create Service Performance Degradation Report"
+      ],
+      "open_apis": [
+        "TMF656 Service Problem Management",
+        "TMF642 Alarm Management"
+      ],
+      "sources": [
+        "ETOM_R13_SMO",
+        "TMF656",
+        "TMF_API_LIST_SN"
+      ]
+    },
+    "MOBILE_VOICE_SERVICE_PROBLEM": {
+      "description": "Mobile voice service faults: calls that fail, drop or sound bad",
+      "etom_processes": [
+        "1.1.2.3 Service Problem Management (current eTOM 1.4.6)",
+        "1.1.2.3.2 Diagnose Service Problem"
+      ],
+      "open_apis": [
+        "TMF656 Service Problem Management",
+        "TMF621 Trouble Ticket Management"
+      ],
+      "sources": [
+        "ETOM_R13_SMO",
+        "ETOM_R16_SPM",
+        "TMF656"
+      ]
+    },
+    "MOBILE_DATA_SERVICE_PROBLEM": {
+      "description": "Mobile data service faults: no data, slow data, hotspot",
+      "etom_processes": [
+        "1.1.2.3 Service Problem Management (current eTOM 1.4.6)",
+        "1.1.2.3.2 Diagnose Service Problem"
+      ],
+      "open_apis": [
+        "TMF656 Service Problem Management"
+      ],
+      "sources": [
+        "ETOM_R13_SMO",
+        "ETOM_R16_SPM",
+        "TMF656"
+      ]
+    },
+    "ROAMING_SERVICE_PROBLEM": {
+      "description": "Service problems while abroad and on international calls",
+      "etom_processes": [
+        "1.1.2.3 Service Problem Management (current eTOM 1.4.6)"
+      ],
+      "open_apis": [
+        "TMF656 Service Problem Management"
+      ],
+      "sources": [
+        "ETOM_R13_SMO",
+        "ETOM_R16_SPM",
+        "TMF656"
+      ]
+    },
+    "MESSAGING_SERVICE_PROBLEM": {
+      "description": "Messaging service faults: texts not sent or received, codes and alerts not delivered",
+      "etom_processes": [
+        "1.1.2.3 Service Problem Management (current eTOM 1.4.6)"
+      ],
+      "open_apis": [
+        "TMF656 Service Problem Management"
+      ],
+      "sources": [
+        "ETOM_R13_SMO",
+        "ETOM_R16_SPM",
+        "TMF656"
+      ]
+    },
+    "VOICE_MESSAGING_FEATURE_CONFIGURATION": {
+      "description": "Configuring calling and messaging features: forwarding, voicemail, caller ID, blocking, Wi-Fi calling, chat",
+      "etom_processes": [
+        "1.1.2.2 Service Configuration & Activation",
+        "1.1.2.2.4 Implement, Configure & Activate Service"
+      ],
+      "open_apis": [
+        "TMF640 Service Activation and Configuration"
+      ],
+      "sources": [
+        "ETOM_R13_SMO",
+        "TMF640"
+      ]
+    },
+    "FIXED_WIRELESS_SERVICE_PROBLEM": {
+      "description": "Home / business internet service faults: offline gateway, slow, latency, drops",
+      "etom_processes": [
+        "1.1.2.3 Service Problem Management (current eTOM 1.4.6)",
+        "1.1.2.3.2 Diagnose Service Problem"
+      ],
+      "open_apis": [
+        "TMF656 Service Problem Management",
+        "TMF653 Service Test Management"
+      ],
+      "sources": [
+        "ETOM_R13_SMO",
+        "ETOM_R16_SPM",
+        "TMF656",
+        "TMF_API_LIST_SN"
+      ]
+    },
+    "HOME_NETWORK_CONFIGURATION": {
+      "description": "Configuring the home / business network: Wi-Fi, gateway setup, static IP, LAN devices",
+      "etom_processes": [
+        "1.1.2.2 Service Configuration & Activation",
+        "1.1.2.2.4 Implement, Configure & Activate Service"
+      ],
+      "open_apis": [
+        "TMF640 Service Activation and Configuration"
+      ],
+      "sources": [
+        "ETOM_R13_SMO",
+        "TMF640"
+      ]
+    },
+    "DEVICE_PROBLEM_MANAGEMENT": {
+      "description": "Handset and wearable problems: hardware, software, setup, compatibility",
+      "etom_processes": [
+        "1.1.1.6 Problem Handling (current eTOM 1.3.7)",
+        "1.1.1.6.1 Isolate Customer Problem"
+      ],
+      "open_apis": [
+        "TMF621 Trouble Ticket Management",
+        "TMF637 Product Inventory Management"
+      ],
+      "sources": [
+        "ETOM_R13_CRM",
+        "ETOM_PH_137",
+        "TMF621",
+        "TMF_API_LIST_SN"
+      ]
+    },
+    "DEVICE_SECURITY_PROTECTION": {
+      "description": "Device unlock, blocked or stolen devices, warranty exchange and insurance claims",
+      "etom_processes": [
+        "1.1.1.6 Problem Handling (current eTOM 1.3.7)",
+        "1.1.1.6.6 Correct & Recover Customer Problem"
+      ],
+      "open_apis": [
+        "TMF621 Trouble Ticket Management",
+        "TMF651 Agreement Management"
+      ],
+      "sources": [
+        "ETOM_R13_CRM",
+        "ETOM_PH_137",
+        "TMF621",
+        "TMF_API_LIST_SF"
+      ]
+    },
+    "DIGITAL_SELF_SERVICE": {
+      "description": "T-Mobile app, T-Life, Account Hub and other apps used by the customer",
+      "etom_processes": [
+        "1.1.1.2.2 Manage Request (Including Self Service)"
+      ],
+      "open_apis": [
+        "TMF683 Party Interaction Management"
+      ],
+      "sources": [
+        "ETOM_R13_CRM",
+        "TMF683"
+      ]
+    },
+    "GENERAL_SUPPORT": {
+      "description": "General questions, store information, how-to and requests that state no specific need",
+      "etom_processes": [
+        "1.1.1.2 Customer Interface Management",
+        "1.1.1.18 Customer Interaction Management"
+      ],
+      "open_apis": [
+        "TMF683 Party Interaction Management"
+      ],
+      "sources": [
+        "ETOM_R13_CRM",
+        "ETOM_CSM",
+        "TMF683"
+      ]
+    }
+  },
+  "taxonomy": {
+    "CUSTOMER_INTERACTION_MANAGEMENT": [
+      "CARE_TRANSFER",
+      "MISROUTED_CALL",
+      "LANGUAGE_SUPPORT",
+      "CALLBACK_REQUEST",
+      "DISCONNECTED_DEAD_AIR",
+      "REP_ASSISTED_CONTACT"
+    ],
+    "CUSTOMER_AUTHENTICATION": [
+      "ACCOUNT_LOGIN_ACCESS",
+      "ACCOUNT_PIN_SECURITY",
+      "IDENTITY_VERIFICATION"
+    ],
+    "CUSTOMER_INFORMATION_MANAGEMENT": [
+      "ACCOUNT_PROFILE_UPDATE",
+      "AUTHORIZED_USER_MANAGEMENT",
+      "ACCOUNT_INQUIRY"
+    ],
+    "CUSTOMER_RELATIONSHIP_LIFECYCLE": [
+      "ACCOUNT_SETUP",
+      "ACCOUNT_OWNERSHIP_TRANSFER",
+      "ACCOUNT_SUSPENSION_STATUS",
+      "ACCOUNT_CLOSURE"
+    ],
+    "BILL_INQUIRY_HANDLING": [
+      "BILL_EXPLANATION",
+      "BILLING_DISPUTE",
+      "BILLING_INQUIRY",
+      "USAGE_INQUIRY"
+    ],
+    "BILL_INVOICE_MANAGEMENT": [
+      "BILL_DELIVERY_PREFERENCES",
+      "CREDIT_ADJUSTMENT_REFUND"
+    ],
+    "BILL_PAYMENTS_RECEIVABLES": [
+      "PAYMENT_PROCESSING",
+      "PAYMENT_FAILURE",
+      "PAYMENT_METHOD_UPDATE",
+      "AUTOPAY_MANAGEMENT",
+      "PAST_DUE_BALANCE"
+    ],
+    "PROMOTION_LOYALTY_MANAGEMENT": [
+      "PROMOTION_REBATE",
+      "TRADE_IN_CREDIT",
+      "LOYALTY_REWARDS"
+    ],
+    "PRODUCT_SERVICE_QUALIFICATION": [
+      "COVERAGE_ADDRESS_QUALIFICATION",
+      "PRODUCT_AVAILABILITY_PRICING"
+    ],
+    "PRODUCT_ORDER_MANAGEMENT": [
+      "PLAN_CHANGE",
+      "FEATURE_PROVISIONING",
+      "INTERNATIONAL_PASS_ORDER",
+      "ADD_LINE_ORDER"
+    ],
+    "ORDER_FULFILMENT": [
+      "DEVICE_ORDER_SHIPPING",
+      "DEVICE_PURCHASE_UPGRADE"
+    ],
+    "TROUBLE_TICKET_MANAGEMENT": [
+      "TICKET_STATUS_FOLLOWUP",
+      "TICKET_ESCALATION"
+    ],
+    "MOBILE_SERVICE_ACTIVATION": [
+      "ESIM_ACTIVATION",
+      "SIM_CARD",
+      "LINE_ACTIVATION",
+      "LINE_SUSPENSION_RESTORE",
+      "LINE_DEACTIVATION",
+      "PROVISIONING_INQUIRY"
+    ],
+    "NUMBER_MANAGEMENT": [
+      "NUMBER_IMEI_RECORD",
+      "NUMBER_PORT_OUT",
+      "NUMBER_PORT_IN"
+    ],
+    "NETWORK_COVERAGE_QUALITY": [
+      "NO_SERVICE_SOS",
+      "WEAK_SIGNAL_INDOOR",
+      "NETWORK_OUTAGE",
+      "NETWORK_INQUIRY"
+    ],
+    "MOBILE_VOICE_SERVICE_PROBLEM": [
+      "INCOMING_CALL_FAILURE",
+      "OUTGOING_CALL_FAILURE",
+      "DROPPED_CALLS",
+      "CALL_AUDIO_QUALITY",
+      "CALLING_INQUIRY"
+    ],
+    "MOBILE_DATA_SERVICE_PROBLEM": [
+      "MOBILE_HOTSPOT",
+      "MOBILE_DATA_NO_CONNECTIVITY",
+      "MOBILE_DATA_SLOW_SPEED"
+    ],
+    "ROAMING_SERVICE_PROBLEM": [
+      "INTERNATIONAL_CALLING_ISSUE",
+      "ROAMING_SERVICE_ISSUE"
+    ],
+    "MESSAGING_SERVICE_PROBLEM": [
+      "SMS_SEND_FAILURE",
+      "SMS_RECEIVE_FAILURE",
+      "VERIFICATION_CODE_DELIVERY",
+      "SENDER_ID_DISPLAY",
+      "EMERGENCY_ALERTS_PAGING",
+      "MESSAGING_INQUIRY"
+    ],
+    "VOICE_MESSAGING_FEATURE_CONFIGURATION": [
+      "CALL_FORWARDING",
+      "VOICEMAIL",
+      "CALLER_ID",
+      "CALL_BLOCKING_SPAM",
+      "CALLING_FEATURES",
+      "WIFI_CALLING",
+      "RCS_IMESSAGE_CHAT",
+      "GROUP_MESSAGING",
+      "MESSAGING_APP"
+    ],
+    "FIXED_WIRELESS_SERVICE_PROBLEM": [
+      "GATEWAY_NO_CONNECTIVITY",
+      "INTERNET_SLOW_SPEED",
+      "INTERNET_LATENCY",
+      "INTERNET_INTERMITTENT",
+      "INTERNET_INQUIRY"
+    ],
+    "HOME_NETWORK_CONFIGURATION": [
+      "WIFI_CONFIGURATION",
+      "GATEWAY_SETUP",
+      "STATIC_IP_NETWORKING",
+      "LAN_DEVICE_CONNECTIVITY"
+    ],
+    "DEVICE_PROBLEM_MANAGEMENT": [
+      "DEVICE_HARDWARE_FAULT",
+      "DEVICE_SOFTWARE_SETTINGS",
+      "DEVICE_SETUP_COMPATIBILITY",
+      "WEARABLE_IOT",
+      "DEVICE_INQUIRY"
+    ],
+    "DEVICE_SECURITY_PROTECTION": [
+      "DEVICE_UNLOCK",
+      "DEVICE_BLOCKED_LOST_STOLEN",
+      "WARRANTY_EXCHANGE",
+      "DEVICE_INSURANCE_CLAIM"
+    ],
+    "DIGITAL_SELF_SERVICE": [
+      "TMOBILE_APP_ACCESS",
+      "APP_ERROR_CRASH",
+      "APP_NOTIFICATIONS_SETTINGS",
+      "TMOBILE_APP_FEATURE",
+      "THIRD_PARTY_APP",
+      "BUSINESS_APPLICATIONS",
+      "APPLICATION_INQUIRY"
+    ],
+    "GENERAL_SUPPORT": [
+      "STORE_RETAIL",
+      "NO_ACTION_REQUIRED",
+      "POLICY_PROCESS_INQUIRY",
+      "GENERAL_INQUIRY",
+      "UNCLEAR_REQUEST"
+    ]
+  },
+  "pattern_parts": {
+    "<NEG>": "(?:cannot|can not|can ?t|cant|unable to|not able to|couldn ?t|could not|won ?t|wont|isn ?t|doesn ?t|didn ?t|not|no longer|never)",
+    "<NET>": "(?:internet|wifi|wi fi|hsi|broadband)",
+    "<GW>": "(?:gateway|router|inseego|modem|\\bhsi\\b(?: device)?|mesh)",
+    "<DEV>": "(?:phone|device|iphone|samsung|galaxy|pixel|tablet|ipad|handset|flip|android|moto\\w*)",
+    "<MSG>": "(?:texts?|text messages?|messages|sms|mms|pictures? messages?|pics?)",
+    "<CARE>": "(?:(?:business|government|govt|gov|individual|consumer|tfb|prepaid|metro|apple ?care|international|tech) ?care|micro ?tech|\\bbts\\b|\\bats\\b|\\bncm\\b|tech support|sales|accounts? receivable|tier \\w+)",
+    "<XFER>": "(?:transferr?\\w*|\\btrans\\b|rout\\w*|re ?rout\\w*|sent over|send over)",
+    "<TRAVEL>": "(?:\\broam\\w*|abroad|overseas|out of (?:the )?(?:country|us)\\b|travel\\w*|landed in|international|\\bintl\\b|\\bint\\b|foreign)"
+  },
+  "lexicon": {
+    "CARE_TRANSFER": {
+      "description": "Transfer or route the contact to another care team or department",
+      "tier": 3,
+      "match": [
+        "<XFER> (?:\\w+ ){0,5}(?:to|over to|with) (?:the |a )?(?:\\w+ ){0,2}(?:<CARE>|team|dept|department|rep|specialist|tech|support|care)\\b",
+        "(?:need|want|request|ask)\\w* (?:\\w+ ){0,2}(?:to be )?(?:transferr\\w*|routed|connected) ",
+        "get (?:\\w+ ){0,3}(?:over|transferr\\w*) to",
+        "warm transfer\\w*",
+        "(?:transfer|route) (?:the )?(?:call|cx|customer|caller|consumer)\\b",
+        "(?:get|reach|need\\w*|want\\w*|look\\w* for|trying to reach) (?:\\w+ ){0,2}(?:<CARE>|care\\b)",
+        "transfer request\\w*",
+        "<CARE>"
+      ],
+      "exclude": [
+        "numbers?",
+        "transfer pin",
+        "data transfer",
+        "transfer (?:data|contacts|photos)"
+      ]
+    },
+    "MISROUTED_CALL": {
+      "description": "Misrouted contacts, wrong department, no help needed",
+      "tier": 1,
+      "match": [
+        "mis ?-? ?rout\\w*",
+        "(?:routed|transferred|sent) (?:to us |here )?(?:by )?(?:mistake|wrong\\w*|incorrect\\w*|in error)",
+        "wrong (?:department|dept|queue|team|place|line of business)",
+        "no help needed",
+        "(?:did ?n ?t|did not|doesn ?t|does not) need (?:help|assistance)",
+        "call re ?-? ?route"
+      ],
+      "exclude": []
+    },
+    "LANGUAGE_SUPPORT": {
+      "description": "Language preference, Spanish or other language representative, interpreter",
+      "tier": 1,
+      "match": [
+        "\\b(?:spanish|french|mandarin|cantonese|vietnamese|korean|portuguese|russian|arabic|hindi|tagalog|creole)\\b",
+        "interpret\\w*",
+        "translat\\w*",
+        "bilingual",
+        "\\blanguage\\b"
+      ],
+      "exclude": [
+        "voice ?mail"
+      ]
+    },
+    "CALLBACK_REQUEST": {
+      "description": "Callback requests, reconnect with a previous representative",
+      "tier": 1,
+      "match": [
+        "call ?-? ?backs?",
+        "(?:return|returning) (?:a |the |his |her |their )?calls?",
+        "get back in touch",
+        "reach (?:back|out) to (?:the )?(?:previous )?(?:rep|agent)",
+        "previous (?:rep|agent)"
+      ],
+      "exclude": []
+    },
+    "DISCONNECTED_DEAD_AIR": {
+      "description": "Contact disconnected, dead air, silent caller",
+      "tier": 1,
+      "match": [
+        "dead air",
+        "(?:lost|losing) (?:the )?connection with (?:the )?(?:care )?(?:rep|agent)",
+        "no one (?:would |was )?(?:respond|answer|on the line)",
+        "background noise",
+        "(?:hung|hang\\w*) up",
+        "(?:silence|silent) on (?:the )?line",
+        "nobody on the line",
+        "(?:call|line) (?:was )?disconnected (?:with|by) (?:the )?(?:rep|agent|care)"
+      ],
+      "exclude": []
+    },
+    "REP_ASSISTED_CONTACT": {
+      "description": "A store, care or partner representative calling on the customer's behalf",
+      "tier": 4,
+      "match": [
+        "(?:store|care|other|sales|retail|business|tfb|bts|apple|eu|end user) (?:rep|agent|employee)s? (?:\\w+ ){0,3}(?:calling|called|on (?:the )?line|trying)",
+        "\\brep (?:calling|called|needed|on line)"
+      ],
+      "exclude": []
+    },
+    "ACCOUNT_LOGIN_ACCESS": {
+      "description": "Cannot sign in to the account, forgotten or reset account password, locked out",
+      "tier": 1,
+      "match": [
+        "(?:log|sign)(?:ging)? ?(?:in|on)\\b",
+        "\\blogin\\b",
+        "authenticat\\w*",
+        "locked (?:\\w+ ){0,2}out",
+        "\\busername",
+        "(?:forgot|reset|change|update)\\w* (?:\\w+ ){0,3}password",
+        "\\bpassword\\b"
+      ],
+      "exclude": [
+        "wi ?fi|ssid|<GW>|voice ?mail|\\bvm\\b|\\bapp\\b|t ?life|account hub"
+      ]
+    },
+    "ACCOUNT_PIN_SECURITY": {
+      "description": "Account PIN, passcode or security question",
+      "tier": 1,
+      "match": [
+        "\\bpin\\b",
+        "pass ?code",
+        "security (?:question|code|word)"
+      ],
+      "exclude": [
+        "(?:transfer|release|port\\w*|number|vm|voice ?mail|sim) pin",
+        "pin .{0,15}(?:port|transfer)"
+      ]
+    },
+    "IDENTITY_VERIFICATION": {
+      "description": "Verify identity or authenticate the caller or account",
+      "tier": 2,
+      "match": [
+        "(?:verif|authenticat|validat)\\w* (?:\\w+ ){0,3}(?:identity|account|acct|caller|customer|\\bid\\b)",
+        "(?:identity|\\bid) verification",
+        "not listed on (?:the )?account",
+        "<NEG> (?:\\w+ )?(?:provide )?verif\\w*"
+      ],
+      "exclude": []
+    },
+    "ACCOUNT_PROFILE_UPDATE": {
+      "description": "Change name, address, email or contact details on the account",
+      "tier": 1,
+      "match": [
+        "(?:update|chang|correct)\\w* .{0,25}\\b(?:address|email|e mail|contact (?:info\\w*|number|details)|name on (?:the )?account|account (?:holder )?name|business name|legal name)",
+        "name change",
+        "profile"
+      ],
+      "exclude": [
+        "(?:wifi|network|ssid|router) name",
+        "shipping address|ship\\w* to"
+      ]
+    },
+    "AUTHORIZED_USER_MANAGEMENT": {
+      "description": "Add, remove or change authorized users and account managers",
+      "tier": 1,
+      "match": [
+        "authori[sz]ed users?",
+        "\\bau\\b",
+        "(?:add|remov|chang)\\w* (?:an? |the )?(?:authori[sz]ed )?(?:users?|account managers?|admins?)\\b",
+        "account manager",
+        "permissions?"
+      ],
+      "exclude": []
+    },
+    "ACCOUNT_INQUIRY": {
+      "description": "Other account requests",
+      "tier": 3,
+      "match": [
+        "\\baccounts?\\b",
+        "\\bacct\\b"
+      ],
+      "exclude": []
+    },
+    "ACCOUNT_SETUP": {
+      "description": "Open or create a new account, credit check",
+      "tier": 1,
+      "match": [
+        "(?:open|start|creat|set ?up|setting up|establish)\\w* (?:a |an |new |the |his |her |their )?(?:new )?(?:t ?mobile |business |personal |consumer )?(?:account|acct)\\b",
+        "new (?:t ?mobile |business )?account",
+        "credit (?:check|application|approval)"
+      ],
+      "exclude": []
+    },
+    "ACCOUNT_OWNERSHIP_TRANSFER": {
+      "description": "Change of responsibility, ownership or liability between accounts",
+      "tier": 1,
+      "match": [
+        "change of responsib\\w*",
+        "\\bcor\\b",
+        "(?:transfer|assum)\\w* (?:of )?(?:the )?(?:account )?(?:ownership|liability|responsib\\w*)",
+        "(?:government|business|corporate|company) (?:account )?to (?:a )?(?:personal|individual|consumer)",
+        "(?:move|transfer|migrat)\\w* (?:\\w+ ){0,3}(?:to|from) (?:a |an |the |his |her |their )?(?:personal|individual|consumer|business|government) account"
+      ],
+      "exclude": []
+    },
+    "ACCOUNT_SUSPENSION_STATUS": {
+      "description": "Account suspended, reinstated, closed or account status questions",
+      "tier": 1,
+      "match": [
+        "(?:account|acct) (?:is |was |got |has been |being )?(?:suspended|suspension|closed|inactive|cancel\\w*|reinstat\\w*|status|restricted)",
+        "reinstat\\w*",
+        "suspended (?:account|status)",
+        "(?:account|acct) .{0,20}suspended"
+      ],
+      "exclude": []
+    },
+    "ACCOUNT_CLOSURE": {
+      "description": "Cancel service or close the account",
+      "tier": 1,
+      "match": [
+        "(?:cancel|clos|terminat|discontinu)\\w* (?:\\w+ ){0,3}(?:service|account|acct)\\b"
+      ],
+      "exclude": [
+        "\\blines?\\b"
+      ]
+    },
+    "BILL_EXPLANATION": {
+      "description": "Explain charges, bill higher than expected, new or unknown fees",
+      "tier": 1,
+      "match": [
+        "bill (?:is |was |went |has gone |has )?(?:up|higher|increased|doubled|jumped|more)",
+        "higher (?:than (?:expected|normal|usual) )?bill",
+        "explain\\w* .{0,20}(?:bill|charges?|fees?)",
+        "(?:extra|unexpected|unknown|additional|new|random|unrecogni[sz]ed) (?:charges?|fees?)",
+        "prorat\\w*",
+        "charges? on (?:the |his |her |their |my )?bill",
+        "(?:roaming|international) charges"
+      ],
+      "exclude": []
+    },
+    "BILLING_DISPUTE": {
+      "description": "Dispute incorrect, duplicate or unwanted charges",
+      "tier": 1,
+      "match": [
+        "disput\\w*",
+        "overcharg\\w*",
+        "(?:charged|billed) (?:twice|double|incorrectly|wrong\\w*|in error)",
+        "(?:charged|billed) for (?:a |an |the |his |her |their )?(?:cancel\\w*|returned|closed|ported|old)",
+        "wrong (?:charges?|bill)",
+        "(?:still|being) (?:billed|charged) (?:after|for)"
+      ],
+      "exclude": []
+    },
+    "BILLING_INQUIRY": {
+      "description": "Other billing and charges questions",
+      "tier": 3,
+      "match": [
+        "\\bbill\\w*",
+        "\\bcharges?\\b",
+        "\\bcharged\\b",
+        "\\bpayments?\\b",
+        "\\bfees?\\b"
+      ],
+      "exclude": [
+        "(?:not |wont |won t |stopped |unable to |cant |can t )?charg\\w* (?:the |his |her |my |their )?(?:device|phone|watch|battery|port)"
+      ]
+    },
+    "BILL_DELIVERY_PREFERENCES": {
+      "description": "Bill statements, copies, paperless, billing alerts and cycle",
+      "tier": 1,
+      "match": [
+        "(?:bill|billing) statements?",
+        "paper ?(?:less|bill)",
+        "\\be ?bill",
+        "(?:copy|copies) of (?:the |his |her |their )?bills?",
+        "invoices?",
+        "payment reminders?",
+        "billing (?:alerts?|notifications?|preferences?|cycle|date|address)"
+      ],
+      "exclude": []
+    },
+    "CREDIT_ADJUSTMENT_REFUND": {
+      "description": "Request or apply a credit, refund or adjustment",
+      "tier": 1,
+      "match": [
+        "\\brefund\\w*",
+        "(?:bill|account) credits?",
+        "credits? (?:for|on|to|back) ",
+        "(?:want|request|apply|applied|missing|owed|need|issue)\\w* (?:a |the )?credits?",
+        "adjustment",
+        "reimburs\\w*",
+        "late fees?"
+      ],
+      "exclude": [
+        "credit (?:card|check|application)"
+      ]
+    },
+    "PAYMENT_PROCESSING": {
+      "description": "Make a payment, pay the bill, payment arrangement",
+      "tier": 1,
+      "match": [
+        "\\bpay (?:the |their |his |her |my |a |an |off |for )?(?:\\w+ )?(?:bill|balance)\\b",
+        "(?:make|making|process\\w*|take|taking|submit\\w*) (?:a |the )?payments?",
+        "payment arrangement",
+        "payment extension",
+        "\\bwants? to pay\\b"
+      ],
+      "exclude": [
+        "declin|fail|did ?n ?t go|not go"
+      ]
+    },
+    "PAYMENT_FAILURE": {
+      "description": "Payment declined, failed or not posted",
+      "tier": 1,
+      "match": [
+        "payments? .{0,20}(?:fail\\w*|declin\\w*|did ?n ?t go|did not go|not go\\w* through|reject\\w*|returned|bounced|not post\\w*)",
+        "card (?:was |is |got )?declined",
+        "<NEG> (?:\\w+ )?(?:pay\\b|make (?:a )?payment)"
+      ],
+      "exclude": []
+    },
+    "PAYMENT_METHOD_UPDATE": {
+      "description": "Update card, bank account or payment method on file",
+      "tier": 1,
+      "match": [
+        "(?:credit|debit) card (?:info\\w*|details|number|on file)?",
+        "card on file",
+        "payment method",
+        "(?:update|chang|add|remov)\\w* .{0,15}(?:card|bank (?:account|info\\w*))\\b"
+      ],
+      "exclude": [
+        "\\bsim\\b",
+        "\\be ?sim"
+      ]
+    },
+    "AUTOPAY_MANAGEMENT": {
+      "description": "Set up, change or troubleshoot AutoPay and its discount",
+      "tier": 1,
+      "match": [
+        "auto ?-? ?pay",
+        "automatic payments?"
+      ],
+      "exclude": []
+    },
+    "PAST_DUE_BALANCE": {
+      "description": "Past-due balance, collections, accounts receivable",
+      "tier": 1,
+      "match": [
+        "past due",
+        "(?:outstanding|remaining|overdue|unpaid) balance",
+        "collections?",
+        "accounts? receivable",
+        "arrears",
+        "(?:had|has|have) a balance",
+        "balance (?:due|owed|on (?:the )?account)"
+      ],
+      "exclude": []
+    },
+    "COVERAGE_ADDRESS_QUALIFICATION": {
+      "description": "Coverage check for an address or area, which tower serves a location",
+      "tier": 1,
+      "match": [
+        "coverage (?:info\\w*|map|check|inquir\\w*|at|for|in)",
+        "check (?:the |an )?(?:coverage|area|address)",
+        "(?:which|what) towers?",
+        "service (?:at|for) (?:a |an |the |this |her |his |their )?(?:address|location|area)"
+      ],
+      "exclude": []
+    },
+    "PLAN_CHANGE": {
+      "description": "Change rate plan, plan options",
+      "tier": 1,
+      "match": [
+        "(?:chang|switch|upgrad|downgrad|mov)\\w* .{0,20}\\bplans?\\b",
+        "(?:rate|price) plans?",
+        "plans? (?:change|options|question|retiring|details)",
+        "wrong plan",
+        "\\bunlimited\\b",
+        "plan back"
+      ],
+      "exclude": [
+        "protection plan",
+        "payment plan",
+        "<TRAVEL>"
+      ]
+    },
+    "FEATURE_PROVISIONING": {
+      "description": "Add or remove line features and add-ons (SOCs, blocking, hotspot feature)",
+      "tier": 1,
+      "match": [
+        "\\b(?:add|adding|remov|enabl|disabl)\\w* .{0,25}(?:features?|\\bsocs?\\b|scam (?:block|shield)|hot ?spot|block\\w*|voicemail to text|family allowance|parental|content filter)",
+        "scam block",
+        "\\bsocs?\\b",
+        "features? (?:provisioning|request|change|add\\w*)",
+        "add ?-?ons?",
+        "features? (?:on|to|from) (?:the |his |her |their )?line"
+      ],
+      "exclude": [
+        "<TRAVEL>"
+      ]
+    },
+    "DEVICE_ORDER_SHIPPING": {
+      "description": "Device order, shipping, delivery, tracking and returns",
+      "tier": 1,
+      "match": [
+        "\\bship\\w*",
+        "\\bshipments?",
+        "tracking",
+        "\\border(?:s|ed)?\\b",
+        "return (?:label|kit|the device|the phone|(?:a |the )?device)",
+        "(?:device|phone|order) (?:was |has been )?(?:returned|never arrived|not received|delayed)",
+        "wrong address"
+      ],
+      "exclude": [
+        "in order to",
+        "<MSG>",
+        "money order"
+      ]
+    },
+    "DEVICE_PURCHASE_UPGRADE": {
+      "description": "Buy or upgrade a device, device financing",
+      "tier": 1,
+      "match": [
+        "upgrade (?:his |her |their |my |a |the )?(?:phone|device|iphone|ipad|tablet)\\b",
+        "(?:buy|purchas|acquir)\\w* (?:a |an |new |the )?(?:\\w+ )?(?:phone|device|iphone|tablet|ipad)\\b",
+        "\\beip\\b",
+        "financ\\w*",
+        "installments?",
+        "wants? to upgrade"
+      ],
+      "exclude": [
+        "\\bplans?\\b"
+      ]
+    },
+    "ESIM_ACTIVATION": {
+      "description": "eSIM activation, QR codes, EID",
+      "tier": 1,
+      "match": [
+        "\\be ?-? ?sims?\\b",
+        "\\bqr code",
+        "\\beid\\b"
+      ],
+      "exclude": []
+    },
+    "SIM_CARD": {
+      "description": "Physical SIM: new SIM, SIM swap, SIM shipped, SIM not detected",
+      "tier": 1,
+      "match": [
+        "\\bp ?sims?\\b",
+        "\\bsim (?:cards?|swap|change|replacement)\\b",
+        "(?:new|replac\\w*|swap\\w*) (?:p ?)?sim\\b",
+        "\\bsim (?:card )?(?:sent|shipped|mailed|incorrect|wrong|not (?:detected|recognized|reading))",
+        "no sim",
+        "invalid sim"
+      ],
+      "exclude": [
+        "\\be ?-? ?sim"
+      ]
+    },
+    "LINE_ACTIVATION": {
+      "description": "Activate a line, device or IMEI; add a new line",
+      "tier": 1,
+      "match": [
+        "activat\\w* (?:\\w+ ){0,3}(?:lines?|watch|device|phones?|tablet|ipad|iphone|imei|hotspot|new|service)\\b",
+        "activation"
+      ],
+      "exclude": [
+        "\\be ?-? ?sim",
+        "\\bp ?sim\\b",
+        "\\bsim\\b",
+        "<GW>"
+      ]
+    },
+    "LINE_SUSPENSION_RESTORE": {
+      "description": "Suspend, restore or reactivate a line or device",
+      "tier": 1,
+      "match": [
+        "lines? (?:is |was |got |are )?(?:suspended|suspension|restricted|hotlined|barred)",
+        "suspend\\w* (?:\\w+ ){0,2}lines?",
+        "(?:restor|reactivat|reconnect|unsuspend)\\w*"
+      ],
+      "exclude": [
+        "(?:account|acct)",
+        "settings"
+      ]
+    },
+    "LINE_DEACTIVATION": {
+      "description": "Deactivate, cancel or remove lines",
+      "tier": 1,
+      "match": [
+        "deactivat\\w*",
+        "(?:cancel|disconnect|remov|terminat)\\w* (?:\\w+ ){0,3}lines?\\b",
+        "return (?:some )?(?:phone )?lines"
+      ],
+      "exclude": []
+    },
+    "PROVISIONING_INQUIRY": {
+      "description": "Other activation and line requests",
+      "tier": 3,
+      "match": [
+        "\\bactivat\\w*",
+        "provision\\w*",
+        "(?:voice|data|new|additional|extra) lines?\\b"
+      ],
+      "exclude": []
+    },
+    "NUMBER_IMEI_RECORD": {
+      "description": "Phone number change, MSISDN / IMEI record errors",
+      "tier": 1,
+      "match": [
+        "\\bmsisdn\\b",
+        "imei (?:is |was )?(?:duplicat\\w*|mismatch\\w*|wrong|incorrect|updat\\w*|chang\\w*)",
+        "(?:chang|new)\\w* (?:phone )?number\\b",
+        "number change",
+        "duplicated on"
+      ],
+      "exclude": [
+        "port",
+        "transfer"
+      ]
+    },
+    "NO_SERVICE_SOS": {
+      "description": "No service, SOS only, not registering on the network",
+      "tier": 1,
+      "match": [
+        "\\bsos\\b",
+        "no (?:service|signal|bars|network|reception)\\b",
+        "emergency calls? only",
+        "not register\\w*",
+        "not seeing (?:\\w+ )?service",
+        "no signal registration"
+      ],
+      "exclude": []
+    },
+    "WEAK_SIGNAL_INDOOR": {
+      "description": "Weak or poor signal, indoor coverage, signal boosters / cell spots",
+      "tier": 1,
+      "match": [
+        "(?:weak|poor|bad|low|spotty|limited) (?:phone |cell |cellular |network )?(?:signal|sign al|service|reception|coverage|bars)",
+        "one bar",
+        "(?:signal|reception) (?:is )?(?:weak|poor|bad)",
+        "indoors?",
+        "cell ?spots?",
+        "signal booster",
+        "femto\\w*",
+        "network extender",
+        "\\bcoverage\\b"
+      ],
+      "exclude": []
+    },
+    "NETWORK_OUTAGE": {
+      "description": "Outages, tower work, several lines losing service at once",
+      "tier": 1,
+      "match": [
+        "\\boutages?\\b",
+        "towers? (?:\\w+ ){0,2}(?:work|repair\\w*|down|issue\\w*|fixed)",
+        "(?:all|multiple|several) (?:\\w+ ){0,3}(?:lines|phones|devices|cell ?spots)\\b.{0,40}(?:no service|stopped|not working|down|poor)"
+      ],
+      "exclude": []
+    },
+    "NETWORK_INQUIRY": {
+      "description": "Other mobile network questions",
+      "tier": 3,
+      "match": [
+        "\\bsignal\\b",
+        "\\bnetwork\\b",
+        "\\bcell(?:ular)?\\b",
+        "\\blte\\b",
+        "\\bservice\\b"
+      ],
+      "exclude": []
+    },
+    "INCOMING_CALL_FAILURE": {
+      "description": "Cannot receive calls, not ringing, straight to voicemail",
+      "tier": 1,
+      "match": [
+        "<NEG> (?:\\w+ ){0,2}(?:receiv\\w*|recv|recieve\\w*|get|getting) (?:any |incoming |phone )?calls",
+        "incoming calls?",
+        "(?:straight|going|goes|go|routing|routed) to (?:\\w+ ){0,2}voice ?mail",
+        "not ringing",
+        "no ring",
+        "(?:make|making) (?:or|and|nor) (?:receive|recv|recieve)\\w* calls"
+      ],
+      "exclude": [
+        "<TRAVEL>"
+      ]
+    },
+    "OUTGOING_CALL_FAILURE": {
+      "description": "Cannot make calls, outbound calls fail",
+      "tier": 1,
+      "match": [
+        "<NEG> (?:\\w+ ){0,2}(?:make|making|place|placing) (?:any |outbound |outgoing |phone )?calls",
+        "outgoing calls?",
+        "outbound calls?",
+        "(?:unable|cant|cannot|can t) (?:to )?call out",
+        "calls? (?:fail\\w*|not going through|wont go through|won t go through)",
+        "cant make calls"
+      ],
+      "exclude": [
+        "<TRAVEL>"
+      ]
+    },
+    "DROPPED_CALLS": {
+      "description": "Calls dropping on the mobile network",
+      "tier": 1,
+      "match": [
+        "\\bdrop\\w* calls?",
+        "calls? .{0,25}\\bdrop\\w*",
+        "calls? (?:\\w+ )?(?:disconnect\\w*|cut\\w* (?:off|out))"
+      ],
+      "exclude": [
+        "\\brep\\b|\\bagent\\b|\\bcare\\b|transferr"
+      ]
+    },
+    "CALL_AUDIO_QUALITY": {
+      "description": "Poor call audio: choppy, echo, one-way audio",
+      "tier": 1,
+      "match": [
+        "(?:audio|voice|call) quality",
+        "choppy",
+        "robotic",
+        "garbled",
+        "echo\\w*",
+        "\\bstatic\\b",
+        "muffled",
+        "broken up",
+        "one ?-? ?way audio",
+        "<NEG> hear",
+        "audio on calls"
+      ],
+      "exclude": []
+    },
+    "CALLING_INQUIRY": {
+      "description": "Other voice calling questions",
+      "tier": 3,
+      "match": [
+        "\\bcalls\\b",
+        "\\bvoice (?:line|service|calls?)\\b"
+      ],
+      "exclude": []
+    },
+    "MOBILE_HOTSPOT": {
+      "description": "Mobile hotspot / tethering not working",
+      "tier": 1,
+      "match": [
+        "\\bhot ?spot\\b",
+        "tethering"
+      ],
+      "exclude": [
+        "(?:add|adding|remov\\w*|enabl\\w*)\\w* .{0,20}hot ?spot",
+        "inseego",
+        "activat\\w* .{0,25}hot ?spot"
+      ]
+    },
+    "SMS_SEND_FAILURE": {
+      "description": "Cannot send SMS / MMS / picture messages",
+      "tier": 1,
+      "match": [
+        "<NEG> (?:\\w+ ){0,3}send(?:ing)? (?:\\w+ ){0,2}<MSG>",
+        "(?:sms|mms|text\\w*|messag\\w*) send(?:ing)? (?:fail\\w*|error|issue)",
+        "<MSG> .{0,20}(?:not (?:sending|going (?:out|through)|delivered|deliver)|fail\\w* to send|won ?t send)"
+      ],
+      "exclude": [
+        "error messages?",
+        "(?:getting|got|gets|receiv\\w*|shows?|showing) (?:a |an |the )?(?:error )?message (?:that|saying|says|stating)"
+      ]
+    },
+    "SMS_RECEIVE_FAILURE": {
+      "description": "Not receiving SMS / MMS, delayed texts",
+      "tier": 1,
+      "match": [
+        "<NEG> (?:\\w+ ){0,3}(?:receiv\\w*|recieve\\w*|get|getting) (?:any |all |their |his |her |some )?<MSG>",
+        "<MSG> .{0,20}(?:not (?:coming|received|arriving)|delayed)",
+        "(?:texts?|messages|sms) not coming in",
+        "(?:sms|mms|text\\w*|messag\\w*) receiv\\w* (?:fail\\w*|error|issue)"
+      ],
+      "exclude": [
+        "error messages?",
+        "voice ?mail"
+      ]
+    },
+    "VERIFICATION_CODE_DELIVERY": {
+      "description": "One-time passcodes, verification texts, short codes",
+      "tier": 1,
+      "match": [
+        "\\botps?\\b",
+        "short ?codes?",
+        "(?:verification|security|one time|authentication) (?:codes?|texts?)",
+        "\\b2fa\\b",
+        "two factor"
+      ],
+      "exclude": []
+    },
+    "SENDER_ID_DISPLAY": {
+      "description": "Texts show an email address or a different number as the sender",
+      "tier": 1,
+      "match": [
+        "(?:showing|shows|displays?|appears?) (?:their |his |her |an? |the )?(?:email|wrong number|different number|private number)",
+        "number is different from",
+        "shows? mdn"
+      ],
+      "exclude": []
+    },
+    "EMERGENCY_ALERTS_PAGING": {
+      "description": "Wireless emergency alerts, paging",
+      "tier": 1,
+      "match": [
+        "emergency (?:alerts?|pages?)",
+        "amber alerts?",
+        "\\bwea\\b",
+        "\\bpag(?:es|ing|er)\\b"
+      ],
+      "exclude": []
+    },
+    "MESSAGING_INQUIRY": {
+      "description": "Other texting and messaging questions",
+      "tier": 3,
+      "match": [
+        "<MSG>",
+        "messaging"
+      ],
+      "exclude": [
+        "error messages?",
+        "(?:getting|got|gets|shows?|showing) (?:a |an |the )?(?:error )?message"
+      ]
+    },
+    "CALL_FORWARDING": {
+      "description": "Call forwarding setup and failures",
+      "tier": 1,
+      "match": [
+        "\\bforward\\w*",
+        "\\bfwd\\b",
+        "\\bfwrd\\b"
+      ],
+      "exclude": [
+        "(?:moving|going) forward",
+        "port forward\\w*",
+        "look\\w* forward"
+      ]
+    },
+    "VOICEMAIL": {
+      "description": "Voicemail setup, password, greeting, visual voicemail",
+      "tier": 1,
+      "match": [
+        "voice ?mails?",
+        "\\bvm\\b"
+      ],
+      "exclude": [
+        "(?:straight|going|goes|go|routing|routed) to (?:\\w+ ){0,2}voice ?mail"
+      ]
+    },
+    "CALLER_ID": {
+      "description": "Caller ID / CNAM showing wrong name or number",
+      "tier": 1,
+      "match": [
+        "caller ?-? ?id",
+        "\\bcnam\\b",
+        "name id",
+        "(?:wrong|private|unknown) (?:name|number) (?:is )?(?:showing|display\\w*)",
+        "showing (?:the )?wrong name"
+      ],
+      "exclude": []
+    },
+    "CALL_BLOCKING_SPAM": {
+      "description": "Spam and scam calls, blocking numbers or callers",
+      "tier": 1,
+      "match": [
+        "spam",
+        "robo ?calls?",
+        "scam (?:calls?|likely)",
+        "block\\w* (?:a |the |certain |unknown )?(?:numbers?|calls?|callers?)",
+        "scam shield"
+      ],
+      "exclude": [
+        "(?:add|adding|remov\\w*) .{0,10}scam"
+      ]
+    },
+    "CALLING_FEATURES": {
+      "description": "Conference / three-way calling, call waiting, hold, HD voice",
+      "tier": 1,
+      "match": [
+        "three ?-? ?way",
+        "conference call\\w*",
+        "call waiting",
+        "call hold",
+        "hd voice",
+        "call (?:settings|features)"
+      ],
+      "exclude": []
+    },
+    "WIFI_CALLING": {
+      "description": "Wi-Fi calling",
+      "tier": 1,
+      "match": [
+        "wi ?-? ?fi call\\w*",
+        "vowifi"
+      ],
+      "exclude": []
+    },
+    "RCS_IMESSAGE_CHAT": {
+      "description": "iMessage, FaceTime, RCS and chat features",
+      "tier": 1,
+      "match": [
+        "\\brcs\\b",
+        "\\bi ?messages?\\b",
+        "chat features?",
+        "\\bfacetime\\b"
+      ],
+      "exclude": []
+    },
+    "GROUP_MESSAGING": {
+      "description": "Group texts and group MMS",
+      "tier": 1,
+      "match": [
+        "group (?:chat|messag\\w*|texts?|mms)"
+      ],
+      "exclude": []
+    },
+    "MESSAGING_APP": {
+      "description": "Default messaging app problems (e.g. Google Messages)",
+      "tier": 1,
+      "match": [
+        "google messages?",
+        "messag\\w* app",
+        "prompting to open (?:\\w+ )?messag\\w*"
+      ],
+      "exclude": []
+    },
+    "GATEWAY_NO_CONNECTIVITY": {
+      "description": "Gateway or home/business internet offline, no connection, warning lights",
+      "tier": 1,
+      "match": [
+        "<GW>.{0,40}(?:offline|not working|no internet|no connection|not connect\\w*|no service|\\bdown\\b|boot\\w*|not providing|unplugged|dead|no power|not powering|won ?t (?:turn|power))",
+        "<GW>.{0,40}(?:lights?|leds?) .{0,15}(?:red|yellow|orange|white|blink\\w*|flash\\w*|solid|off|out)",
+        "(?:yellow|red|white|orange|blue) (?:signal )?(?:leds?|lights?)\\b",
+        "no (?:service|signal|internet|connection) (?:on|with|from|to) (?:the |his |her |their |this )?<GW>",
+        "no (?:home |business )?(?:internet|wi ?fi|broadband)\\b",
+        "(?:home |business )?internet (?:service )?(?:is |was |has been )?(?:not working|down|out|offline|not connecting)",
+        "not getting (?:any )?internet",
+        "<NEG> (?:\\w+ ){0,2}(?:connect|access)\\w* (?:\\w+ ){0,2}(?:to )?(?:the )?(?:internet|<GW>)"
+      ],
+      "exclude": [
+        "<TRAVEL>",
+        "(?:cellular|mobile|cell) data"
+      ]
+    },
+    "INTERNET_SLOW_SPEED": {
+      "description": "Slow home/business internet speeds or throttling",
+      "tier": 1,
+      "match": [
+        "(?:slow|speeds?|mbps|throttl\\w*|bandwidth|decreas\\w*) .{0,30}(?:<NET>|<GW>)",
+        "(?:<NET>|<GW>).{0,30}(?:slow|speeds?|mbps|throttl\\w*|bandwidth|decreas\\w*)"
+      ],
+      "exclude": [
+        "<TRAVEL>"
+      ]
+    },
+    "INTERNET_LATENCY": {
+      "description": "Latency, ping, lag, packet loss",
+      "tier": 1,
+      "match": [
+        "latency",
+        "\\bping\\b",
+        "\\blag\\w*",
+        "packet loss",
+        "jitter",
+        "freez\\w* while gaming"
+      ],
+      "exclude": []
+    },
+    "INTERNET_INTERMITTENT": {
+      "description": "Internet connection drops or cuts in and out",
+      "tier": 1,
+      "match": [
+        "(?:<NET>|<GW>|connection).{0,30}(?:cutting|going|drop\\w*|disconnect\\w*|in and out|on and off|intermittent\\w*)",
+        "(?:losing|lost) connection (?:on|with|to) (?:the |his |her |their )?<GW>",
+        "losing connection .{0,15}daily"
+      ],
+      "exclude": [
+        "calls?",
+        "\\brep\\b",
+        "<TRAVEL>"
+      ]
+    },
+    "INTERNET_INQUIRY": {
+      "description": "Other home / business internet questions",
+      "tier": 3,
+      "match": [
+        "<NET>",
+        "<GW>"
+      ],
+      "exclude": [
+        "<TRAVEL>"
+      ]
+    },
+    "WIFI_CONFIGURATION": {
+      "description": "Wi-Fi name / password, SSID broadcast, mesh, bands",
+      "tier": 1,
+      "match": [
+        "\\bssid",
+        "wi ?fi (?:name|password|network name|settings|broadcast\\w*|configur\\w*|config|setup|set up)",
+        "(?:change|update|reset)\\w* .{0,25}(?:wi ?fi|network|<GW>) (?:name|password)",
+        "broadcast\\w*",
+        "\\bmesh\\b",
+        "extender",
+        "\\bghz\\b",
+        "password on (?:her |his |their |the )?(?:\\w+ )?<GW>"
+      ],
+      "exclude": []
+    },
+    "GATEWAY_SETUP": {
+      "description": "Install, activate or set up a gateway / router",
+      "tier": 1,
+      "match": [
+        "(?:set ?(?:ting)? ?up|setup|install\\w*|configur\\w*|activat\\w*) .{0,25}<GW>",
+        "<GW>.{0,25}(?:set ?up|setup|install\\w*)",
+        "(?:new|replacement|received|recv d|recv) (?:\\w+ ){0,2}<GW>",
+        "\\bplacement\\b"
+      ],
+      "exclude": []
+    },
+    "STATIC_IP_NETWORKING": {
+      "description": "Static IP, IP passthrough, subnet, port forwarding, DNS",
+      "tier": 1,
+      "match": [
+        "static ip",
+        "\\bip (?:address|passthrough|pass through)",
+        "subnet",
+        "passthrough",
+        "port forward\\w*",
+        "\\bdns\\b",
+        "public ip",
+        "\\bwan\\b"
+      ],
+      "exclude": []
+    },
+    "LAN_DEVICE_CONNECTIVITY": {
+      "description": "Ethernet / LAN ports, TVs, printers and other devices on the home network",
+      "tier": 1,
+      "match": [
+        "(?:\\blan|ethernet) ?(?:ports?|cables?|connection)?",
+        "(?:smart )?\\btv\\b",
+        "printers?",
+        "\\broku\\b",
+        "landline (?:to|into) (?:the |this )?(?:router|gateway)",
+        "<NEG> (?:\\w+ ){0,2}connect (?:any |her |his |their )?devices? to"
+      ],
+      "exclude": []
+    },
+    "DEVICE_HARDWARE_FAULT": {
+      "description": "Screen, power, charging, battery, overheating, camera, speaker or physical damage",
+      "tier": 1,
+      "match": [
+        "<NEG> (?:\\w+ ){0,2}(?:power\\w*|turn\\w*) on",
+        "(?:not|wont|won t|stopped|isnt|isn t) (?:\\w+ )?(?:charging|charge|powering|turning on)",
+        "(?:unable|cant|can t|cannot) (?:to )?charge",
+        "charging port",
+        "battery",
+        "overheat\\w*",
+        "(?:screen|display) (?:is |was |went |stays? )?(?:cracked|broken|black|blank|off|frozen|stuck|lines|flicker\\w*|unresponsive|dim)",
+        "\\bcracked\\b",
+        "water damage",
+        "(?:keeps |kept )?(?:restarting|rebooting|powering (?:off|on and off)|shutting (?:off|down))",
+        "(?:speaker|microphone|\\bmic\\b|camera|button|sensor|touch ?screen)s?\\b",
+        "\\bdamaged\\b",
+        "\\bbroken (?:phone|device|screen)"
+      ],
+      "exclude": [
+        "<GW>"
+      ]
+    },
+    "DEVICE_SOFTWARE_SETTINGS": {
+      "description": "Software / OS updates, apps installing themselves, malware, MDM, factory reset / Device settings, location services, Bluetooth, GPS",
+      "tier": 1,
+      "match": [
+        "(?:software|\\bos\\b|system|ios|android) updates?",
+        "apps? (?:\\w+ )?(?:downloading|installing) (?:randomly|by (?:it|them)sel\\w*|on (?:its|their) own)",
+        "virus",
+        "malware",
+        "hack\\w*",
+        "\\bmdm\\b",
+        "factory reset",
+        "(?:reset|restore) (?:network )?settings",
+        "bluetooth",
+        "\\bgps\\b",
+        "location (?:services?|sharing|tracking|settings)",
+        "turn location",
+        "(?:device|phone) settings"
+      ],
+      "exclude": []
+    },
+    "DEVICE_SETUP_COMPATIBILITY": {
+      "description": "Set up a handset, pair accessories, transfer data to a new device / Device compatibility and bring-your-own-device",
+      "tier": 1,
+      "match": [
+        "set ?(?:ting)? ?up (?:a |the |his |her |their |new )*<DEV>",
+        "transfer (?:data|contacts|photos|pictures)",
+        "data transfer",
+        "\\bpair\\w*",
+        "compatib\\w*",
+        "\\bbyod\\b",
+        "bring (?:their|his|her|your) own",
+        "(?:not |un)supported (?:device|phone)",
+        "not supporting"
+      ],
+      "exclude": [
+        "<GW>"
+      ]
+    },
+    "WEARABLE_IOT": {
+      "description": "Smartwatches, kids watches, trackers and connected IoT devices",
+      "tier": 1,
+      "match": [
+        "\\bwatch(?:es)?\\b",
+        "wearables?",
+        "sync ?up",
+        "\\btrackers?\\b",
+        "\\biot\\b",
+        "telematics",
+        "geo ?tabs?"
+      ],
+      "exclude": [
+        "watch (?:tv|movies|videos)"
+      ]
+    },
+    "DEVICE_INQUIRY": {
+      "description": "Other handset questions",
+      "tier": 3,
+      "match": [
+        "<DEV>"
+      ],
+      "exclude": []
+    },
+    "DEVICE_UNLOCK": {
+      "description": "Carrier / network unlock of a handset",
+      "tier": 1,
+      "match": [
+        "\\bunlock\\w*"
+      ],
+      "exclude": [
+        "(?:unlock|unlocking) (?:the |his |her |their )?account"
+      ]
+    },
+    "DEVICE_BLOCKED_LOST_STOLEN": {
+      "description": "IMEI blocked or blacklisted, lost or stolen device",
+      "tier": 1,
+      "match": [
+        "imei (?:is |was )?(?:block\\w*|blacklist\\w*|barr\\w*)",
+        "blacklist\\w*",
+        "\\bunblock\\w*",
+        "\\bstolen\\b",
+        "lost (?:and found|or stolen|(?:his |her |their |my |the )?(?:phone|device|iphone))"
+      ],
+      "exclude": []
+    },
+    "TMOBILE_APP_ACCESS": {
+      "description": "Sign-in and registration for the T-Mobile app, T-Life or Account Hub",
+      "tier": 1,
+      "match": [
+        "(?:log|sign) ?(?:in|on|up).{0,25}(?:\\bapp\\b|t ?life|account hub|my t ?mobile)",
+        "(?:\\bapp\\b|t ?life|account hub).{0,25}(?:log|sign) ?(?:in|on|up)|login",
+        "account hub",
+        "\\bt ?-? ?life\\b",
+        "my t ?mobile"
+      ],
+      "exclude": []
+    },
+    "APP_ERROR_CRASH": {
+      "description": "App crashes, errors, stuck loading",
+      "tier": 1,
+      "match": [
+        "\\bapps?\\b .{0,20}(?:crash\\w*|errors?|stuck|freez\\w*|not (?:loading|opening|working)|keeps closing|loading screen|glitch\\w*)",
+        "error codes?",
+        "app errors?"
+      ],
+      "exclude": []
+    },
+    "APP_NOTIFICATIONS_SETTINGS": {
+      "description": "App notifications and in-app settings",
+      "tier": 1,
+      "match": [
+        "app (?:notifications?|settings|preferences)",
+        "notification settings",
+        "(?:turn|stop|disabl|enabl)\\w* (?:off |on )?(?:app )?notifications?"
+      ],
+      "exclude": [
+        "<MSG>|payment|billing"
+      ]
+    },
+    "TMOBILE_APP_FEATURE": {
+      "description": "T-Mobile Tuesdays, rewards, usage and features inside the T-Mobile app",
+      "tier": 1,
+      "match": [
+        "t ?mobile tuesdays?",
+        "\\btuesdays?\\b",
+        "rewards?",
+        "usage (?:in|on) (?:the )?app",
+        "(?:t ?mobile|tmo|tmobile) app"
+      ],
+      "exclude": []
+    },
+    "THIRD_PARTY_APP": {
+      "description": "Third-party apps and services (WhatsApp, Google, Teams, games, streaming)",
+      "tier": 1,
+      "match": [
+        "whats ?app",
+        "\\bgoogle\\b",
+        "\\bteams\\b",
+        "roblox",
+        "online gaming",
+        "netflix",
+        "youtube",
+        "facebook",
+        "instagram",
+        "\\bzoom\\b",
+        "outlook",
+        "gmail",
+        "email (?:app|not syncing|setup)",
+        "third ?-? ?party"
+      ],
+      "exclude": [
+        "google messag\\w*"
+      ]
+    },
+    "BUSINESS_APPLICATIONS": {
+      "description": "Business solutions: VPN, virtual desktop, portals and dashboards",
+      "tier": 1,
+      "match": [
+        "\\bvpn\\b",
+        "virtual (?:computer|desktop|pbx)",
+        "(?:business|admin|device) (?:portal|dashboard)",
+        "\\bdashboard\\b"
+      ],
+      "exclude": []
+    },
+    "APPLICATION_INQUIRY": {
+      "description": "Other app questions",
+      "tier": 3,
+      "match": [
+        "\\bapps?\\b",
+        "\\bapplications?\\b"
+      ],
+      "exclude": []
+    },
+    "STORE_RETAIL": {
+      "description": "Store hours, locations and in-store questions",
+      "tier": 2,
+      "match": [
+        "hours of operation",
+        "(?:store|business) hours",
+        "\\bstores?\\b",
+        "retail",
+        "\\bdealer"
+      ],
+      "exclude": []
+    },
+    "NO_ACTION_REQUIRED": {
+      "description": "Resolved on contact, test or accidental calls, no change made",
+      "tier": 5,
+      "match": [
+        "no (?:help|changes?|action|assistance) (?:was |is )?(?:needed|made|required|taken)",
+        "\\bresolved\\b",
+        "test call",
+        "(?:called|dialed) by mistake",
+        "accidental\\w*",
+        "issue (?:fixed|cleared)"
+      ],
+      "exclude": []
+    },
+    "POLICY_PROCESS_INQUIRY": {
+      "description": "How-to, process and policy questions",
+      "tier": 5,
+      "match": [
+        "how (?:to|do|does|can)\\b",
+        "process\\w* (?:for|to)",
+        "steps (?:for|to)",
+        "polic(?:y|ies)",
+        "procedure",
+        "what options",
+        "information (?:about|on|for)"
+      ],
+      "exclude": [
+        "unlock eligib\\w*"
+      ]
+    },
+    "GENERAL_INQUIRY": {
+      "description": "Other general questions and requests",
+      "tier": 5,
+      "match": [
+        "\\bquestions?\\b",
+        "inquir\\w*",
+        "\\binfo\\w*",
+        "assist\\w*",
+        "\\bhelp\\b",
+        "\\bsupport\\b",
+        "\\bwholesale\\b"
+      ],
+      "exclude": []
+    },
+    "UNCLEAR_REQUEST": {
+      "description": "The request does not say what the customer needs",
+      "tier": 6,
+      "match": [
+        "(?:request|issue|need) (?:is |was )?(?:unclear|not clear|not specified)",
+        "(?:more )?details? (?:is |are )?(?:required|needed)",
+        "clarif\\w*",
+        "action (?:was )?not specified",
+        "\\bunclear\\b"
+      ],
+      "exclude": []
+    },
+    "USAGE_INQUIRY": {
+      "description": "How much data, minutes or messages were used",
+      "tier": 1,
+      "match": [
+        "\\busage\\b",
+        "how much data",
+        "data (?:used|consumption|balance)"
+      ],
+      "exclude": []
+    },
+    "PROMOTION_REBATE": {
+      "description": "Promotions, rebates, discounts and offers",
+      "tier": 1,
+      "match": [
+        "\\bpromo\\w*",
+        "rebates?",
+        "\\b(?:discounts?|offers?|deals?|bogo|coupons?)\\b"
+      ],
+      "exclude": []
+    },
+    "TRADE_IN_CREDIT": {
+      "description": "Trade-in value and trade-in credits",
+      "tier": 1,
+      "match": [
+        "trade ?-? ?in",
+        "trading in"
+      ],
+      "exclude": []
+    },
+    "LOYALTY_REWARDS": {
+      "description": "Loyalty programmes and rewards (e.g. T-Mobile Tuesdays)",
+      "tier": 1,
+      "match": [
+        "t ?mobile tuesdays?",
+        "\\btuesdays?\\b",
+        "rewards?",
+        "loyalty"
+      ],
+      "exclude": []
+    },
+    "PRODUCT_AVAILABILITY_PRICING": {
+      "description": "Which products are available for the customer, and at what price",
+      "tier": 2,
+      "match": [
+        "(?:what|which) .{0,30}(?:available|options)",
+        "\\bpric\\w*",
+        "\\bquotes?\\b",
+        "how much (?:is|does|for|would)",
+        "\\bcost\\b"
+      ],
+      "exclude": [
+        "usage|how much data"
+      ]
+    },
+    "INTERNATIONAL_PASS_ORDER": {
+      "description": "Buying or adding international / travel data passes and plans",
+      "tier": 1,
+      "match": [
+        "\\bdata pass\\w*",
+        "day pass\\w*",
+        "travel pass\\w*",
+        "\\b(?:int|intl|international) (?:day |data )?pass\\w*",
+        "\\bpass(?:es)? (?:for|while|to)",
+        "(?:add|adding|buy|purchas)\\w* .{0,25}international",
+        "international (?:plan|features?|add ?-?ons?)"
+      ],
+      "exclude": []
+    },
+    "ADD_LINE_ORDER": {
+      "description": "Add a new voice, data, tablet or watch line",
+      "tier": 1,
+      "match": [
+        "\\b(?:add|adding|open|opening|new|additional|extra) (?:a |an )?(?:new )?(?:voice |data |tablet |watch )?lines?\\b"
+      ],
+      "exclude": [
+        "\\be ?-? ?sim",
+        "\\bp ?sim\\b"
+      ]
+    },
+    "TICKET_STATUS_FOLLOWUP": {
+      "description": "Status, update or follow-up on an existing ticket or case",
+      "tier": 4,
+      "match": [
+        "\\btickets?\\b",
+        "\\bcases?\\b",
+        "follow ?-? ?up",
+        "\\betr\\b",
+        "support case"
+      ],
+      "exclude": [
+        "in (?:any|this|that|which) case",
+        "just in case",
+        "phone case"
+      ]
+    },
+    "TICKET_ESCALATION": {
+      "description": "Escalate or re-open a ticket or case",
+      "tier": 4,
+      "match": [
+        "escalat\\w*",
+        "re ?-? ?open\\w*"
+      ],
+      "exclude": []
+    },
+    "NUMBER_PORT_OUT": {
+      "description": "Port a number out to another carrier, transfer / release PIN",
+      "tier": 1,
+      "match": [
+        "port ?-? ?out",
+        "(?:release|transfer|port ?out|number transfer) pin",
+        "(?:to|switch\\w* to|leaving for|moving to) (?:another|a different|other|new) carrier"
+      ],
+      "exclude": []
+    },
+    "NUMBER_PORT_IN": {
+      "description": "Bring a number in from another carrier, transfer a number in",
+      "tier": 2,
+      "match": [
+        "\\bport(?:ing|ed)?(?: in)?\\b",
+        "(?:transfer|mov|keep|bring)\\w* (?:\\w+ ){0,3}numbers?\\b",
+        "numbers? (?:\\w+ )?(?:transferred|moved|ported)",
+        "from (?:another|other|a different|the old|his old|her old|their old) carrier"
+      ],
+      "exclude": [
+        "port forward\\w*",
+        "(?:lan|ethernet|charging|usb) port",
+        "port (?:on|of) (?:the )?(?:router|gateway)",
+        "\\bdocked\\b"
+      ]
+    },
+    "MOBILE_DATA_NO_CONNECTIVITY": {
+      "description": "Mobile data not working or not connecting, APN",
+      "tier": 1,
+      "match": [
+        "\\bno (?:mobile |cellular |cell |lte )?data\\b",
+        "(?:mobile|cellular|lte|cell) data",
+        "data (?:is |isn ?t |not |stopped |wont |won t )(?:not )?(?:working|connecting|loading)",
+        "data (?:connectivity|connection)",
+        "\\bapn\\b"
+      ],
+      "exclude": [
+        "data pass",
+        "<NET>",
+        "<GW>",
+        "slow|speed|throttl"
+      ]
+    },
+    "MOBILE_DATA_SLOW_SPEED": {
+      "description": "Slow or throttled mobile data",
+      "tier": 1,
+      "match": [
+        "slow (?:mobile |cellular )?data",
+        "data (?:speeds?|is slow)",
+        "\\bthrottl\\w*",
+        "data .{0,15}slow"
+      ],
+      "exclude": [
+        "data pass",
+        "<NET>",
+        "<GW>"
+      ]
+    },
+    "INTERNATIONAL_CALLING_ISSUE": {
+      "description": "Problems calling international numbers or from abroad",
+      "tier": 1,
+      "match": [
+        "calls? to (?:\\w+ )?(?:europe|mexico|canada|asia|africa|international|overseas|another country)\\b.{0,30}",
+        "international call\\w*",
+        "calling (?:code|international)",
+        "country code"
+      ],
+      "exclude": []
+    },
+    "ROAMING_SERVICE_ISSUE": {
+      "description": "Service, data or calls not working while travelling abroad",
+      "tier": 2,
+      "match": [
+        "(?:\\broam\\w*|abroad|overseas|out of (?:the )?(?:country|us)\\b|travel\\w*|landed in|international|\\bintl\\b|\\bint\\b|foreign)"
+      ],
+      "exclude": [
+        "\\bpass(?:es)?\\b"
+      ]
+    },
+    "WARRANTY_EXCHANGE": {
+      "description": "Warranty exchange and defective device replacement",
+      "tier": 1,
+      "match": [
+        "warranty",
+        "\\bexchange\\b",
+        "(?:replacement|exchange) (?:phone|device)",
+        "(?:phone|device) (?:replacement|exchange|swap)",
+        "replac\\w* (?:the |his |her |their |a )?(?:phone|device|iphone|tablet)",
+        "defective"
+      ],
+      "exclude": []
+    },
+    "DEVICE_INSURANCE_CLAIM": {
+      "description": "Insurance, damage claims and device protection plans",
+      "tier": 1,
+      "match": [
+        "insurance",
+        "\\bclaims?\\b",
+        "assurant",
+        "protection (?:plan|360)",
+        "\\bp ?360\\b"
+      ],
+      "exclude": []
+    }
+  },
+  "allowed_l2_by_l1": {},
+  "legacy_scheme": {
+    "description": "How this taxonomy maps onto the earlier 9 L2 / 13 L4 labels, used only to compare against them.",
+    "l2": {
+      "CUSTOMER_INTERACTION_MANAGEMENT": "CALL_HANDLING",
+      "CUSTOMER_AUTHENTICATION": "ACCOUNT",
+      "CUSTOMER_INFORMATION_MANAGEMENT": "ACCOUNT",
+      "CUSTOMER_RELATIONSHIP_LIFECYCLE": "ACCOUNT",
+      "BILL_INQUIRY_HANDLING": "BILLING",
+      "BILL_INVOICE_MANAGEMENT": "BILLING",
+      "BILL_PAYMENTS_RECEIVABLES": "BILLING",
+      "PROMOTION_LOYALTY_MANAGEMENT": "BILLING",
+      "PRODUCT_SERVICE_QUALIFICATION": "NETWORK",
+      "PRODUCT_ORDER_MANAGEMENT": "PROVISIONING",
+      "ORDER_FULFILMENT": "DEVICE",
+      "TROUBLE_TICKET_MANAGEMENT": "GENERAL_SUPPORT",
+      "MOBILE_SERVICE_ACTIVATION": "PROVISIONING",
+      "NUMBER_MANAGEMENT": "PROVISIONING",
+      "NETWORK_COVERAGE_QUALITY": "NETWORK",
+      "MOBILE_VOICE_SERVICE_PROBLEM": "NETWORK",
+      "MOBILE_DATA_SERVICE_PROBLEM": "NETWORK",
+      "ROAMING_SERVICE_PROBLEM": "NETWORK",
+      "MESSAGING_SERVICE_PROBLEM": "NETWORK",
+      "VOICE_MESSAGING_FEATURE_CONFIGURATION": "CALL_HANDLING",
+      "FIXED_WIRELESS_SERVICE_PROBLEM": "INTERNET",
+      "HOME_NETWORK_CONFIGURATION": "INTERNET",
+      "DEVICE_PROBLEM_MANAGEMENT": "DEVICE",
+      "DEVICE_SECURITY_PROTECTION": "DEVICE",
+      "DIGITAL_SELF_SERVICE": "APPLICATION",
+      "GENERAL_SUPPORT": "GENERAL_SUPPORT"
+    },
+    "l2_by_l4": {
+      "INTERNATIONAL_PASS_ORDER": "NETWORK",
+      "ADD_LINE_ORDER": "PROVISIONING",
+      "TMOBILE_APP_FEATURE": "APPLICATION"
+    },
+    "l4_default_by_l2": {
+      "CUSTOMER_INTERACTION_MANAGEMENT": "CALL_FAILURE",
+      "CUSTOMER_AUTHENTICATION": "ACCOUNT_PROFILE_UPDATE",
+      "CUSTOMER_INFORMATION_MANAGEMENT": "ACCOUNT_PROFILE_UPDATE",
+      "CUSTOMER_RELATIONSHIP_LIFECYCLE": "ACCOUNT_PROFILE_UPDATE",
+      "BILL_INQUIRY_HANDLING": "BILL_EXPLANATION",
+      "BILL_INVOICE_MANAGEMENT": "BILL_EXPLANATION",
+      "BILL_PAYMENTS_RECEIVABLES": "PAYMENT_PROCESSING",
+      "PROMOTION_LOYALTY_MANAGEMENT": "BILL_EXPLANATION",
+      "PRODUCT_SERVICE_QUALIFICATION": "NETWORK_COVERAGE",
+      "PRODUCT_ORDER_MANAGEMENT": "FEATURE_PROVISIONING",
+      "ORDER_FULFILMENT": "DEVICE_ONBOARDING",
+      "TROUBLE_TICKET_MANAGEMENT": "GENERAL_SUPPORT",
+      "MOBILE_SERVICE_ACTIVATION": "LINE_PROVISIONING",
+      "NUMBER_MANAGEMENT": "LINE_PROVISIONING",
+      "NETWORK_COVERAGE_QUALITY": "NETWORK_COVERAGE",
+      "MOBILE_VOICE_SERVICE_PROBLEM": "NETWORK_COVERAGE",
+      "MOBILE_DATA_SERVICE_PROBLEM": "NETWORK_COVERAGE",
+      "ROAMING_SERVICE_PROBLEM": "NETWORK_COVERAGE",
+      "MESSAGING_SERVICE_PROBLEM": "NETWORK_COVERAGE",
+      "VOICE_MESSAGING_FEATURE_CONFIGURATION": "CALL_FAILURE",
+      "FIXED_WIRELESS_SERVICE_PROBLEM": "INTERNET",
+      "HOME_NETWORK_CONFIGURATION": "INTERNET",
+      "DEVICE_PROBLEM_MANAGEMENT": "DEVICE_ONBOARDING",
+      "DEVICE_SECURITY_PROTECTION": "DEVICE_ONBOARDING",
+      "DIGITAL_SELF_SERVICE": "MOBILE_APP_SUPPORT",
+      "GENERAL_SUPPORT": "GENERAL_SUPPORT"
+    },
+    "l4": {
+      "AUTOPAY_MANAGEMENT": "AUTOPAY_MANAGEMENT",
+      "PLAN_CHANGE": "PLAN_PROVISIONING",
+      "INTERNATIONAL_PASS_ORDER": "NETWORK_COVERAGE",
+      "ADD_LINE_ORDER": "LINE_PROVISIONING"
+    }
+  }
+}

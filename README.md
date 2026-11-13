@@ -38,4 +38,10 @@ python .\nora_check_repeats.py --file "C:\Datascience\interactions_clean.parquet
 python ".\intent_l2_l4_pipeline_v7.py" --input "C:\Users\AGhosh56\OneDrive - T-Mobile USA\Downloads\data.csv"
 
 
+########
+
+python ".\intent_l2_l4_pipeline_v9.py" --input "C:\Users\AGhosh56\OneDrive - T-Mobile USA\Downloads\data.csv" --baseline-manifest "C:\Datascience\nora_intent_v8\run_manifest.json"
+
+
+
 

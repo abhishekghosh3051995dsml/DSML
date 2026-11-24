@@ -43,5 +43,11 @@ python ".\intent_l2_l4_pipeline_v7.py" --input "C:\Users\AGhosh56\OneDrive - T-M
 python ".\intent_l2_l4_pipeline_v9.py" --input "C:\Users\AGhosh56\OneDrive - T-Mobile USA\Downloads\data.csv" --baseline-manifest "C:\Datascience\nora_intent_v8\run_manifest.json"
 
 
+#######
+
+Inventory identities, Function Apps, Key Vaults, secrets and resources.
+Validate Key Vault least privilege and scan source/configuration for shared credentials.
+Create user × Function App × resource × entry/exit access-control matrix.
+
 
 
